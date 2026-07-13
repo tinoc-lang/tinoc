@@ -1,14 +1,14 @@
 # Tinoc
 
-> This is Official GitHub repository for ***TinocLang*** compiler source-code.
+> This is the official GitHub repository for the **TinocLang** compiler source code.
 
 ## **T**inoc **I**s **No**t **C**
 
-Tinoc is a short-form of **T**his **I**s **No**t **C**, usually known as **T**inoc **I**s **No**t **C**. 
+Tinoc is a short form of **T**his **I**s **No**t **C**, commonly known as **T**inoc **I**s **No**t **C**.
 
-**NOTE:** Tinoc Respects C and its usage, Tinoc is made with philosophy that Programming should be **Meaningful**, **Accurate**, **Robust**, **Maximum Performance** and **Simple**.
+**NOTE:** Tinoc respects C and its usage. Tinoc is built on the philosophy that programming should be **Meaningful**, **Accurate**, **Robust**, **Maximum Performance**, and **Simple**.
 
-**Tinoc** transplies to C99 for most system support.
+**Tinoc** transpiles to C99 for maximum system support.
 
 ## Example Program
 
@@ -24,7 +24,7 @@ fn main() void {
 }
 ```
 
-**Transplied C Code:**
+**Transpiled C Code:**
 
 ```c
 #include <stdio.h>
@@ -39,6 +39,7 @@ int main() {
 ```
 
 ### Important Links
+
 - [Website](https://tinoc-lang.vercel.app)
 - [LICENSE](LICENSE)
 - [Creator GitHub](https://github.com/pbarot2009)
