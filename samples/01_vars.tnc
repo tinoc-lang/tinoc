@@ -1,0 +1,18 @@
+// NOTE: This is variables only sample/test so this would not compile by any c compiler because it doesn't contain the main function.
+
+var num1 u8 = 127;
+var num2 u16 = 250;
+var num3 u32 = 10000;
+var num4 u64 = 123456;
+var num5 u128 = 12345678;
+var num_u usize = 12312312323;
+
+var inum1 i8 = -127;
+var inum2 i16 = -250;
+var inum3 i32 = -10000;
+var inum4 i64 = -123456;
+var inum5 i128 = -12345678;
+var num_u isize = -12312312323;
+
+var num_inffered1 = 123; // infered as u8
+var num_inffered2 = -67; // as i8

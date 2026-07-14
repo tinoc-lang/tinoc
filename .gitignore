@@ -51,5 +51,36 @@ Module.symvers
 Mkfile.old
 dkms.conf
 
-# debug information files
+# Debug information files
 *.dwo
+
+# CMake
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+CTestTestfile.cmake
+_deps/
+CMakeUserPresets.json
+Testing/
+compile_commands.json
+install_manifest.txt
+
+# Common build directory names
+build/
+build*/
+out/
+cmake-build-*/
+
+# GoogleTest / GTest (when fetched via FetchContent or submodule)
+googletest/
+gtest/
+gmock/
+*.gcno
+*.gcda
+*.gcov
+gtest_output.xml
+
+# IDE files (optional, common with CMake projects)
+.vscode/
+.idea/
+*.swp
