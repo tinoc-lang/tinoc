@@ -54,9 +54,8 @@ func Execute(args []string) {
 	}
 }
 
-// ============================================================================
+
 // Subcommand Handlers
-// ============================================================================
 
 func handleBuild(args []string) {
 	fs := flag.NewFlagSet("build", flag.ExitOnError)
@@ -144,9 +143,8 @@ func registerPipelineFlags(fs *flag.FlagSet, config *PipelineConfig) {
 	fs.BoolVar(&config.Verbose, "verbose", false, "Enable verbose compiler log timings")
 }
 
-// ============================================================================
+// @todo
 // Compiler Execution Pipeline (Placeholders)
-// ============================================================================
 
 func runCompilerPipeline(mode string, config PipelineConfig) {
 	if config.Verbose {
@@ -194,9 +192,9 @@ func determineOutputName(config PipelineConfig) string {
 	return strings.TrimSuffix(filepath.Base(config.FilePath), ext)
 }
 
-// ============================================================================
 // Help Screens & Version Info
-// ============================================================================
+
+
 
 func printVersion() {
 	fmt.Printf("%s version %s\n", CompilerName, Version)
