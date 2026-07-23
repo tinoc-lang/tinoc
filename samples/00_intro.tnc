@@ -5,6 +5,6 @@ fn main() void
 {
     var name str = "Prathmesh";
     const lang = "Tinoc";
-    
+    // This comment should be ignored    
     io.println("{s} is creator of {s} Programming Language!", name, lang);
 }

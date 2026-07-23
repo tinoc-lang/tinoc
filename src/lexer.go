@@ -608,8 +608,7 @@ func printHeader(useColor bool) {
 	} else {
 		fmt.Printf("%-14s %-22s %-10s\n", "TYPE", "LITERAL", "POSITION")
 	}
-	fmt.Println("")
-	fmt.Println("")
+	fmt.Println()
 }
 
 // printToken prints a single token row, colorized by category.
@@ -617,8 +616,12 @@ func printToken(tok Token, useColor bool) {
 	pos := fmt.Sprintf("L%d:C%d", tok.Line, tok.Column)
 	literal := fmt.Sprintf("%q", tok.Literal)
 
+	typeCol := fmt.Sprintf("%-14s", string(tok.Type))
+	literalCol := fmt.Sprintf("%-22s", literal)
+	posCol := fmt.Sprintf("%-10s", pos)
+
 	if !useColor {
-		fmt.Printf("%-14s %-22s %-10s\n", tok.Type, literal, pos)
+		fmt.Printf("%s %s %s\n", typeCol, literalCol, posCol)
 		return
 	}
 
@@ -626,10 +629,10 @@ func printToken(tok Token, useColor bool) {
 	if tok.Type == TOKEN_ILLEGAL {
 		c = colorBold + colorRed
 	}
-	fmt.Printf("%s%-14s%s %s%-22s%s %s%-10s%s\n",
-		c, string(tok.Type), colorReset,
-		c, literal, colorReset,
-		colorDim, pos, colorReset,
+	fmt.Printf("%s%s%s %s%s%s %s%s%s\n",
+		c, typeCol, colorReset,
+		c, literalCol, colorReset,
+		colorDim, posCol, colorReset,
 	)
 }
 
