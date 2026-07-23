@@ -13,6 +13,36 @@ const (
 	CompilerName = "tinoc"
 )
 
+// Color constants and supportsColor are defined in lexer.go and shared
+// across this package.
+
+func stage(useColor bool, label, format string, args ...interface{}) {
+	msg := fmt.Sprintf(format, args...)
+	if useColor {
+		fmt.Printf("%s[%s]%s %s\n", colorCyan, label, colorReset, msg)
+	} else {
+		fmt.Printf("[%s] %s\n", label, msg)
+	}
+}
+
+func ok(useColor bool, format string, args ...interface{}) {
+	msg := fmt.Sprintf(format, args...)
+	if useColor {
+		fmt.Printf("  %s%s%s\n", colorGreen, msg, colorReset)
+	} else {
+		fmt.Printf("  %s\n", msg)
+	}
+}
+
+func fail(useColor bool, format string, args ...interface{}) {
+	msg := fmt.Sprintf(format, args...)
+	if useColor {
+		fmt.Fprintf(os.Stderr, "%serror:%s %s\n", colorRed, colorReset, msg)
+	} else {
+		fmt.Fprintf(os.Stderr, "error: %s\n", msg)
+	}
+}
+
 // PipelineConfig holds flags and parameters for a compiler execution run.
 type PipelineConfig struct {
 	FilePath   string
@@ -48,14 +78,16 @@ func Execute(args []string) {
 			printGlobalHelp()
 		}
 	default:
-		fmt.Printf("Error: unknown command %q for %q\n\n", subcommand, CompilerName)
+		fail(supportsColor(), "unknown command %q for %q", subcommand, CompilerName)
+		fmt.Println()
 		printGlobalHelp()
 		os.Exit(1)
 	}
 }
 
-
+// ----------------------------------------------------------------------
 // Subcommand Handlers
+// ----------------------------------------------------------------------
 
 func handleBuild(args []string) {
 	fs := flag.NewFlagSet("build", flag.ExitOnError)
@@ -70,12 +102,17 @@ func handleBuild(args []string) {
 	_ = fs.Parse(args)
 
 	if fs.NArg() < 1 {
-		fmt.Println("Error: missing target file for 'build'.")
-		fmt.Println("Usage: tinoc build <file.tn> [flags]")
+		fail(supportsColor(), "missing target file for 'build'")
+		fmt.Println("usage: tinoc build <file.tn> [flags]")
 		os.Exit(1)
 	}
 
 	config.FilePath = fs.Arg(0)
+	if err := readSourceFile(config.FilePath); err != nil {
+		fail(supportsColor(), "%v", err)
+		os.Exit(1)
+	}
+
 	runCompilerPipeline("build", config)
 }
 
@@ -92,12 +129,17 @@ func handleRun(args []string) {
 	_ = fs.Parse(args)
 
 	if fs.NArg() < 1 {
-		fmt.Println("Error: missing target file for 'run'.")
-		fmt.Println("Usage: tinoc run <file.tn> [flags]")
+		fail(supportsColor(), "missing target file for 'run'")
+		fmt.Println("usage: tinoc run <file.tn> [flags]")
 		os.Exit(1)
 	}
 
 	config.FilePath = fs.Arg(0)
+	if err := readSourceFile(config.FilePath); err != nil {
+		fail(supportsColor(), "%v", err)
+		os.Exit(1)
+	}
+
 	runCompilerPipeline("run", config)
 }
 
@@ -105,8 +147,8 @@ func handleCheck(args []string) {
 	fs := flag.NewFlagSet("check", flag.ExitOnError)
 	var config PipelineConfig
 
-	fs.BoolVar(&config.Verbose, "v", false, "Enable verbose timing logs")
-	fs.BoolVar(&config.Verbose, "verbose", false, "Enable verbose timing logs")
+	fs.BoolVar(&config.Verbose, "v", false, "enable verbose timing logs")
+	fs.BoolVar(&config.Verbose, "verbose", false, "enable verbose timing logs")
 
 	fs.Usage = func() {
 		printSubcommandHelp("check")
@@ -115,72 +157,116 @@ func handleCheck(args []string) {
 	_ = fs.Parse(args)
 
 	if fs.NArg() < 1 {
-		fmt.Println("Error: missing target file for 'check'.")
-		fmt.Println("Usage: tinoc check <file.tn>")
+		fail(supportsColor(), "missing target file for 'check'")
+		fmt.Println("usage: tinoc check <file.tn>")
 		os.Exit(1)
 	}
 
 	config.FilePath = fs.Arg(0)
-	fmt.Printf("[CHECK] Analyzing %s...\n", config.FilePath)
-	fmt.Println(" -> (Placeholder) Lexical, syntax, and type check passed successfully!")
+	useColor := supportsColor()
+
+	source, err := readSourceFileContent(config.FilePath)
+	if err != nil {
+		fail(useColor, "%v", err)
+		os.Exit(1)
+	}
+
+	stage(useColor, "CHECK", "analyzing %s", config.FilePath)
+
+	total, illegal := DumpTokens(source)
+	if illegal > 0 {
+		fail(useColor, "lexical check failed (%d illegal token(s) of %d total)", illegal, total)
+		os.Exit(1)
+	}
+
+	ok(useColor, "lexical check passed (%d tokens)", total)
 }
 
-// Helper to bind short and long flags to the same option pointers.
+// Binds short and long flags to the same option pointers.
 func registerPipelineFlags(fs *flag.FlagSet, config *PipelineConfig) {
-	fs.StringVar(&config.OutputPath, "o", "", "Output path for the binary or generated file")
-	fs.StringVar(&config.OutputPath, "output", "", "Output path for the binary or generated file")
+	fs.StringVar(&config.OutputPath, "o", "", "output path for the binary or generated file")
+	fs.StringVar(&config.OutputPath, "output", "", "output path for the binary or generated file")
 
-	fs.BoolVar(&config.Lex, "l", false, "Stop at Lexer stage and print token stream")
-	fs.BoolVar(&config.Lex, "lex", false, "Stop at Lexer stage and print token stream")
+	fs.BoolVar(&config.Lex, "l", false, "stop at lexer stage and print token stream")
+	fs.BoolVar(&config.Lex, "lex", false, "stop at lexer stage and print token stream")
 
-	fs.BoolVar(&config.AST, "a", false, "Stop at Parser stage and print AST")
-	fs.BoolVar(&config.AST, "ast", false, "Stop at Parser stage and print AST")
+	fs.BoolVar(&config.AST, "a", false, "stop at parser stage and print AST")
+	fs.BoolVar(&config.AST, "ast", false, "stop at parser stage and print AST")
 
-	fs.BoolVar(&config.EmitC, "c", false, "Stop at Codegen stage and output C code")
-	fs.BoolVar(&config.EmitC, "emit-c", false, "Stop at Codegen stage and output C code")
+	fs.BoolVar(&config.EmitC, "c", false, "stop at codegen stage and output C code")
+	fs.BoolVar(&config.EmitC, "emit-c", false, "stop at codegen stage and output C code")
 
-	fs.BoolVar(&config.Verbose, "v", false, "Enable verbose compiler log timings")
-	fs.BoolVar(&config.Verbose, "verbose", false, "Enable verbose compiler log timings")
+	fs.BoolVar(&config.Verbose, "v", false, "enable verbose compiler log timings")
+	fs.BoolVar(&config.Verbose, "verbose", false, "enable verbose compiler log timings")
 }
 
-// @todo
-// Compiler Execution Pipeline (Placeholders)
+func readSourceFile(path string) error {
+	_, err := readSourceFileContent(path)
+	return err
+}
+
+func readSourceFileContent(path string) (string, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", fmt.Errorf("cannot read %s: %w", path, err)
+	}
+	return string(data), nil
+}
+
+// ----------------------------------------------------------------------
+// Compiler Execution Pipeline
+// ----------------------------------------------------------------------
 
 func runCompilerPipeline(mode string, config PipelineConfig) {
+	useColor := supportsColor()
+
 	if config.Verbose {
-		fmt.Printf("[INFO] Target Source: %s\n", config.FilePath)
+		stage(useColor, "INFO", "target source: %s", config.FilePath)
 		if config.OutputPath != "" {
-			fmt.Printf("[INFO] Target Output: %s\n", config.OutputPath)
+			stage(useColor, "INFO", "target output: %s", config.OutputPath)
 		}
 	}
 
-	// 1. Cutoff: Lexer testing flag
+	source, err := readSourceFileContent(config.FilePath)
+	if err != nil {
+		fail(useColor, "%v", err)
+		os.Exit(1)
+	}
+
+	// Cutoff: lexer testing flag.
 	if config.Lex {
-		fmt.Printf("[STAGE: LEXER] Tokenizing %s...\n", config.FilePath)
-		fmt.Println(" -> (Placeholder) Token stream dumped successfully.")
+		stage(useColor, "LEXER", "tokenizing %s", config.FilePath)
+		total, illegal := DumpTokens(source)
+		if illegal > 0 {
+			fail(useColor, "%d illegal token(s) found", illegal)
+			os.Exit(1)
+		}
+		ok(useColor, "%d tokens dumped", total)
 		return
 	}
 
-	// 2. Cutoff: Parser testing flag
+	// Cutoff: parser testing flag.
 	if config.AST {
-		fmt.Printf("[STAGE: PARSER] Parsing AST for %s...\n", config.FilePath)
-		fmt.Println(" -> (Placeholder) AST tree printed successfully.")
+		stage(useColor, "PARSER", "parsing AST for %s", config.FilePath)
+		fmt.Println("  (placeholder) AST printing is not yet implemented.")
 		return
 	}
 
-	// 3. Cutoff: Transpiler testing flag
+	// Cutoff: transpiler testing flag.
 	if config.EmitC {
-		fmt.Printf("[STAGE: CODEGEN] Transpiling %s to C...\n", config.FilePath)
-		fmt.Println(" -> (Placeholder) C source emitted successfully.")
+		stage(useColor, "CODEGEN", "transpiling %s to C", config.FilePath)
+		fmt.Println("  (placeholder) C code generation is not yet implemented.")
 		return
 	}
 
-	// 4. Full compilation pipeline
+	// Full compilation pipeline.
 	outName := determineOutputName(config)
-	fmt.Printf("[STAGE: FULL BUILD] Transpiling %s -> C -> %s...\n", config.FilePath, outName)
+	stage(useColor, "BUILD", "transpiling %s -> C -> %s", config.FilePath, outName)
+	fmt.Println("  (placeholder) full build pipeline is not yet implemented.")
 
 	if mode == "run" {
-		fmt.Printf("[STAGE: EXECUTE] Running binary ./%s...\n", outName)
+		stage(useColor, "EXECUTE", "running ./%s", outName)
+		fmt.Println("  (placeholder) execution is not yet implemented.")
 	}
 }
 
@@ -192,16 +278,23 @@ func determineOutputName(config PipelineConfig) string {
 	return strings.TrimSuffix(filepath.Base(config.FilePath), ext)
 }
 
+// ----------------------------------------------------------------------
 // Help Screens & Version Info
-
-
+// ----------------------------------------------------------------------
 
 func printVersion() {
-	fmt.Printf("%s version %s\n", CompilerName, Version)
+	if !supportsColor() {
+		fmt.Printf("%s version %s\n", CompilerName, Version)
+		return
+	}
+	fmt.Printf("\033[1m%s%s%s version %s%s%s\n", colorCyan, CompilerName, colorReset, colorGreen, Version, colorReset)
 }
 
 func printGlobalHelp() {
-	helpText := `TinocLang Compiler & Transpiler
+	useColor := supportsColor()
+
+	if !useColor {
+		fmt.Print(`TinocLang compiler and transpiler
 
 Usage:
   tinoc <command> [file] [flags]
@@ -213,47 +306,112 @@ Commands:
   version     Print compiler version information
   help        Display help info for a command
 
-Global Flags:
+Global flags:
   -h, --help  Display CLI help information
 
 Run 'tinoc help <command>' for detailed flag usage on specific subcommands.
-`
-	fmt.Print(helpText)
+`)
+		return
+	}
+
+	bold := "\033[1m"
+	fmt.Printf("%sTinocLang%s compiler and transpiler\n\n", bold, colorReset)
+
+	fmt.Printf("%sUsage:%s\n", bold, colorReset)
+	fmt.Printf("  tinoc %s<command>%s [file] [flags]\n\n", colorCyan, colorReset)
+
+	fmt.Printf("%sCommands:%s\n", bold, colorReset)
+	printCommandLine("build", "Transpile Tinoc code to C and compile to binary")
+	printCommandLine("run", "Transpile, compile, and execute program")
+	printCommandLine("check", "Perform lexical, syntactic, and type checks without emitting code")
+	printCommandLine("version", "Print compiler version information")
+	printCommandLine("help", "Display help info for a command")
+	fmt.Println()
+
+	fmt.Printf("%sGlobal flags:%s\n", bold, colorReset)
+	printFlagLine("-h, --help", "Display CLI help information")
+	fmt.Println()
+
+	fmt.Printf("%sRun 'tinoc help <command>' for detailed flag usage on specific subcommands.%s\n", colorDim, colorReset)
+}
+
+func printCommandLine(name, desc string) {
+	fmt.Printf("  %s%-11s%s %s\n", colorCyan, name, colorReset, desc)
+}
+
+func printFlagLine(flags, desc string) {
+	fmt.Printf("  %s%-13s%s %s\n", colorGreen, flags, colorReset, desc)
 }
 
 func printSubcommandHelp(command string) {
+	useColor := supportsColor()
+	bold := "\033[1m"
+
 	switch command {
 	case "build":
-		fmt.Print(`Usage: tinoc build <file.tn> [flags]
+		if !useColor {
+			fmt.Print(`Usage: tinoc build <file.tn> [flags]
 
 Transpiles Tinoc source code to C and compiles it using the system C compiler.
 
-Pipeline Cutoff Flags (Testing):
-  -l, --lex       Stop after Lexer stage and output token stream
-  -a, --ast       Stop after Parser stage and output formatted AST
-  -c, --emit-c    Stop after Codegen stage and print transpiled C code
+Pipeline cutoff flags (testing):
+  -l, --lex       Stop after lexer stage and print token stream
+  -a, --ast       Stop after parser stage and print AST
+  -c, --emit-c    Stop after codegen stage and print transpiled C code
 
 Options:
   -o, --output    Specify output binary or target path
   -v, --verbose   Show detailed compiler execution timing
 `)
+			return
+		}
+		fmt.Printf("%sUsage:%s tinoc %sbuild%s <file.tn> [flags]\n\n", bold, colorReset, colorCyan, colorReset)
+		fmt.Println("Transpiles Tinoc source code to C and compiles it using the system C compiler.")
+		fmt.Println()
+		fmt.Printf("%sPipeline cutoff flags (testing):%s\n", bold, colorReset)
+		printFlagLine("-l, --lex", "Stop after lexer stage and print token stream")
+		printFlagLine("-a, --ast", "Stop after parser stage and print AST")
+		printFlagLine("-c, --emit-c", "Stop after codegen stage and print transpiled C code")
+		fmt.Println()
+		fmt.Printf("%sOptions:%s\n", bold, colorReset)
+		printFlagLine("-o, --output", "Specify output binary or target path")
+		printFlagLine("-v, --verbose", "Show detailed compiler execution timing")
+
 	case "run":
-		fmt.Print(`Usage: tinoc run <file.tn> [flags]
+		if !useColor {
+			fmt.Print(`Usage: tinoc run <file.tn> [flags]
 
 Transpiles and compiles Tinoc code, then executes the binary immediately.
 
 Options:
-  -l, --lex       Stop after Lexer stage
-  -a, --ast       Stop after Parser stage
+  -l, --lex       Stop after lexer stage
+  -a, --ast       Stop after parser stage
   -c, --emit-c    Stop after C generation stage
   -v, --verbose   Show detailed execution timing
 `)
+			return
+		}
+		fmt.Printf("%sUsage:%s tinoc %srun%s <file.tn> [flags]\n\n", bold, colorReset, colorCyan, colorReset)
+		fmt.Println("Transpiles and compiles Tinoc code, then executes the binary immediately.")
+		fmt.Println()
+		fmt.Printf("%sOptions:%s\n", bold, colorReset)
+		printFlagLine("-l, --lex", "Stop after lexer stage")
+		printFlagLine("-a, --ast", "Stop after parser stage")
+		printFlagLine("-c, --emit-c", "Stop after C generation stage")
+		printFlagLine("-v, --verbose", "Show detailed execution timing")
+
 	case "check":
-		fmt.Print(`Usage: tinoc check <file.tn>
+		if !useColor {
+			fmt.Print(`Usage: tinoc check <file.tn>
 
 Scans and type-checks the Tinoc source file without generating C or binary output.
 `)
+			return
+		}
+		fmt.Printf("%sUsage:%s tinoc %scheck%s <file.tn>\n\n", bold, colorReset, colorCyan, colorReset)
+		fmt.Println("Scans and type-checks the Tinoc source file without generating C or binary output.")
+
 	default:
-		fmt.Printf("Unknown command %q for 'tinoc help'\n", command)
+		fail(useColor, "unknown command %q for 'tinoc help'", command)
 	}
 }

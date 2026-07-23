@@ -622,6 +622,9 @@ func printToken(tok Token, useColor bool) {
 	}
 
 	c := colorForToken(tok.Type)
+	if tok.Type == TOKEN_ILLEGAL {
+		c = colorBold + colorRed
+	}
 	fmt.Printf("%s%-14s%s %s%-22s%s %s%-10s%s\n",
 		c, string(tok.Type), colorReset,
 		c, literal, colorReset,
@@ -646,15 +649,16 @@ func printSummary(counts map[TokenType]int, total int, useColor bool) {
 	}
 }
 
-// RunLexer lexes the given source and prints every token in a table.
-func RunLexer(source string) {
+// DumpTokens lexes source and prints every token in a table. It returns the
+// total token count and the illegal token count so callers (e.g. the CLI's
+// "check" command) can decide whether lexing succeeded.
+func DumpTokens(source string) (total int, illegal int) {
 	useColor := supportsColor()
 
 	printHeader(useColor)
 
 	lexer := New(source)
 	counts := make(map[TokenType]int)
-	total := 0
 
 	for {
 		tok := lexer.NextToken()
@@ -668,38 +672,5 @@ func RunLexer(source string) {
 	}
 
 	printSummary(counts, total, useColor)
-}
-
-func Lex() {
-	input := `#import std.io;
-
-struct Point {
-    x f32;
-    y f32;
-
-    fn translate(self ^Point, dx f32, dy f32) void {
-        self^.x +|= dx;
-    }
-}
-
-fn main() void {
-    var p Point = Point { .x = 1.0, .y = 2.0 };
-    const mask = 0b1_1111_1111;
-    const hex_addr = 0xFF80_0000;
-    const hexf = 0x103.70p-5;
-
-    for 0..10 |i| {
-        io.println("i = {d}", i);
-    }
-
-    if p.x > 0.0 {
-        io.println("positive");
-    } else if p.x == 0.0 {
-        io.println("zero");
-    } else {
-        io.println("negative");
-    }
-}`
-
-	RunLexer(input)
+	return total, counts[TOKEN_ILLEGAL]
 }
