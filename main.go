@@ -1,11 +1,12 @@
 package main
 
 import (
-	"os"
+	//"os"
 
 	"github.com/tinoc-lang/tinoc/src"
 )
 
 func main() {
-	src.Execute(os.Args[1:])
+	//src.Execute(os.Args[1:])
+	src.Lex()
 }
