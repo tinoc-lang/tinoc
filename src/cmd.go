@@ -103,7 +103,7 @@ func handleBuild(args []string) {
 
 	if fs.NArg() < 1 {
 		fail(supportsColor(), "missing target file for 'build'")
-		fmt.Println("usage: tinoc build <file.tn> [flags]")
+		fmt.Println("usage: tinoc build <file.tnc> [flags]")
 		os.Exit(1)
 	}
 
@@ -130,7 +130,7 @@ func handleRun(args []string) {
 
 	if fs.NArg() < 1 {
 		fail(supportsColor(), "missing target file for 'run'")
-		fmt.Println("usage: tinoc run <file.tn> [flags]")
+		fmt.Println("usage: tinoc run <file.tnc> [flags]")
 		os.Exit(1)
 	}
 
@@ -158,7 +158,7 @@ func handleCheck(args []string) {
 
 	if fs.NArg() < 1 {
 		fail(supportsColor(), "missing target file for 'check'")
-		fmt.Println("usage: tinoc check <file.tn>")
+		fmt.Println("usage: tinoc check <file.tnc>")
 		os.Exit(1)
 	}
 
@@ -350,7 +350,7 @@ func printSubcommandHelp(command string) {
 	switch command {
 	case "build":
 		if !useColor {
-			fmt.Print(`Usage: tinoc build <file.tn> [flags]
+			fmt.Print(`Usage: tinoc build <file.tnc> [flags]
 
 Transpiles Tinoc source code to C and compiles it using the system C compiler.
 
@@ -365,7 +365,7 @@ Options:
 `)
 			return
 		}
-		fmt.Printf("%sUsage:%s tinoc %sbuild%s <file.tn> [flags]\n\n", bold, colorReset, colorCyan, colorReset)
+		fmt.Printf("%sUsage:%s tinoc %sbuild%s <file.tnc> [flags]\n\n", bold, colorReset, colorCyan, colorReset)
 		fmt.Println("Transpiles Tinoc source code to C and compiles it using the system C compiler.")
 		fmt.Println()
 		fmt.Printf("%sPipeline cutoff flags (testing):%s\n", bold, colorReset)
@@ -379,7 +379,7 @@ Options:
 
 	case "run":
 		if !useColor {
-			fmt.Print(`Usage: tinoc run <file.tn> [flags]
+			fmt.Print(`Usage: tinoc run <file.tnc> [flags]
 
 Transpiles and compiles Tinoc code, then executes the binary immediately.
 
@@ -391,7 +391,7 @@ Options:
 `)
 			return
 		}
-		fmt.Printf("%sUsage:%s tinoc %srun%s <file.tn> [flags]\n\n", bold, colorReset, colorCyan, colorReset)
+		fmt.Printf("%sUsage:%s tinoc %srun%s <file.tnc> [flags]\n\n", bold, colorReset, colorCyan, colorReset)
 		fmt.Println("Transpiles and compiles Tinoc code, then executes the binary immediately.")
 		fmt.Println()
 		fmt.Printf("%sOptions:%s\n", bold, colorReset)
@@ -402,13 +402,13 @@ Options:
 
 	case "check":
 		if !useColor {
-			fmt.Print(`Usage: tinoc check <file.tn>
+			fmt.Print(`Usage: tinoc check <file.tnc>
 
 Scans and type-checks the Tinoc source file without generating C or binary output.
 `)
 			return
 		}
-		fmt.Printf("%sUsage:%s tinoc %scheck%s <file.tn>\n\n", bold, colorReset, colorCyan, colorReset)
+		fmt.Printf("%sUsage:%s tinoc %scheck%s <file.tnc>\n\n", bold, colorReset, colorCyan, colorReset)
 		fmt.Println("Scans and type-checks the Tinoc source file without generating C or binary output.")
 
 	default:
