@@ -213,9 +213,7 @@ func readSourceFileContent(path string) (string, error) {
 	return string(data), nil
 }
 
-// ----------------------------------------------------------------------
 // Compiler Execution Pipeline
-// ----------------------------------------------------------------------
 
 func runCompilerPipeline(mode string, config PipelineConfig) {
 	useColor := supportsColor()
@@ -278,9 +276,8 @@ func determineOutputName(config PipelineConfig) string {
 	return strings.TrimSuffix(filepath.Base(config.FilePath), ext)
 }
 
-// ----------------------------------------------------------------------
 // Help Screens & Version Info
-// ----------------------------------------------------------------------
+// 
 
 func printVersion() {
 	if !supportsColor() {

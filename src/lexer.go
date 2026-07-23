@@ -608,7 +608,8 @@ func printHeader(useColor bool) {
 	} else {
 		fmt.Printf("%-14s %-22s %-10s\n", "TYPE", "LITERAL", "POSITION")
 	}
-	fmt.Println("------------------------------------------------------")
+	fmt.Println("")
+	fmt.Println("")
 }
 
 // printToken prints a single token row, colorized by category.
