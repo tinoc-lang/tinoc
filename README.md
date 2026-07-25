@@ -77,7 +77,6 @@ int main() {
 ## Important Links
 
 - **Website:** https://tinoc-lang.vercel.app
-- **License:** [LICENSE](LICENSE)
 - **Creator GitHub:** https://github.com/pbarot2009
 
 ---

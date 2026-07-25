@@ -76,8 +76,7 @@ func (i *Identifier) String() string       { return i.Value }
 // === Literal Expressions ===
 
 
-// IntegerLiteral represents an integer literal in any base (decimal, hex,
-// octal, binary), e.g. `98222`, `0xff`, `0o755`, `0b11110000`, `1_000_000`.
+// IntegerLiteral represents an integer literal in any base (decimal, hex, octal, binary), e.g. `98222`, `0xff`, `0o755`, `0b11110000`, `1_000_000`.
 // The raw token literal (with underscores/prefix intact) is preserved in
 // Raw; Value holds the parsed numeric value once evaluated.
 type IntegerLiteral struct {
@@ -108,7 +107,7 @@ type StringLiteral struct {
 	Value string
 }
 
-func (sl *StringLiteral) expressionNode()      {}
+func (sl *StringLiteral) expressionNode() {}
 func (sl *StringLiteral) TokenLiteral() string { return sl.Token.Literal }
 func (sl *StringLiteral) String() string       { return "\"" + sl.Value + "\"" }
 
