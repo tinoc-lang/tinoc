@@ -244,7 +244,9 @@ func runCompilerPipeline(mode string, config PipelineConfig) {
 		os.Exit(1)
 	}
 
-	// Cutoff: lexer testing flag.
+	// Phase 1: Lexer. Always runs first, since every later phase depends
+	// on it. -l/--lex is a cutoff: print the token stream and stop here.
+	
 	if config.Lex {
 		stage(useColor, "LEXER", "tokenizing %s", config.FilePath)
 		total, illegal := DumpTokens(source)
@@ -256,7 +258,17 @@ func runCompilerPipeline(mode string, config PipelineConfig) {
 		return
 	}
 
-	// Cutoff: parser testing flag.
+	stage(useColor, "LEXER", "tokenizing %s", config.FilePath)
+	_, illegal := DumpTokensQuiet(source)
+	if illegal > 0 {
+		fail(useColor, "%d illegal token(s) found", illegal)
+		os.Exit(1)
+	}
+	ok(useColor, "lexing complete")
+
+	// Phase 2: Parser / AST. -a/--ast is a cutoff: print the AST and stop
+	// here. Otherwise parse and continue, since codegen needs the AST.
+	
 	if config.AST {
 		stage(useColor, "PARSER", "parsing AST for %s", config.FilePath)
 		_, errs := DumpAST(source)
@@ -268,21 +280,51 @@ func runCompilerPipeline(mode string, config PipelineConfig) {
 		return
 	}
 
-	// Cutoff: transpiler testing flag.
+	stage(useColor, "PARSER", "parsing %s", config.FilePath)
+	program, parseErrs := ParseSource(source)
+	if len(parseErrs) > 0 {
+		fail(useColor, "%d parse error(s) found (parser is partial; see errors above)", len(parseErrs))
+		for _, e := range parseErrs {
+			fmt.Fprintf(os.Stderr, "  %s\n", e.String())
+		}
+		os.Exit(1)
+	}
+	ok(useColor, "parsed %d top-level statement(s)", len(program.Statements))
+
+	// Phase 3: Codegen. -c/--emit-c is a cutoff. Codegen itself is not
+	// implemented yet, so both the cutoff and the full-pipeline path
+	// report it as a placeholder rather than pretending it ran.
 	if config.EmitC {
 		stage(useColor, "CODEGEN", "transpiling %s to C", config.FilePath)
-		fmt.Println("  (placeholder) C code generation is not yet implemented.")
+		placeholder(useColor, "C code generation is not yet implemented")
 		return
 	}
 
-	// Full compilation pipeline.
+	stage(useColor, "CODEGEN", "transpiling %s to C", config.FilePath)
+	placeholder(useColor, "C code generation is not yet implemented")
+
+	// === Phase 4: Link/compile the generated C into a binary. Also not
+	// implemented yet. ===
+	
 	outName := determineOutputName(config)
-	stage(useColor, "BUILD", "transpiling %s -> C -> %s", config.FilePath, outName)
-	fmt.Println("  (placeholder) full build pipeline is not yet implemented.")
+	stage(useColor, "BUILD", "compiling generated C -> %s", outName)
+	placeholder(useColor, "C compilation/linking is not yet implemented")
 
 	if mode == "run" {
 		stage(useColor, "EXECUTE", "running ./%s", outName)
-		fmt.Println("  (placeholder) execution is not yet implemented.")
+		placeholder(useColor, "execution is not yet implemented")
+	}
+}
+
+// placeholder marks output for a pipeline phase that has not been
+// implemented yet, so `build`/`run` without cutoff flags clearly show
+// which phases actually ran versus which are still stubs.
+func placeholder(useColor bool, format string, args ...interface{}) {
+	msg := fmt.Sprintf(format, args...)
+	if useColor {
+		fmt.Printf("  %s[placeholder]%s %s\n", colorYellow, colorReset, msg)
+	} else {
+		fmt.Printf("  [placeholder] %s\n", msg)
 	}
 }
 

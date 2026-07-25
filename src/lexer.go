@@ -678,3 +678,24 @@ func DumpTokens(source string) (total int, illegal int) {
 	printSummary(counts, total, useColor)
 	return total, counts[TOKEN_ILLEGAL]
 }
+
+// DumpTokensQuiet lexes source without printing anything, returning the
+// same (total, illegal) counts as DumpTokens. Used when lexing runs as an
+// intermediate stage of the full build/run pipeline (no -l/--lex flag),
+// where the full token table would just be noise.
+func DumpTokensQuiet(source string) (total int, illegal int) {
+	lexer := New(source)
+	counts := make(map[TokenType]int)
+
+	for {
+		tok := lexer.NextToken()
+		counts[tok.Type]++
+		total++
+
+		if tok.Type == TOKEN_EOF {
+			break
+		}
+	}
+
+	return total, counts[TOKEN_ILLEGAL]
+}
