@@ -178,8 +178,23 @@ func handleCheck(args []string) {
 		fail(useColor, "lexical check failed (%d illegal token(s) of %d total)", illegal, total)
 		os.Exit(1)
 	}
-
 	ok(useColor, "lexical check passed (%d tokens)", total)
+
+	// Parser is still partial (literals, var/const, basic control flow,
+	// and functions), so a parse error here does not necessarily mean the
+	// source is invalid Tinoc — only that it uses a construct the parser
+	// doesn't cover yet (struct/enum/union bodies, switch, etc). check
+	// still surfaces parse errors since they're useful signal either way,
+	// but does not fail the command on them.
+	_, parseErrs := ParseSource(source)
+	if len(parseErrs) > 0 {
+		fail(useColor, "syntactic check found %d issue(s) (parser is partial; some may be unsupported syntax, not errors)", len(parseErrs))
+		for _, e := range parseErrs {
+			fmt.Fprintf(os.Stderr, "  %s\n", e.String())
+		}
+	} else {
+		ok(useColor, "syntactic check passed")
+	}
 }
 
 // Binds short and long flags to the same option pointers.
@@ -246,7 +261,12 @@ func runCompilerPipeline(mode string, config PipelineConfig) {
 	// Cutoff: parser testing flag.
 	if config.AST {
 		stage(useColor, "PARSER", "parsing AST for %s", config.FilePath)
-		fmt.Println("  (placeholder) AST printing is not yet implemented.")
+		_, errs := DumpAST(source)
+		if errs > 0 {
+			fail(useColor, "%d parse error(s) found (parser is partial; see errors above)", errs)
+			os.Exit(1)
+		}
+		ok(useColor, "AST parsed successfully")
 		return
 	}
 
@@ -277,7 +297,7 @@ func determineOutputName(config PipelineConfig) string {
 }
 
 // Help Screens & Version Info
-// 
+//
 
 func printVersion() {
 	if !supportsColor() {

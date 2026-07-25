@@ -1,0 +1,43 @@
+#import std.io;
+
+fn add(a i32, b i32) i32 {
+	return a + b;
+}
+
+fn Identity:T(val T) T {
+	return val;
+}
+
+fn main() void {
+	var x i32 = 10;
+
+	if x > 0 {
+		x += 1;
+	} else if x == 0 {
+		x -= 1;
+	} else {
+		x = 0;
+	}
+
+	for 0..10 |i| {
+		x += i;
+	}
+
+	var nums [5]i32 = [1, 2, 3, 4, 5];
+	for nums |n| {
+		x += n;
+	}
+
+	while x < 100 {
+		x += 1;
+	}
+
+	const result = add(10, 25);
+	const same = Identity:i32(result);
+
+	var p ^i32 = &x;
+	var deref = p^;
+
+	io.println("{d}", same);
+	io.println("{d}", deref);
+}

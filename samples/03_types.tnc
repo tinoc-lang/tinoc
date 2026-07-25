@@ -1,0 +1,40 @@
+#import std.io;
+#import std.collections.*;
+
+fn main() void {
+	// arrays
+	const message = ['h', 'e', 'l', 'l', 'o'];
+	const alt_message [5]u8 = ['h', 'e', 'l', 'l', 'o'];
+
+	// multidimensional array
+	const mat [2][2]f32 = [
+		[1.0, 0.0],
+		[0.0, 1.0],
+	];
+
+	// sentinel-terminated array
+	const sentinel [_:0]u8 = [1, 2, 3, 4];
+
+	// optional type
+	var maybe ?i32 = null;
+	maybe = 42;
+
+	// error union types
+	var inferred_err !i32 = 0;
+
+	// pointer type
+	var x i32 = 5;
+	var ptr ^i32 = &x;
+	ptr^ = 10;
+
+	// generic collection type
+	var v vec:i32;
+
+	// generic struct-literal instantiation
+	var pair Pair:i32 = Pair:i32 { .first = 10, .second = 20 };
+
+	// generic map type
+	var m map:(str, i32);
+
+	io.println("{any}", pair);
+}
