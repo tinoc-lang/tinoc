@@ -6,8 +6,8 @@ import (
 	"strings"
 )
 
-// ----------------------------------------------------------------------
-// Precedence Table
+
+// === Precedence Table ===
 //
 // Mirrors (a subset of) the precedence line from syntax.md:
 //
@@ -19,7 +19,6 @@ import (
 // Only the operators the lexer currently emits are wired up; the rest are
 // reserved slots for when the lexer grows support for them (`**`, `||` as
 // error-set-merge as opposed to logical or, `++`, etc).
-// ----------------------------------------------------------------------
 
 type precedence int
 
@@ -94,9 +93,8 @@ var precedences = map[TokenType]precedence{
 	TOKEN_LBRACE: CALL, // struct literal: Type { .field = value, ... }
 }
 
-// ----------------------------------------------------------------------
-// Parser
-// ----------------------------------------------------------------------
+
+// === Parser ===
 
 type (
 	prefixParseFn func() Expression
@@ -238,9 +236,7 @@ func (p *Parser) curPrecedence() precedence {
 	return LOWEST
 }
 
-// ----------------------------------------------------------------------
-// Program / Statement Dispatch
-// ----------------------------------------------------------------------
+// === Program / Statement Dispatch ===
 
 // ParseProgram parses the entire token stream into a *Program.
 func (p *Parser) ParseProgram() *Program {
@@ -293,9 +289,7 @@ func (p *Parser) parseStatement() Statement {
 	}
 }
 
-// ----------------------------------------------------------------------
-// var / const
-// ----------------------------------------------------------------------
+// === var / const ===
 
 func (p *Parser) parseVarStatement() Statement {
 	stmt := &VarStatement{Token: p.curToken}
@@ -363,9 +357,8 @@ func (p *Parser) skipSemicolon() {
 	}
 }
 
-// ----------------------------------------------------------------------
-// return / break / continue
-// ----------------------------------------------------------------------
+// === return / break / continue ===
+
 
 func (p *Parser) parseReturnStatement() Statement {
 	stmt := &ReturnStatement{Token: p.curToken}
@@ -393,9 +386,7 @@ func (p *Parser) parseContinueStatement() Statement {
 	return stmt
 }
 
-// ----------------------------------------------------------------------
-// #import
-// ----------------------------------------------------------------------
+// === #import ===
 
 func (p *Parser) parseImportStatement() Statement {
 	stmt := &ImportStatement{Token: p.curToken}
@@ -422,9 +413,8 @@ func (p *Parser) parseImportStatement() Statement {
 	return stmt
 }
 
-// ----------------------------------------------------------------------
-// Blocks
-// ----------------------------------------------------------------------
+// === Blocks ===
+
 
 func (p *Parser) parseBlockStatement() *BlockStatement {
 	block := &BlockStatement{Token: p.curToken, Statements: []Statement{}}
@@ -442,9 +432,8 @@ func (p *Parser) parseBlockStatement() *BlockStatement {
 	return block
 }
 
-// ----------------------------------------------------------------------
-// if / while / for
-// ----------------------------------------------------------------------
+// === if / while / for ===
+
 
 func (p *Parser) parseIfStatement() Statement {
 	stmt := &IfStatement{Token: p.curToken}
@@ -531,9 +520,7 @@ func (p *Parser) parseForStatement() Statement {
 	return stmt
 }
 
-// ----------------------------------------------------------------------
-// fn / pub / static
-// ----------------------------------------------------------------------
+// === fn / pub / static ===
 
 func (p *Parser) parsePubStatement() Statement {
 	if p.peekTokenIs(TOKEN_FN) {
@@ -658,9 +645,7 @@ func (p *Parser) parseSingleParam() *Parameter {
 	return param
 }
 
-// ----------------------------------------------------------------------
-// Expression Statements
-// ----------------------------------------------------------------------
+// === Expression Statements ===
 
 func (p *Parser) parseExpressionStatement() Statement {
 	stmt := &ExpressionStatement{Token: p.curToken}
@@ -671,9 +656,7 @@ func (p *Parser) parseExpressionStatement() Statement {
 	return stmt
 }
 
-// ----------------------------------------------------------------------
-// Pratt Expression Parsing
-// ----------------------------------------------------------------------
+// === Pratt Expression Parsing ===
 
 func (p *Parser) parseExpression(prec precedence) Expression {
 	prefix := p.prefixParseFns[p.curToken.Type]
@@ -981,9 +964,7 @@ func (p *Parser) parseOptionalUnwrapPostfix(left Expression) Expression {
 	return &PostfixExpression{Token: p.curToken, Operator: "?", Left: left}
 }
 
-// ----------------------------------------------------------------------
-// Type Parsing
-// ----------------------------------------------------------------------
+// === Type Parsing ===
 
 // parseType parses a type expression starting at curToken. Handles named
 // types, generic instantiations (`T:U`, `T:(U,V)`), pointers (`^T`),
@@ -1071,9 +1052,7 @@ func (p *Parser) parseTypeList(closing TokenType) []TypeExpr {
 	return list
 }
 
-// ----------------------------------------------------------------------
-// CLI Entry Points
-// ----------------------------------------------------------------------
+// === CLI Entry Points ===
 
 // ParseSource parses the given source text and returns the resulting
 // Program along with any parse errors encountered. Errors are collected

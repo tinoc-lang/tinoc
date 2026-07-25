@@ -85,9 +85,7 @@ func Execute(args []string) {
 	}
 }
 
-// ----------------------------------------------------------------------
-// Subcommand Handlers
-// ----------------------------------------------------------------------
+// === Subcommand Handlers ===
 
 func handleBuild(args []string) {
 	fs := flag.NewFlagSet("build", flag.ExitOnError)

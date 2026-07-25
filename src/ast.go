@@ -5,9 +5,7 @@ import (
 	"strings"
 )
 
-// ----------------------------------------------------------------------
-// Core Node Interfaces
-// ----------------------------------------------------------------------
+// === Core Node Interfaces ===
 
 // Node is the base interface implemented by every AST node.
 type Node interface {
@@ -36,9 +34,8 @@ type TypeExpr interface {
 	typeNode()
 }
 
-// ----------------------------------------------------------------------
-// Program (root node)
-// ----------------------------------------------------------------------
+// === Program (root node) ===
+
 
 // Program is the root node of every parsed Tinoc source file.
 type Program struct {
@@ -61,9 +58,9 @@ func (p *Program) String() string {
 	return out.String()
 }
 
-// ----------------------------------------------------------------------
-// Identifiers
-// ----------------------------------------------------------------------
+
+// === Identifiers ===
+
 
 // Identifier represents a bare name reference, e.g. `x`, `add`, `io`.
 type Identifier struct {
@@ -75,9 +72,9 @@ func (i *Identifier) expressionNode()      {}
 func (i *Identifier) TokenLiteral() string { return i.Token.Literal }
 func (i *Identifier) String() string       { return i.Value }
 
-// ----------------------------------------------------------------------
-// Literal Expressions
-// ----------------------------------------------------------------------
+
+// === Literal Expressions ===
+
 
 // IntegerLiteral represents an integer literal in any base (decimal, hex,
 // octal, binary), e.g. `98222`, `0xff`, `0o755`, `0b11110000`, `1_000_000`.
@@ -165,9 +162,8 @@ func (al *ArrayLiteral) String() string {
 	return out.String()
 }
 
-// ----------------------------------------------------------------------
-// Other Basic Expressions
-// ----------------------------------------------------------------------
+// === Other Basic Expressions ===
+
 
 // PrefixExpression represents a unary prefix operator applied to an
 // expression, e.g. `-x`, `!a`, `&a`, `~x`, `-%x`.
@@ -417,9 +413,7 @@ func (sl *StructLiteral) String() string {
 	return out.String()
 }
 
-// ----------------------------------------------------------------------
-// Type Expressions
-// ----------------------------------------------------------------------
+// === Type Expressions ===
 
 // NamedType represents a plain named type, e.g. `i32`, `str`, `bool`,
 // `Point`, or the void return type.
@@ -536,9 +530,7 @@ func (at *ArrayType) String() string {
 	return out.String()
 }
 
-// ----------------------------------------------------------------------
-// Statements
-// ----------------------------------------------------------------------
+// === Statements ===
 
 // VarStatement represents a `var` declaration, with or without an explicit
 // type and/or initializer:
