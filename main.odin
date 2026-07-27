@@ -1,7 +1,8 @@
 package main
 
-import "core:fmt"
+import "core:os"
+import "src"
 
 main :: proc() {
-  fmt.println("TinocLang Compiler v0.1.0")
+	src.execute(os.args[1:])
 }
