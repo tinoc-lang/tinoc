@@ -3,24 +3,26 @@ set -e
 
 BUILD_DIR="build"
 
-# Detect OS (respects GOOS if explicitly set for cross-compiling)
-if [ -n "$GOOS" ]; then
-    TARGET_OS="$GOOS"
+# Detect OS (respects TARGET_OS or ODIN_TARGET if explicitly set)
+if [ -n "$TARGET_OS" ]; then
+    OS="$TARGET_OS"
+elif [ -n "$ODIN_TARGET" ]; then
+    OS="$ODIN_TARGET"
 else
     UNAME_S="$(uname -s 2>/dev/null || echo "unknown")"
     case "$UNAME_S" in
-        Linux*)               TARGET_OS="linux" ;;
-        Darwin*)              TARGET_OS="darwin" ;;
-        MINGW*|MSYS*|CYGWIN*) TARGET_OS="windows" ;;
-        FreeBSD*)             TARGET_OS="freebsd" ;;
-        OpenBSD*)             TARGET_OS="openbsd" ;;
-        *)                    TARGET_OS="linux" ;;
+        Linux*)               OS="linux" ;;
+        Darwin*)              OS="darwin" ;;
+        MINGW*|MSYS*|CYGWIN*) OS="windows" ;;
+        FreeBSD*)             OS="freebsd" ;;
+        OpenBSD*)             OS="openbsd" ;;
+        *)                    OS="linux" ;;
     esac
 fi
 
 # Set binary name extension
 BINARY_NAME="tinoc"
-if [ "$TARGET_OS" = "windows" ]; then
+if [ "$OS" = "windows" ]; then
     BINARY_NAME="tinoc.exe"
 fi
 
@@ -36,8 +38,10 @@ fi
 # Build steps
 mkdir -p "${BUILD_DIR}"
 
-echo "Building ${BINARY_NAME} for target: ${TARGET_OS}..."
-GOOS="${TARGET_OS}" go build -trimpath -ldflags="-s -w" -o "${OUTPUT_PATH}" main.go
+echo "Building ${BINARY_NAME} for target: ${OS}..."
+
+# Build package in current directory with speed optimizations
+odin build . -out:"${OUTPUT_PATH}" -o:speed -target:"${OS}"
 
 echo "Build complete -> ${OUTPUT_PATH}"
 
@@ -46,4 +50,3 @@ if command -v du >/dev/null 2>&1; then
     SIZE=$(du -h "${OUTPUT_PATH}" | awk '{print $1}')
     echo "Size: ${SIZE}"
 fi
-
