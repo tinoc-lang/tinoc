@@ -1,4 +1,0 @@
-fn main() i32 {
-  var num = 48;
-  return num;
-}
