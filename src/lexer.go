@@ -530,16 +530,14 @@ func (l *Lexer) readNumber() (string, TokenType) {
 func (l *Lexer) readString() string {
 	l.readChar() // skip opening quote
 	position := l.position
-	for {
-		if l.ch == '"' || l.ch == 0 {
-			break
-		}
+	for l.ch != '"' && l.ch != 0 {
 		if l.ch == '\\' {
 			l.readChar()
 		}
 		l.readChar()
 	}
-	// Closing quote (if present) is consumed by the trailing readChar in NextToken.
+	// Closing quote (if present) is consumed by the trailing
+	// readChar in NextToken.
 	return l.input[position:l.position]
 }
 
@@ -565,7 +563,7 @@ func (l *Lexer) skipWhitespaceAndComments() {
 		} else if l.ch == '/' && l.peekChar() == '*' {
 			l.readChar()
 			l.readChar()
-			for !(l.ch == '*' && l.peekChar() == '/') && l.ch != 0 {
+			for (l.ch != '*' || l.peekChar() != '/') && l.ch != 0 {
 				l.readChar()
 			}
 			if l.ch != 0 {
