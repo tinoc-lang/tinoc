@@ -190,27 +190,35 @@ handle_check :: proc(args: []string) {
 
 	stage(use_color, "CHECK", "analyzing %s", config.file_path)
 
-	/*
-	// Lexer/Parser checks commented out until implemented in Odin
-	total, illegal := dump_tokens(source)
-	if illegal > 0 {
+	lex_diags := diagnostics_make()
+	defer diagnostics_destroy(&lex_diags)
+	total, illegal := dump_tokens_quiet(source, &lex_diags)
+	if illegal > 0 || has_errors(&lex_diags) {
 		fail(use_color, "lexical check failed (%d illegal token(s) of %d total)", illegal, total)
+		print_diagnostics(&lex_diags, config.file_path, source, use_color)
 		os.exit(1)
 	}
 	ok_msg(use_color, "lexical check passed (%d tokens)", total)
 
-	_, parse_errs := parse_source(source)
-	if len(parse_errs) > 0 {
-		fail(use_color, "syntactic check found %d issue(s) (parser is partial; some may be unsupported syntax, not errors)", len(parse_errs))
-		for e in parse_errs {
-			fmt.eprintf("  %s\n", e)
-		}
-	} else {
-		ok_msg(use_color, "syntactic check passed")
+	parse_diags := diagnostics_make()
+	defer diagnostics_destroy(&parse_diags)
+	program := parse_source(source, &parse_diags)
+	if has_errors(&parse_diags) {
+		fail(use_color, "syntactic check found %d issue(s)", error_count(&parse_diags))
+		print_diagnostics(&parse_diags, config.file_path, source, use_color)
+		os.exit(1)
 	}
-	*/
+	ok_msg(use_color, "syntactic check passed (%d function(s))", len(program.functions))
 
-	placeholder(use_color, "lexical and syntactic checks are not yet implemented")
+	sem_diags := diagnostics_make()
+	defer diagnostics_destroy(&sem_diags)
+	check_program(program, &sem_diags)
+	if has_errors(&sem_diags) {
+		fail(use_color, "semantic check found %d issue(s)", error_count(&sem_diags))
+		print_diagnostics(&sem_diags, config.file_path, source, use_color)
+		os.exit(1)
+	}
+	ok_msg(use_color, "semantic check passed")
 }
 
 // Parses pipeline options and extracts positional argument file paths.
@@ -275,72 +283,197 @@ run_compiler_pipeline :: proc(mode: string, config: Pipeline_Config) {
 	}
 	defer delete(source)
 
-	/*
-	// Phase 1: Lexer (Commented out until implemented)
+	// Phase 1: Lexer
+	stage(use_color, "LEXER", "tokenizing %s", config.file_path)
+	lex_diags := diagnostics_make()
+	defer diagnostics_destroy(&lex_diags)
+
 	if config.lex {
-		stage(use_color, "LEXER", "tokenizing %s", config.file_path)
-		total, illegal := dump_tokens(source)
-		if illegal > 0 {
+		total, illegal := dump_tokens(source, &lex_diags)
+		if illegal > 0 || has_errors(&lex_diags) {
 			fail(use_color, "%d illegal token(s) found", illegal)
+			print_diagnostics(&lex_diags, config.file_path, source, use_color)
 			os.exit(1)
 		}
 		ok_msg(use_color, "%d tokens dumped", total)
 		return
 	}
 
-	stage(use_color, "LEXER", "tokenizing %s", config.file_path)
-	_, illegal := dump_tokens_quiet(source)
-	if illegal > 0 {
+	_, illegal := dump_tokens_quiet(source, &lex_diags)
+	if illegal > 0 || has_errors(&lex_diags) {
 		fail(use_color, "%d illegal token(s) found", illegal)
+		print_diagnostics(&lex_diags, config.file_path, source, use_color)
 		os.exit(1)
 	}
 	ok_msg(use_color, "lexing complete")
 
-	// Phase 2: Parser / AST (Commented out until implemented)
-	if config.ast {
-		stage(use_color, "PARSER", "parsing AST for %s", config.file_path)
-		_, errs := dump_ast(source)
-		if errs > 0 {
-			fail(use_color, "%d parse error(s) found (parser is partial; see errors above)", errs)
-			os.exit(1)
-		}
-		ok_msg(use_color, "AST parsed successfully")
-		return
-	}
-
+	// Phase 2: Parser / AST
 	stage(use_color, "PARSER", "parsing %s", config.file_path)
-	program, parse_errs := parse_source(source)
-	if len(parse_errs) > 0 {
-		fail(use_color, "%d parse error(s) found (parser is partial; see errors above)", len(parse_errs))
-		for e in parse_errs {
-			fmt.eprintf("  %s\n", e)
-		}
+	parse_diags := diagnostics_make()
+	defer diagnostics_destroy(&parse_diags)
+	program := parse_source(source, &parse_diags)
+
+	if has_errors(&parse_diags) {
+		fail(use_color, "%d parse error(s) found", error_count(&parse_diags))
+		print_diagnostics(&parse_diags, config.file_path, source, use_color)
 		os.exit(1)
 	}
-	ok_msg(use_color, "parsed %d top-level statement(s)", len(program.statements))
-	*/
+	ok_msg(use_color, "parsed %d function(s)", len(program.functions))
 
-	// Phase 3: Codegen
-	if config.emit_c {
-		stage(use_color, "CODEGEN", "transpiling %s to C", config.file_path)
-		placeholder(use_color, "C code generation is not yet implemented")
+	if config.ast {
+		stage(use_color, "PARSER", "AST for %s", config.file_path)
+		dump_ast(program)
 		return
 	}
 
-	stage(use_color, "CODEGEN", "transpiling %s to C", config.file_path)
-	placeholder(use_color, "C code generation is not yet implemented")
+	// Phase 3: Semantics
+	stage(use_color, "SEMA", "checking %s", config.file_path)
+	sem_diags := diagnostics_make()
+	defer diagnostics_destroy(&sem_diags)
+	check_program(program, &sem_diags)
 
-	// Phase 4: Link/compile C binary
+	if has_errors(&sem_diags) {
+		fail(use_color, "%d semantic error(s) found", error_count(&sem_diags))
+		print_diagnostics(&sem_diags, config.file_path, source, use_color)
+		os.exit(1)
+	}
+	ok_msg(use_color, "semantic checks passed")
+
+	// Phase 4: Codegen
+	stage(use_color, "CODEGEN", "transpiling %s to C", config.file_path)
+	c_source := generate_c(program)
+	defer delete(c_source)
+	ok_msg(use_color, "generated %d byte(s) of C", len(c_source))
+
+	c_path := determine_c_output_path(config)
+	defer delete(c_path)
+
+	write_err := os.write_entire_file(c_path, transmute([]u8)c_source)
+	if write_err != nil {
+		fail(use_color, "failed to write generated C to %s", c_path)
+		os.exit(1)
+	}
+
+	if config.emit_c {
+		fmt.println(c_source)
+		return
+	}
+
+	// Phase 5: Compile/link the generated C with the system C compiler.
 	out_name := determine_output_name(config)
 	defer delete(out_name)
 
 	stage(use_color, "BUILD", "compiling generated C -> %s", out_name)
-	placeholder(use_color, "C compilation/linking is not yet implemented")
+	compile_ok := compile_c_file(c_path, out_name, use_color, config.verbose)
+	if !compile_ok {
+		fail(use_color, "C compilation/linking failed")
+		os.exit(1)
+	}
+	ok_msg(use_color, "built %s", out_name)
 
 	if mode == "run" {
 		stage(use_color, "EXECUTE", "running ./%s", out_name)
-		placeholder(use_color, "execution is not yet implemented")
+		run_ok, exit_code := run_binary(out_name)
+		if !run_ok {
+			fail(use_color, "failed to execute %s", out_name)
+			os.exit(1)
+		}
+		if exit_code != 0 {
+			os.exit(exit_code)
+		}
 	}
+}
+
+// determine_c_output_path picks where the intermediate .c file is written:
+// alongside the requested output binary (or source file) with a .c
+// extension.
+determine_c_output_path :: proc(config: Pipeline_Config) -> string {
+	base := determine_output_name(config)
+	defer delete(base)
+	return strings.concatenate({base, ".c"})
+}
+
+// tinoc_header_dir locates utils/tinoc.h relative to the source file being
+// compiled, falling back to the current directory's utils/ folder. This
+// keeps `tinoc build path/to/file.tnc` working from any invocation
+// directory as long as the repo layout is intact.
+tinoc_header_dir :: proc() -> string {
+	candidates := []string{"utils", "../utils"}
+	for c in candidates {
+		header, join_err := filepath.join({c, "tinoc.h"})
+		if join_err != nil {
+			continue
+		}
+		defer delete(header)
+		if os.exists(header) {
+			return strings.clone(c)
+		}
+	}
+	return strings.clone("utils")
+}
+
+// compile_c_file shells out to a system C compiler (cc, falling back to
+// gcc/clang) to build the generated C into a native binary.
+compile_c_file :: proc(c_path, out_name: string, use_color: bool, verbose: bool) -> bool {
+	header_dir := tinoc_header_dir()
+	defer delete(header_dir)
+
+	compilers := []string{"cc", "gcc", "clang"}
+	for compiler in compilers {
+		args := []string{compiler, c_path, "-I", header_dir, "-o", out_name, "-lm"}
+		if verbose {
+			stage(use_color, "INFO", "running: %s", strings.join(args, " "))
+		}
+
+		state, _, stderr, err := os.process_exec(
+			os.Process_Desc{command = args},
+			context.allocator,
+		)
+		defer delete(stderr)
+
+		if err != nil {
+			// Compiler not found or failed to launch; try the next one.
+			continue
+		}
+
+		if state.exit_code != 0 {
+			fmt.eprint(string(stderr))
+			return false
+		}
+		return true
+	}
+
+	fail(use_color, "no working C compiler found (tried cc, gcc, clang)")
+	return false
+}
+
+// run_binary executes the freshly built binary in the current directory,
+// forwarding its stdout/stderr, and returns whether it launched
+// successfully along with its exit code.
+run_binary :: proc(out_name: string) -> (bool, int) {
+	exe_path := out_name
+	needs_free := false
+	if !strings.has_prefix(exe_path, "./") && !strings.has_prefix(exe_path, "/") {
+		exe_path = strings.concatenate({"./", out_name})
+		needs_free = true
+	}
+	defer if needs_free {
+		delete(exe_path)
+	}
+
+	state, _, stderr, err := os.process_exec(
+		os.Process_Desc{command = []string{exe_path}},
+		context.allocator,
+	)
+	defer delete(stderr)
+
+	if err != nil {
+		return false, 1
+	}
+	if len(stderr) > 0 {
+		fmt.eprint(string(stderr))
+	}
+	return true, state.exit_code
 }
 
 determine_output_name :: proc(config: Pipeline_Config) -> string {
@@ -349,7 +482,7 @@ determine_output_name :: proc(config: Pipeline_Config) -> string {
 	}
 	ext := filepath.ext(config.file_path)
 	base := filepath.base(config.file_path)
-	return strings.trim_suffix(base, ext)
+	return strings.clone(strings.trim_suffix(base, ext))
 }
 
 // Help Screens & Version Info
