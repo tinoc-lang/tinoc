@@ -246,7 +246,7 @@ func runCompilerPipeline(mode string, config PipelineConfig) {
 
 	// Phase 1: Lexer. Always runs first, since every later phase depends
 	// on it. -l/--lex is a cutoff: print the token stream and stop here.
-	
+
 	if config.Lex {
 		stage(useColor, "LEXER", "tokenizing %s", config.FilePath)
 		total, illegal := DumpTokens(source)
@@ -268,7 +268,7 @@ func runCompilerPipeline(mode string, config PipelineConfig) {
 
 	// Phase 2: Parser / AST. -a/--ast is a cutoff: print the AST and stop
 	// here. Otherwise parse and continue, since codegen needs the AST.
-	
+
 	if config.AST {
 		stage(useColor, "PARSER", "parsing AST for %s", config.FilePath)
 		_, errs := DumpAST(source)
@@ -305,7 +305,7 @@ func runCompilerPipeline(mode string, config PipelineConfig) {
 
 	// === Phase 4: Link/compile the generated C into a binary. Also not
 	// implemented yet. ===
-	
+
 	outName := determineOutputName(config)
 	stage(useColor, "BUILD", "compiling generated C -> %s", outName)
 	placeholder(useColor, "C compilation/linking is not yet implemented")

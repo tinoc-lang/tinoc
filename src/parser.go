@@ -6,7 +6,6 @@ import (
 	"strings"
 )
 
-
 // === Precedence Table ===
 //
 // Mirrors (a subset of) the precedence line from syntax.md:
@@ -92,7 +91,6 @@ var precedences = map[TokenType]precedence{
 	TOKEN_COLON:  CALL, // generic call: ident:T(...)
 	TOKEN_LBRACE: CALL, // struct literal: Type { .field = value, ... }
 }
-
 
 // === Parser ===
 
@@ -359,7 +357,6 @@ func (p *Parser) skipSemicolon() {
 
 // === return / break / continue ===
 
-
 func (p *Parser) parseReturnStatement() Statement {
 	stmt := &ReturnStatement{Token: p.curToken}
 
@@ -415,7 +412,6 @@ func (p *Parser) parseImportStatement() Statement {
 
 // === Blocks ===
 
-
 func (p *Parser) parseBlockStatement() *BlockStatement {
 	block := &BlockStatement{Token: p.curToken, Statements: []Statement{}}
 
@@ -433,7 +429,6 @@ func (p *Parser) parseBlockStatement() *BlockStatement {
 }
 
 // === if / while / for ===
-
 
 func (p *Parser) parseIfStatement() Statement {
 	stmt := &IfStatement{Token: p.curToken}
@@ -1257,4 +1252,3 @@ func (p *Parser) parseArrayType() TypeExpr {
 
 	return at
 }
-

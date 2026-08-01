@@ -36,7 +36,6 @@ type TypeExpr interface {
 
 // === Program (root node) ===
 
-
 // Program is the root node of every parsed Tinoc source file.
 type Program struct {
 	Statements []Statement
@@ -58,9 +57,7 @@ func (p *Program) String() string {
 	return out.String()
 }
 
-
 // === Identifiers ===
-
 
 // Identifier represents a bare name reference, e.g. `x`, `add`, `io`.
 type Identifier struct {
@@ -72,9 +69,7 @@ func (i *Identifier) expressionNode()      {}
 func (i *Identifier) TokenLiteral() string { return i.Token.Literal }
 func (i *Identifier) String() string       { return i.Value }
 
-
 // === Literal Expressions ===
-
 
 // IntegerLiteral represents an integer literal in any base (decimal, hex, octal, binary), e.g. `98222`, `0xff`, `0o755`, `0b11110000`, `1_000_000`.
 // The raw token literal (with underscores/prefix intact) is preserved in
@@ -107,7 +102,7 @@ type StringLiteral struct {
 	Value string
 }
 
-func (sl *StringLiteral) expressionNode() {}
+func (sl *StringLiteral) expressionNode()      {}
 func (sl *StringLiteral) TokenLiteral() string { return sl.Token.Literal }
 func (sl *StringLiteral) String() string       { return "\"" + sl.Value + "\"" }
 
@@ -162,7 +157,6 @@ func (al *ArrayLiteral) String() string {
 }
 
 // === Other Basic Expressions ===
-
 
 // PrefixExpression represents a unary prefix operator applied to an
 // expression, e.g. `-x`, `!a`, `&a`, `~x`, `-%x`.
@@ -829,4 +823,3 @@ func (is *ImportStatement) String() string {
 	out.WriteString(";")
 	return out.String()
 }
-
