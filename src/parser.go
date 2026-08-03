@@ -533,12 +533,35 @@ func (p *Parser) parsePubStatement() Statement {
 	return p.parseStatement()
 }
 
+// parseStaticStatement handles the `static` modifier, which currently
+// prefixes three statement kinds: `static fn` (static method inside a
+// struct/union/enum body), `static var`, and `static const`. The modifier
+// itself carries no new token; it is folded into IsStatic on the resulting
+// node so downstream stages (sema, codegen) can tell static bindings/
+// functions apart from ordinary ones without re-inspecting tokens.
 func (p *Parser) parseStaticStatement() Statement {
-	if !p.expectPeek(TOKEN_FN) {
+	switch p.peekToken.Type {
+	case TOKEN_FN:
+		p.nextToken()
+		return p.parseFunctionStatement(true)
+	case TOKEN_VAR:
+		p.nextToken()
+		stmt := p.parseVarStatement()
+		if v, ok := stmt.(*VarStatement); ok {
+			v.IsStatic = true
+		}
+		return stmt
+	case TOKEN_CONST:
+		p.nextToken()
+		stmt := p.parseConstStatement()
+		if c, ok := stmt.(*ConstStatement); ok {
+			c.IsStatic = true
+		}
+		return stmt
+	default:
+		p.addError("expected 'fn', 'var', or 'const' after 'static', got %s (%q) instead", p.peekToken.Type, p.peekToken.Literal)
 		return nil
 	}
-	fn := p.parseFunctionStatement(true)
-	return fn
 }
 
 func (p *Parser) parseFunctionStatement(isStatic bool) Statement {

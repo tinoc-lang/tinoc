@@ -532,16 +532,20 @@ func (at *ArrayType) String() string {
 //	var <identifier> <type> = <expression>;
 //	var <identifier> = <expression>;
 type VarStatement struct {
-	Token Token // TOKEN_VAR
-	Name  *Identifier
-	Type  TypeExpr   // nil when the type is inferred
-	Value Expression // nil for decl-only
+	Token    Token // TOKEN_VAR
+	Name     *Identifier
+	Type     TypeExpr   // nil when the type is inferred
+	Value    Expression // nil for decl-only
+	IsStatic bool       // set for `static var`
 }
 
 func (vs *VarStatement) statementNode()       {}
 func (vs *VarStatement) TokenLiteral() string { return vs.Token.Literal }
 func (vs *VarStatement) String() string {
 	var out bytes.Buffer
+	if vs.IsStatic {
+		out.WriteString("static ")
+	}
 	out.WriteString(vs.TokenLiteral() + " ")
 	out.WriteString(vs.Name.String())
 	if vs.Type != nil {
@@ -558,16 +562,20 @@ func (vs *VarStatement) String() string {
 // ConstStatement represents a `const` declaration. Same shape as
 // VarStatement, but the binding cannot be mutated afterward.
 type ConstStatement struct {
-	Token Token // TOKEN_CONST
-	Name  *Identifier
-	Type  TypeExpr   // nil when the type is inferred
-	Value Expression // nil for decl-only
+	Token    Token // TOKEN_CONST
+	Name     *Identifier
+	Type     TypeExpr   // nil when the type is inferred
+	Value    Expression // nil for decl-only
+	IsStatic bool       // set for `static const`
 }
 
 func (cs *ConstStatement) statementNode()       {}
 func (cs *ConstStatement) TokenLiteral() string { return cs.Token.Literal }
 func (cs *ConstStatement) String() string {
 	var out bytes.Buffer
+	if cs.IsStatic {
+		out.WriteString("static ")
+	}
 	out.WriteString(cs.TokenLiteral() + " ")
 	out.WriteString(cs.Name.String())
 	if cs.Type != nil {

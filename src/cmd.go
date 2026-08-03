@@ -4,6 +4,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 )
@@ -87,6 +88,38 @@ func Execute(args []string) {
 
 // === Subcommand Handlers ===
 
+// reorderArgs rearranges a subcommand's raw arguments so every flag
+// (anything starting with "-") comes before the positional arguments,
+// regardless of how the person typed them. Go's stdlib flag package
+// stops parsing at the first non-flag token, which would otherwise force
+// an unintuitive rule like "the file must come last" (`tinoc build -o out
+// prog.tnc` works but `tinoc build prog.tnc -o out` would not); Tinoc's
+// CLI accepts either order like most modern tools do.
+//
+// A flag that takes a value passed as a separate token (`-o out`, not
+// `-o=out`) is kept paired with its value by never treating a token
+// immediately after a known value-taking flag as positional.
+func reorderArgs(args []string) []string {
+	valueFlags := map[string]bool{
+		"-o": true, "--output": true,
+	}
+
+	var flags, positional []string
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		if strings.HasPrefix(a, "-") {
+			flags = append(flags, a)
+			if valueFlags[a] && !strings.Contains(a, "=") && i+1 < len(args) {
+				i++
+				flags = append(flags, args[i])
+			}
+			continue
+		}
+		positional = append(positional, a)
+	}
+	return append(flags, positional...)
+}
+
 func handleBuild(args []string) {
 	fs := flag.NewFlagSet("build", flag.ExitOnError)
 	var config PipelineConfig
@@ -97,7 +130,7 @@ func handleBuild(args []string) {
 		printSubcommandHelp("build")
 	}
 
-	_ = fs.Parse(args)
+	_ = fs.Parse(reorderArgs(args))
 
 	if fs.NArg() < 1 {
 		fail(supportsColor(), "missing target file for 'build'")
@@ -124,7 +157,7 @@ func handleRun(args []string) {
 		printSubcommandHelp("run")
 	}
 
-	_ = fs.Parse(args)
+	_ = fs.Parse(reorderArgs(args))
 
 	if fs.NArg() < 1 {
 		fail(supportsColor(), "missing target file for 'run'")
@@ -152,7 +185,7 @@ func handleCheck(args []string) {
 		printSubcommandHelp("check")
 	}
 
-	_ = fs.Parse(args)
+	_ = fs.Parse(reorderArgs(args))
 
 	if fs.NArg() < 1 {
 		fail(supportsColor(), "missing target file for 'check'")
@@ -190,9 +223,34 @@ func handleCheck(args []string) {
 		for _, e := range parseErrs {
 			fmt.Fprintf(os.Stderr, "  %s\n", e.String())
 		}
-	} else {
-		ok(useColor, "syntactic check passed")
+		os.Exit(1)
 	}
+	ok(useColor, "syntactic check passed")
+
+	// Sema runs on top of a clean parse. It covers var/const/static
+	// var/static const/fn fully; anything else in the program (struct/
+	// enum/union/switch/generics/etc) is left unchecked by this pass
+	// rather than reported as an error, matching the parser's own
+	// "partial, not wrong" stance above.
+	_, _, diags := RunSema(config.FilePath, source)
+
+	semaErrs := 0
+	for _, d := range diags.All() {
+		if d.Severity == SeverityError && d.Stage == "sema" {
+			semaErrs++
+		}
+	}
+
+	if semaErrs > 0 {
+		fail(useColor, "semantic check found %s", pluralize(semaErrs, "issue", "issues"))
+		for _, d := range diags.All() {
+			if d.Stage == "sema" {
+				fmt.Fprintln(os.Stderr, "  "+d.Colorize(useColor))
+			}
+		}
+		os.Exit(1)
+	}
+	ok(useColor, "semantic check passed")
 }
 
 // Binds short and long flags to the same option pointers.
@@ -227,6 +285,12 @@ func readSourceFileContent(path string) (string, error) {
 }
 
 // Compiler Execution Pipeline
+//
+// Full pipeline: Lexer -> Parser/AST -> Sema -> Codegen -> C compiler ->
+// (run mode only) execute the resulting binary. Each stage after the
+// lexer can be cut off early via -l/-a/-c for inspecting intermediate
+// output; without a cutoff flag, `build` runs through native compilation
+// and `run` additionally executes the result.
 
 func runCompilerPipeline(mode string, config PipelineConfig) {
 	useColor := supportsColor()
@@ -267,7 +331,7 @@ func runCompilerPipeline(mode string, config PipelineConfig) {
 	ok(useColor, "lexing complete")
 
 	// Phase 2: Parser / AST. -a/--ast is a cutoff: print the AST and stop
-	// here. Otherwise parse and continue, since codegen needs the AST.
+	// here. Otherwise parse and continue, since sema/codegen need the AST.
 
 	if config.AST {
 		stage(useColor, "PARSER", "parsing AST for %s", config.FilePath)
@@ -291,41 +355,154 @@ func runCompilerPipeline(mode string, config PipelineConfig) {
 	}
 	ok(useColor, "parsed %d top-level statement(s)", len(program.Statements))
 
-	// Phase 3: Codegen. -c/--emit-c is a cutoff. Codegen itself is not
-	// implemented yet, so both the cutoff and the full-pipeline path
-	// report it as a placeholder rather than pretending it ran.
+	// Phase 3: Sema. Type-checks and resolves names for var/const/static
+	// var/static const/fn (see sema.go); Codegen depends on its resolved
+	// types, so it always runs before codegen regardless of cutoff flags.
+
+	stage(useColor, "SEMA", "analyzing %s", config.FilePath)
+	diags := NewDiagnostics(config.FilePath)
+	sema := NewSema(diags)
+	sema.Check(program)
+
+	if diags.HasErrors() {
+		fail(useColor, "%s found", diags.Summary(useColor))
+		diags.PrintStderr()
+		os.Exit(1)
+	}
+	ok(useColor, "semantic analysis passed")
+
+	// Phase 4: Codegen. -c/--emit-c is a cutoff: print the generated C
+	// and stop here (or write it to -o if given).
+
+	stage(useColor, "CODEGEN", "transpiling %s to C", config.FilePath)
+	gen := NewCodegen(sema, diags)
+	cCode := gen.Generate(program)
+
+	if diags.HasErrors() {
+		fail(useColor, "%s found during codegen", diags.Summary(useColor))
+		diags.PrintStderr()
+		os.Exit(1)
+	}
+	ok(useColor, "generated %d line(s) of C", strings.Count(cCode, "\n"))
+
 	if config.EmitC {
-		stage(useColor, "CODEGEN", "transpiling %s to C", config.FilePath)
-		placeholder(useColor, "C code generation is not yet implemented")
+		if config.OutputPath != "" {
+			if err := os.WriteFile(config.OutputPath, []byte(cCode), 0o644); err != nil {
+				fail(useColor, "cannot write %s: %v", config.OutputPath, err)
+				os.Exit(1)
+			}
+			ok(useColor, "wrote %s", config.OutputPath)
+		} else {
+			fmt.Print(cCode)
+		}
 		return
 	}
 
-	stage(useColor, "CODEGEN", "transpiling %s to C", config.FilePath)
-	placeholder(useColor, "C code generation is not yet implemented")
+	// Phase 5: Native compilation. Discover a C compiler (gcc/clang/cc/
+	// tcc, or $CC/$TINOC_CC override), write the generated C plus the
+	// embedded tinoc.h runtime header to a work directory, and invoke it.
 
-	// === Phase 4: Link/compile the generated C into a binary. Also not
-	// implemented yet. ===
+	cc, err := FindCCompiler()
+	if err != nil {
+		fail(useColor, "%v", err)
+		os.Exit(1)
+	}
 
 	outName := determineOutputName(config)
 	stage(useColor, "BUILD", "compiling generated C -> %s", outName)
-	placeholder(useColor, "C compilation/linking is not yet implemented")
+	if useColor {
+		fmt.Printf("  %susing%s %s%s%s %s(%s)%s\n", colorDim, colorReset, colorCyan, cc.Name, colorReset, colorDim, cc.Path, colorReset)
+	} else {
+		fmt.Printf("  using %s (%s)\n", cc.Name, cc.Path)
+	}
+	if config.Verbose && cc.Version != "" {
+		fmt.Printf("  %s\n", cc.Version)
+	}
+
+	binPath, err := compileGeneratedC(cc, config.FilePath, cCode, outName, config.Verbose, useColor)
+	if err != nil {
+		fail(useColor, "%v", err)
+		os.Exit(1)
+	}
+	ok(useColor, "build succeeded -> %s", binPath)
 
 	if mode == "run" {
-		stage(useColor, "EXECUTE", "running ./%s", outName)
-		placeholder(useColor, "execution is not yet implemented")
+		stage(useColor, "EXECUTE", "running %s", binPath)
+		fmt.Println()
+		exitCode := runBinary(binPath)
+		if exitCode != 0 {
+			fmt.Println()
+			fail(useColor, "program exited with status %d", exitCode)
+			os.Exit(exitCode)
+		}
 	}
 }
 
-// placeholder marks output for a pipeline phase that has not been
-// implemented yet, so `build`/`run` without cutoff flags clearly show
-// which phases actually ran versus which are still stubs.
-func placeholder(useColor bool, format string, args ...interface{}) {
-	msg := fmt.Sprintf(format, args...)
-	if useColor {
-		fmt.Printf("  %s[placeholder]%s %s\n", colorYellow, colorReset, msg)
-	} else {
-		fmt.Printf("  [placeholder] %s\n", msg)
+// compileGeneratedC writes the generated C source and the embedded
+// tinoc.h runtime header into a temporary work directory, then invokes
+// the discovered C compiler to produce outName. Returns the path to the
+// compiled binary (made absolute so `run` can exec it regardless of the
+// working directory).
+func compileGeneratedC(cc *CCompiler, sourcePath, cCode, outName string, verbose, useColor bool) (string, error) {
+	workDir, err := os.MkdirTemp("", "tinoc-build-*")
+	if err != nil {
+		return "", fmt.Errorf("cannot create build work directory: %w", err)
 	}
+
+	base := strings.TrimSuffix(filepath.Base(sourcePath), filepath.Ext(sourcePath))
+	cFile := filepath.Join(workDir, base+".c")
+	if err := os.WriteFile(cFile, []byte(cCode), 0o644); err != nil {
+		return "", fmt.Errorf("cannot write generated C to %s: %w", cFile, err)
+	}
+	if err := os.WriteFile(filepath.Join(workDir, "tinoc.h"), []byte(RuntimeHeader), 0o644); err != nil {
+		return "", fmt.Errorf("cannot write tinoc.h runtime header: %w", err)
+	}
+
+	outPath := outName
+	if !filepath.IsAbs(outPath) {
+		if abs, err := filepath.Abs(outPath); err == nil {
+			outPath = abs
+		}
+	}
+
+	args := cc.BuildArgs(cFile, outPath, []string{workDir})
+
+	if verbose {
+		if useColor {
+			fmt.Printf("  %s$ %s %s%s\n", colorDim, cc.Path, strings.Join(args, " "), colorReset)
+		} else {
+			fmt.Printf("  $ %s %s\n", cc.Path, strings.Join(args, " "))
+		}
+	}
+
+	cmd := exec.Command(cc.Path, args...)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		return "", fmt.Errorf("%s failed to compile generated C: %w", cc.Name, err)
+	}
+
+	return outPath, nil
+}
+
+// runBinary executes the compiled program, forwarding stdio directly so
+// interactive programs behave normally, and returns its exit code (0 on
+// success, the child's exit status otherwise, or 1 if the process
+// couldn't be started at all).
+func runBinary(binPath string) int {
+	cmd := exec.Command(binPath)
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+
+	if err := cmd.Run(); err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			return exitErr.ExitCode()
+		}
+		fmt.Fprintf(os.Stderr, "error: cannot run %s: %v\n", binPath, err)
+		return 1
+	}
+	return 0
 }
 
 func determineOutputName(config PipelineConfig) string {

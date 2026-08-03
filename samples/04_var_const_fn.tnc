@@ -1,0 +1,58 @@
+// Demonstrates the currently supported subset of Tinoc:
+// var, const, static var, static const, and basic functions.
+
+fn add(a i32, b i32) i32 {
+	return a + b;
+}
+
+fn square(n i32) i32 {
+	return n * n;
+}
+
+// static var keeps its value across calls, backed by C's own `static`
+// storage duration -- each call increments the same counter.
+fn nextId() i32 {
+	static var counter i32 = 0;
+	counter += 1;
+	return counter;
+}
+
+fn main() void {
+	var x i32 = 10;
+	var y = 20; // inferred type: i32
+
+	const pi = 3;          // inferred type: i32 (integer literal)
+	const maxRetries i32 = 5;
+
+	static const version i32 = 1;
+
+	var sum = add(x, y);
+	var sq = square(sum);
+
+	if sq > 100 {
+		x += 1;
+	} else if sq == 100 {
+		x = 0;
+	} else {
+		x -= 1;
+	}
+
+	var total i32 = 0;
+	var i i32 = 0;
+	while i < maxRetries {
+		total += i;
+		i += 1;
+	}
+
+	for 0..5 |n| {
+		total += n;
+	}
+
+	var idA = nextId();
+	var idB = nextId();
+	var idC = nextId();
+
+	const _unused = version + pi + idA + idB + idC + total;
+
+	return;
+}
