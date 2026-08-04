@@ -1,17 +1,13 @@
 #!/usr/bin/env bash
 #
-# Tinoc build script.
-# Usage: ./build.sh [command] [flags]
+# Tinoc build script.                         # Usage: ./build.sh [command] [flags]
 # Run './build.sh help' for the full command list.
 
 set -euo pipefail
 
-BUILD_DIR="build"
-DIST_DIR="dist"
-COVER_DIR="coverage"
+BUILD_DIR="build"                             DIST_DIR="dist"                               COVER_DIR="coverage"
 BINARY_BASE="tinoc"
-MODULE_PATH="main.go"
-INSTALL_DIR="${INSTALL_DIR:-/usr/local/bin}"
+MODULE_PATH="main.go"                         INSTALL_DIR="${INSTALL_DIR:-/usr/local/bin}"
 TEST_TIMEOUT="${TEST_TIMEOUT:-120s}"
 
 VERSION="${VERSION:-$(git describe --tags --always --dirty 2>/dev/null || echo dev)}"
@@ -139,6 +135,7 @@ cmd_build_all() {
     info "Cross-compiling tinoc for all platforms"
     mkdir -p "${DIST_DIR}"
 
+    local err_file="${TMPDIR:-/tmp}/tinoc_build_err"
     local targets=("linux amd64" "linux arm64" "darwin amd64" "darwin arm64" "windows amd64")
     local failures=0
 
@@ -148,13 +145,14 @@ cmd_build_all() {
         [ "$os" = "windows" ] && ext=".exe"
         out="${DIST_DIR}/${BINARY_BASE}-${os}-${arch}${ext}"
         step "${os}/${arch}"
-        if GOOS="$os" GOARCH="$arch" go build -trimpath -ldflags="$(ldflags release)" -o "$out" "$MODULE_PATH" 2>/tmp/tinoc_build_err; then
+        if GOOS="$os" GOARCH="$arch" go build -trimpath -ldflags="$(ldflags release)" -o "$out" "$MODULE_PATH" 2>"$err_file"; then
             ok "  ${out} ($(du -h "$out" 2>/dev/null | awk '{print $1}'))"
         else
             error "  ${os}/${arch} failed"
-            cat /tmp/tinoc_build_err >&2
+            [ -f "$err_file" ] && cat "$err_file" >&2
             failures=$((failures + 1))
         fi
+        rm -f "$err_file"
     done
 
     echo
@@ -280,20 +278,23 @@ cmd_check() {
 
 cmd_install() {
     cmd_build
-    local os out dest
+    local os out dest err_file
+    err_file="${TMPDIR:-/tmp}/tinoc_install_err"
     os="$(detect_os)"
     out="${BUILD_DIR}/$(binary_name "$os")"
     dest="${INSTALL_DIR}/$(binary_name "$os")"
     info "Installing to ${dest}"
     mkdir -p "${INSTALL_DIR}" 2>/dev/null || true
-    if cp "$out" "$dest" 2>/tmp/tinoc_install_err; then
+    if cp "$out" "$dest" 2>"$err_file"; then
         chmod +x "$dest"
         ok "Installed -> ${dest}"
     else
         error "Install failed (try: sudo INSTALL_DIR=${INSTALL_DIR} ./build.sh install)"
-        cat /tmp/tinoc_install_err >&2
+        [ -f "$err_file" ] && cat "$err_file" >&2
+        rm -f "$err_file"
         exit 1
     fi
+    rm -f "$err_file"
 }
 
 cmd_clean() {
