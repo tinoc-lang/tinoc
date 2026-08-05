@@ -10,7 +10,7 @@ import (
 
 // === Codegen Tests ===
 //
-// These go one step further than sema_test.go: they generate real C99
+// These go one step further than sema_test.go: they generate real C11
 // from Tinoc source, compile it with whatever C compiler build.sh/
 // ccompiler.go finds on the host, run the resulting binary, and assert
 // on its actual exit code / stdout. This is the strongest correctness

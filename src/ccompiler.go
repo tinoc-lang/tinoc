@@ -11,7 +11,7 @@ import (
 
 // === C Compiler Discovery ===
 //
-// Tinoc transpiles to C99 and then needs a real C compiler to turn that
+// Tinoc transpiles to C11 and then needs a real C compiler to turn that
 // into a binary for `build`/`run`. Systems differ in what's installed
 // (gcc, clang, a vendor cc shim, tcc, ...), so this file probes for one
 // at pipeline time rather than hardcoding a single name, and reports
@@ -212,12 +212,17 @@ func probeCCompiler(path string) (CCompilerKind, string) {
 
 // BuildArgs returns the argument list to compile a single C source file
 // into an output binary, tuned per compiler family. All three supported
-// families accept this same core flag set (-std=c99, -O2, -o); kept as a
+// families accept this same core flag set (-std=c11, -O2, -o); kept as a
 // method (rather than one hardcoded slice in cmd.go) so a compiler-
 // specific quirk can be special-cased here later without touching the
 // pipeline driver.
+//
+// C11 (rather than C99) is the transpile target: it unlocks the
+// C11-guarded features in tinoc.h (_Generic dispatch for saturating
+// arithmetic) and gives future passes (optionals, error unions, typed
+// enums) a richer target language.
 func (c *CCompiler) BuildArgs(cFile, outPath string, includeDirs []string) []string {
-	args := []string{"-std=c99", "-O2"}
+	args := []string{"-std=c11", "-O2"}
 	if c.Kind != CCTinyCC {
 		// tcc's -Wall/-Wextra coverage is minimal and noisy in ways
 		// unrelated to generated-code quality; skip them there, keep
