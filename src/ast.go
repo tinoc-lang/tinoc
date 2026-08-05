@@ -406,6 +406,75 @@ func (sl *StructLiteral) String() string {
 	return out.String()
 }
 
+// StructField is a single named field inside a struct body, e.g. the
+// `x f32;` in `struct Point { x f32; y f32; }`.
+type StructField struct {
+	Name *Identifier
+	Type TypeExpr
+}
+
+func (f *StructField) String() string {
+	if f.Type == nil {
+		return f.Name.String()
+	}
+	return f.Name.String() + " " + f.Type.String()
+}
+
+// StructStatement represents a struct declaration:
+//
+//	struct <identifier> {
+//	    <field> <type>;
+//	    ...
+//	    fn <identifier>(self ^<type-of-struct>, ...) <type> {...}
+//	    static fn <identifier>(<param> <type>, ...) <type> {...}
+//	}
+//
+// Methods (including `static fn` ones, distinguished via
+// FunctionStatement.IsStatic) are collected into Methods; generics
+// (`struct Pair:T { ... }`) are rejected during parsing with a clear
+// "not yet supported" diagnostic.
+type StructStatement struct {
+	Token   Token // TOKEN_STRUCT
+	Name    *Identifier
+	Fields  []*StructField
+	Methods []*FunctionStatement
+	IsPub   bool
+}
+
+func (ss *StructStatement) statementNode()       {}
+func (ss *StructStatement) TokenLiteral() string { return ss.Token.Literal }
+func (ss *StructStatement) String() string {
+	var out bytes.Buffer
+	if ss.IsPub {
+		out.WriteString("pub ")
+	}
+	out.WriteString("struct ")
+	if ss.Name != nil {
+		out.WriteString(ss.Name.String())
+	}
+	out.WriteString(" {\n")
+	for _, f := range ss.Fields {
+		out.WriteString("\t")
+		if f != nil {
+			out.WriteString(f.String())
+		}
+		out.WriteString(";\n")
+	}
+	for _, m := range ss.Methods {
+		if m == nil {
+			continue
+		}
+		if m.IsStatic {
+			out.WriteString("\tstatic ")
+		}
+		out.WriteString("\t")
+		out.WriteString(m.String())
+		out.WriteString("\n")
+	}
+	out.WriteString("}")
+	return out.String()
+}
+
 // === Type Expressions ===
 
 // NamedType represents a plain named type, e.g. `i32`, `str`, `bool`,

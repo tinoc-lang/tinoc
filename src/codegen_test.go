@@ -402,3 +402,167 @@ fn main() void {
 		t.Fatalf("expected exit 0, got %d", code)
 	}
 }
+
+// === Struct Codegen Tests ===
+
+func TestCodegen_StructLiteralAndFieldAccess(t *testing.T) {
+	_, code := runMainWithExit(t, `
+struct Point {
+	x f32;
+	y f32;
+}
+
+fn main() void {
+	var p Point = Point { .x = 1.0, .y = 2.0 };
+	p.x = 40.0;
+	var rounded i32 = 0;
+	if p.x > 39.0 and p.x < 41.0 {
+		rounded = 40;
+	}
+	tinoc_exit(rounded);
+}
+`)
+	if code != 40 {
+		t.Fatalf("expected exit 40 (field access + mutation through struct literal), got %d", code)
+	}
+}
+
+func TestCodegen_StructInstanceMethod(t *testing.T) {
+	_, code := runMainWithExit(t, `
+struct Counter {
+	value i32;
+
+	fn inc(self ^Counter, by i32) void {
+		self^.value += by;
+	}
+
+	fn get(self ^Counter) i32 {
+		return self^.value;
+	}
+}
+
+fn main() void {
+	var c Counter = Counter { .value = 0 };
+	c.inc(5);
+	c.inc(7);
+	tinoc_exit(c.get());
+}
+`)
+	if code != 12 {
+		t.Fatalf("expected exit 12 (5+7 via methods mutating self), got %d", code)
+	}
+}
+
+func TestCodegen_StructStaticMethodAndReturn(t *testing.T) {
+	_, code := runMainWithExit(t, `
+struct Rect {
+	w i32;
+	h i32;
+
+	static fn square(side i32) Rect {
+		return Rect { .w = side, .h = side };
+	}
+
+	fn area(self ^Rect) i32 {
+		return self^.w * self^.h;
+	}
+}
+
+fn main() void {
+	var r = Rect.square(9);
+	tinoc_exit(r.area());
+}
+`)
+	if code != 81 {
+		t.Fatalf("expected exit 81 (9*9 via static constructor + method), got %d", code)
+	}
+}
+
+func TestCodegen_StructNestedAndCopy(t *testing.T) {
+	_, code := runMainWithExit(t, `
+struct Vec2 {
+	x i32;
+	y i32;
+}
+
+struct Player {
+	pos Vec2;
+	lives i32;
+
+	fn moveBy(self ^Player, dx i32, dy i32) void {
+		self^.pos.x += dx;
+		self^.pos.y += dy;
+	}
+}
+
+fn main() void {
+	var p Player = Player { .pos = Vec2 { .x = 10, .y = 20 }, .lives = 3 };
+	p.moveBy(5, 2);
+
+	var q = p; // struct copy: later mutations to q must not touch p
+	q.pos.x = 999;
+
+	if p.pos.x == 15 and p.pos.y == 22 and q.pos.x == 999 {
+		tinoc_exit(p.lives * 10 + 2);
+	}
+	tinoc_exit(1);
+}
+`)
+	if code != 32 {
+		t.Fatalf("expected exit 32 (nested struct mutation via method + copy semantics), got %d", code)
+	}
+}
+
+func TestCodegen_StructLinkedList(t *testing.T) {
+	_, code := runMainWithExit(t, `
+struct Node {
+	value i32;
+	next ^Node;
+}
+
+fn sum(n ^Node) i32 {
+	var total i32 = 0;
+	var cur ^Node = n;
+	while cur != null {
+		total += cur^.value;
+		cur = cur^.next;
+	}
+	return total;
+}
+
+fn main() void {
+	var n1 Node = Node { .value = 1, .next = null };
+	var n2 Node = Node { .value = 2, .next = &n1 };
+	var n3 Node = Node { .value = 3, .next = &n2 };
+	tinoc_exit(sum(&n3));
+}
+`)
+	if code != 6 {
+		t.Fatalf("expected exit 6 (linked list sum via self-referencing struct), got %d", code)
+	}
+}
+
+func TestCodegen_StructAsParamAndReturn(t *testing.T) {
+	_, code := runMainWithExit(t, `
+struct Pair {
+	a i32;
+	b i32;
+}
+
+fn make(a i32, b i32) Pair {
+	return Pair { .a = a, .b = b };
+}
+
+fn mul(p Pair) i32 {
+	return p.a * p.b;
+}
+
+fn main() void {
+	var p = make(6, 7);
+	tinoc_exit(mul(p));
+}
+`)
+	if code != 42 {
+		t.Fatalf("expected exit 42 (struct passed by value to/from functions), got %d", code)
+	}
+}

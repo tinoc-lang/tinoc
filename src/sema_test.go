@@ -328,3 +328,465 @@ fn main() void {
 }
 `)
 }
+
+// === Struct Sema Tests ===
+
+func TestStructDeclarationAndLiteral(t *testing.T) {
+	checkNoErrors(t, `
+struct Point {
+	x f32;
+	y f32;
+}
+
+fn main() void {
+	var p Point = Point { .x = 1.0, .y = 2.0 };
+	p.x = 5.0;
+	return;
+}
+`)
+}
+
+func TestStructInferredLiteral(t *testing.T) {
+	checkNoErrors(t, `
+struct Point {
+	x f32;
+	y f32;
+}
+
+fn main() void {
+	var p = Point { .x = 1.0, .y = 2.0 };
+	return;
+}
+`)
+}
+
+func TestStructDeclOnly(t *testing.T) {
+	checkNoErrors(t, `
+struct Point {
+	x f32;
+	y f32;
+}
+
+fn main() void {
+	var p Point;
+	return;
+}
+`)
+}
+
+func TestStructUnknownFieldInLiteral(t *testing.T) {
+	checkHasError(t, `
+struct Point {
+	x f32;
+	y f32;
+}
+
+fn main() void {
+	var p Point = Point { .x = 1.0, .z = 2.0 };
+	return;
+}
+`, "unknown field z in struct Point")
+}
+
+func TestStructMissingFieldInLiteral(t *testing.T) {
+	checkHasError(t, `
+struct Point {
+	x f32;
+	y f32;
+}
+
+fn main() void {
+	var p Point = Point { .x = 1.0 };
+	return;
+}
+`, "missing field(s)")
+}
+
+func TestStructDuplicateFieldInLiteral(t *testing.T) {
+	checkHasError(t, `
+struct Point {
+	x f32;
+	y f32;
+}
+
+fn main() void {
+	var p Point = Point { .x = 1.0, .x = 2.0, .y = 3.0 };
+	return;
+}
+`, "duplicate field x")
+}
+
+func TestStructLiteralTypeMismatch(t *testing.T) {
+	checkHasError(t, `
+struct Point {
+	x f32;
+	y f32;
+}
+
+fn main() void {
+	var p Point = Point { .x = 1.0, .y = "nope" };
+	return;
+}
+`, "field y")
+}
+
+func TestStructLiteralOnNonStruct(t *testing.T) {
+	checkHasError(t, `
+fn main() void {
+	var p i32 = i32 { .x = 1 };
+	return;
+}
+`, "is not a struct type")
+}
+
+func TestStructDuplicateFields(t *testing.T) {
+	checkHasError(t, `
+struct Bad {
+	a i32;
+	a i32;
+}
+fn main() void {
+	return;
+}
+`, "duplicate field a")
+}
+
+func TestStructRedeclared(t *testing.T) {
+	checkHasError(t, `
+struct Point {
+	x f32;
+}
+struct Point {
+	y f32;
+}
+fn main() void {
+	return;
+}
+`, "redeclared")
+}
+
+func TestStructSelfContainmentByValueRejected(t *testing.T) {
+	checkHasError(t, `
+struct Bad {
+	next Bad;
+}
+fn main() void {
+	return;
+}
+`, "contains itself by value")
+}
+
+func TestStructSelfPointerAllowed(t *testing.T) {
+	checkNoErrors(t, `
+struct Node {
+	value i32;
+	next ^Node;
+}
+fn main() void {
+	return;
+}
+`)
+}
+
+func TestStructFieldAccess(t *testing.T) {
+	checkNoErrors(t, `
+struct Point {
+	x f32;
+	y f32;
+}
+
+fn main() void {
+	var p Point = Point { .x = 1.0, .y = 2.0 };
+	var x = p.x;
+	p.y = x;
+	return;
+}
+`)
+}
+
+func TestStructUnknownFieldAccess(t *testing.T) {
+	checkHasError(t, `
+struct Point {
+	x f32;
+	y f32;
+}
+
+fn main() void {
+	var p Point = Point { .x = 1.0, .y = 2.0 };
+	var z = p.z;
+	return;
+}
+`, "has no field or method z")
+}
+
+func TestStructFieldTypeMismatchOnAssign(t *testing.T) {
+	checkHasError(t, `
+struct Point {
+	x f32;
+	y f32;
+}
+
+fn main() void {
+	var p Point = Point { .x = 1.0, .y = 2.0 };
+	p.x = "hello";
+	return;
+}
+`, "cannot use")
+}
+
+func TestStructCannotCompare(t *testing.T) {
+	checkHasError(t, `
+struct Point {
+	x f32;
+	y f32;
+}
+
+fn main() void {
+	var a Point = Point { .x = 1.0, .y = 2.0 };
+	var b Point = Point { .x = 1.0, .y = 2.0 };
+	if a == b {
+		return;
+	}
+	return;
+}
+`, "cannot compare")
+}
+
+func TestStructAsParamAndReturn(t *testing.T) {
+	checkNoErrors(t, `
+struct Point {
+	x f32;
+	y f32;
+}
+
+fn make(x f32) Point {
+	return Point { .x = x, .y = 0.0 };
+}
+
+fn sum(a Point, b Point) f32 {
+	return a.x + b.y;
+}
+
+fn main() void {
+	var p = make(1.0);
+	var s = sum(p, p);
+	return;
+}
+`)
+}
+
+func TestStructInstanceMethod(t *testing.T) {
+	checkNoErrors(t, `
+struct Point {
+	x f32;
+	y f32;
+
+	fn translate(self ^Point, dx f32, dy f32) void {
+		self^.x += dx;
+		self^.y += dy;
+	}
+
+	fn length(self ^Point) f32 {
+		return self^.x * self^.x + self^.y * self^.y;
+	}
+}
+
+fn main() void {
+	var p Point = Point { .x = 1.0, .y = 2.0 };
+	p.translate(0.5, 1.5);
+	var l = p.length();
+	return;
+}
+`)
+}
+
+func TestStructStaticMethod(t *testing.T) {
+	checkNoErrors(t, `
+struct Point {
+	x f32;
+	y f32;
+
+	static fn origin() Point {
+		return Point { .x = 0.0, .y = 0.0 };
+	}
+}
+
+fn main() void {
+	var o = Point.origin();
+	return;
+}
+`)
+}
+
+func TestStructMethodMissingReturn(t *testing.T) {
+	checkHasError(t, `
+struct Point {
+	x f32;
+
+	fn doubled(self ^Point) f32 {
+		var r = self^.x * 2.0;
+	}
+}
+fn main() void {
+	return;
+}
+`, "missing return at end of method")
+}
+
+func TestStructStaticCalledOnValueRejected(t *testing.T) {
+	checkHasError(t, `
+struct Point {
+	x f32;
+
+	static fn make() Point {
+		return Point { .x = 1.0 };
+	}
+}
+
+fn main() void {
+	var p Point = Point { .x = 1.0 };
+	p.make();
+	return;
+}
+`, "must be called on the type name")
+}
+
+func TestStructInstanceCalledOnTypeRejected(t *testing.T) {
+	checkHasError(t, `
+struct Point {
+	x f32;
+
+	fn get(self ^Point) f32 {
+		return self^.x;
+	}
+}
+
+fn main() void {
+	var v = Point.get();
+	return;
+}
+`, "is not static")
+}
+
+func TestStructUnknownMethod(t *testing.T) {
+	checkHasError(t, `
+struct Point {
+	x f32;
+
+	fn get(self ^Point) f32 {
+		return self^.x;
+	}
+}
+
+fn main() void {
+	var p Point = Point { .x = 1.0 };
+	p.warp(2.0);
+	return;
+}
+`, "no method warp")
+}
+
+func TestStructMethodArgCountMismatch(t *testing.T) {
+	checkHasError(t, `
+struct Point {
+	x f32;
+
+	fn scale(self ^Point, k f32) void {
+		self^.x *= k;
+	}
+}
+
+fn main() void {
+	var p Point = Point { .x = 1.0 };
+	p.scale();
+	return;
+}
+`, "not enough arguments")
+}
+
+func TestStructMethodArgTypeMismatch(t *testing.T) {
+	checkHasError(t, `
+struct Point {
+	x f32;
+
+	fn scale(self ^Point, k f32) void {
+		self^.x *= k;
+	}
+}
+
+fn main() void {
+	var p Point = Point { .x = 1.0 };
+	p.scale("big");
+	return;
+}
+`, "argument 1")
+}
+
+func TestStructInstanceMethodWithoutSelfRejected(t *testing.T) {
+	checkHasError(t, `
+struct Point {
+	x f32;
+
+	fn bad() f32 {
+		return 1.0;
+	}
+}
+fn main() void {
+	return;
+}
+`, "needs a self parameter")
+}
+
+func TestStructSelfWrongTypeRejected(t *testing.T) {
+	checkHasError(t, `
+struct Point {
+	x f32;
+
+	fn bad(self ^Other) f32 {
+		return 1.0;
+	}
+}
+fn main() void {
+	return;
+}
+`, "self parameter")
+}
+
+func TestStructNested(t *testing.T) {
+	checkNoErrors(t, `
+struct Inner {
+	v f32;
+}
+
+struct Outer {
+	inner Inner;
+	tag i32;
+}
+
+fn main() void {
+	var o Outer = Outer { .inner = Inner { .v = 1.5 }, .tag = 7 };
+	var v = o.inner.v;
+	o.inner.v = v;
+	return;
+}
+`)
+}
+
+func TestStructMethodCallOnPointerReceiver(t *testing.T) {
+	checkNoErrors(t, `
+struct Point {
+	x f32;
+
+	fn set(self ^Point, v f32) void {
+		self^.x = v;
+	}
+}
+
+fn main() void {
+	var p Point = Point { .x = 1.0 };
+	var pp ^Point = &p;
+	pp.set(9.0);
+	return;
+}
+`)
+}

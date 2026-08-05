@@ -105,13 +105,30 @@ func (g *Codegen) Generate(prog *Program) string {
 		}
 	}
 
+	// Struct pre-pass: emit every struct's tag forward declaration and
+	// typedef first (in source order), so function/method prototypes that
+	// mention struct types -- emitted later in the forward-decl block --
+	// and every use in bodies sees a complete struct. Pointer fields to
+	// structs defined later in the file work because of the tag forward
+	// declarations; by-value fields to later structs are invalid C, same
+	// as in C itself, and surface at C compile time.
+	var structs bytes.Buffer
+	main := &g.out
+	g.out = structs
+	for _, stmt := range prog.Statements {
+		if st, ok := stmt.(*StructStatement); ok {
+			g.genStructTypeDef(st)
+		}
+	}
+	structs = g.out
+	g.out = *main
+
 	var body bytes.Buffer
 
-	// Emit function definitions and top-level var/const in source order
-	// into `body`, while collecting forward declarations into
-	// g.forwardDecls as we go, so the final output can place all
-	// prototypes before any definition.
-	main := &g.out
+	// Emit function definitions, method definitions, and top-level
+	// var/const in source order into `body`, while collecting forward
+	// declarations (functions and methods) into g.forwardDecls as we go,
+	// so the final output can place all prototypes before any definition.
 	g.out = body
 	for _, stmt := range prog.Statements {
 		g.genTopLevelStatement(stmt)
@@ -127,6 +144,11 @@ func (g *Codegen) Generate(prog *Program) string {
 		final.WriteString("\n")
 	}
 	final.WriteString("\n")
+
+	final.Write(structs.Bytes())
+	if structs.Len() > 0 {
+		final.WriteString("\n")
+	}
 
 	if len(g.forwardDecls) > 0 {
 		for _, d := range g.forwardDecls {
@@ -154,6 +176,8 @@ func (g *Codegen) genTopLevelStatement(stmt Statement) {
 		g.genTopLevelVar(st)
 	case *ConstStatement:
 		g.genTopLevelConst(st)
+	case *StructStatement:
+		g.genStructMethods(st)
 	case *ImportStatement:
 		// #import is Sema-level module resolution, not a C construct;
 		// nothing to emit. (std.io's io.println etc are not yet backed
@@ -183,6 +207,139 @@ func (g *Codegen) genExternCFuncProto(ecs *ExternCFuncStatement) {
 		ret = cDeclTypeSpelling(ecs.ReturnType)
 	}
 	g.forwardDecls = append(g.forwardDecls, fmt.Sprintf("%s %s(%s)", ret, ecs.CSymbol, cParamListSpelling(ecs)))
+}
+
+// === Structs ===
+
+// genStructTypeDef emits one struct's C type: a tag forward declaration
+// (`struct Point;`) followed by the typedef (`typedef struct Point {
+// ... } Point;`). The tag forward decl lets pointer fields reference
+// structs defined later in the file (including the struct itself). Field
+// types use the C tag spelling (`struct Point`, `struct Node*`) so
+// self-/mutually-referential pointer fields compile regardless of
+// declaration order.
+func (g *Codegen) genStructTypeDef(st *StructStatement) {
+	if st.Name == nil {
+		return
+	}
+	name := sanitizeCIdent(st.Name.Value)
+
+	g.writeln("struct %s;", name)
+	g.writeln("typedef struct %s {", name)
+	g.indent++
+	if resolved, ok := g.sema.structTypes[st.Name.Value]; ok {
+		for _, f := range resolved.Fields {
+			if f == nil {
+				continue
+			}
+			g.writeln("%s %s;", structFieldCType(f.Type), sanitizeCIdent(f.Name))
+		}
+	}
+	g.indent--
+	g.writeln("} %s;", name)
+	g.out.WriteString("\n")
+}
+
+// genStructMethods emits every method of a struct: C prototypes go into
+// the shared forward-decl block (so methods can call one another
+// regardless of declaration order), and definitions follow immediately
+// after the struct's typedef. Instance methods take an implicit `self`
+// first parameter (a pointer to the struct for `self ^Name`, or the
+// struct by value for `self Name`); static methods take only their
+// declared parameters.
+func (g *Codegen) genStructMethods(st *StructStatement) {
+	if st.Name == nil {
+		return
+	}
+	for _, m := range st.Methods {
+		if m != nil {
+			g.genMethod(st.Name.Value, m)
+		}
+	}
+}
+
+// genMethod renders a single struct method (instance or static). Method
+// symbols are resolved from Sema's per-struct method table (never
+// s.funcs), and the C name is mangled as tnc_<Struct>_<method> so methods
+// of different structs never collide.
+func (g *Codegen) genMethod(structName string, fn *FunctionStatement) {
+	if fn.Name == nil {
+		return
+	}
+
+	sym := g.sema.structMethods[structName][fn.Name.Value]
+	if sym == nil {
+		g.errorAt(fn.Token.Line, fn.Token.Column, "codegen: no resolved signature for %s.%s (sema did not run or failed)", structName, fn.Name.Value)
+		return
+	}
+
+	retC := cReturnType(sym.ReturnType, fn.Name.Value)
+	cName := "tnc_" + sanitizeCIdent(structName) + "_" + sanitizeCIdent(fn.Name.Value)
+
+	var params []string
+	offset := 0
+	if !fn.IsStatic && len(sym.Params) > 0 {
+		params = append(params, fmt.Sprintf("%s self", cSelfParamType(sym.Params[0])))
+		offset = 1
+	}
+	for i := offset; i < len(sym.ParamNames); i++ {
+		var pt *Type
+		if i < len(sym.Params) {
+			pt = sym.Params[i]
+		}
+		params = append(params, fmt.Sprintf("%s %s", cTypeOrFallback(pt), sanitizeCIdent(sym.ParamNames[i])))
+	}
+	if len(params) == 0 {
+		params = []string{"void"}
+	}
+	paramList := strings.Join(params, ", ")
+
+	g.forwardDecls = append(g.forwardDecls, fmt.Sprintf("%s %s(%s)", retC, cName, paramList))
+
+	g.writeln("%s %s(%s) {", retC, cName, paramList)
+	g.indent++
+	if fn.Body != nil {
+		for _, st := range fn.Body.Statements {
+			g.genStatement(st)
+		}
+	}
+	g.indent--
+	g.writeln("}")
+	g.out.WriteString("\n")
+}
+
+// cSelfParamType renders the C type for a method's self parameter: `^T`
+// receivers become pointers, `T` receivers pass the struct by value.
+func cSelfParamType(selfType *Type) string {
+	if selfType == nil || selfType.Kind == KindInvalid {
+		return "void*"
+	}
+	if selfType.Kind == KindPointer {
+		elem := "void"
+		if selfType.Elem != nil {
+			elem = selfType.Elem.CType()
+		}
+		return elem + "*"
+	}
+	return cTypeOrFallback(selfType)
+}
+
+// structFieldCType renders a struct field's C type. Struct-typed fields
+// use the tag spelling (`struct Point`, `struct Point*`) which compiles
+// even when the referenced struct is declared later in the file (tag
+// forward declarations were emitted in the struct pre-pass); everything
+// else uses the ordinary CType mapping.
+func structFieldCType(t *Type) string {
+	if t == nil || t.Kind == KindInvalid || t.Kind == KindUnknown {
+		return "void*"
+	}
+	if t.Kind == KindStruct {
+		return "struct " + sanitizeCIdent(t.Name)
+	}
+	if t.Kind == KindPointer && t.Elem != nil && t.Elem.Kind == KindStruct {
+		return "struct " + sanitizeCIdent(t.Elem.Name) + "*"
+	}
+	return t.CType()
 }
 
 // === Functions ===
@@ -362,7 +519,7 @@ func (g *Codegen) checkEmittable(t *Type, line, col int, what string) bool {
 		return false
 	}
 	if t.Kind == KindUnknown {
-		g.errorAt(line, col, "codegen: %s has an unsupported type (%s) — struct/enum/union/array/generic codegen is not implemented yet", what, t.Name)
+		g.errorAt(line, col, "codegen: %s has an unsupported type (%s) — enum/union/array/optional/error-union/generic codegen is not implemented yet", what, t.Name)
 		return false
 	}
 	return true
@@ -388,6 +545,10 @@ func zeroValue(t *Type) string {
 		return "tinoc_str_lit(\"\", 0)"
 	case KindPointer:
 		return "NULL"
+	case KindStruct:
+		// Aggregate zero-initializer: every member gets zeroed, matching
+		// Tinoc's decl-only `var p Point;` semantics.
+		return "{0}"
 	default:
 		return "{0}"
 	}
@@ -687,6 +848,13 @@ func (g *Codegen) genExpr(e Expression) string {
 				return c.CSymbol
 			}
 		}
+		// `self^.x` renders as `self->x` (the C idiom for accessing a
+		// field through the pointer `self`), which is exactly the pattern
+		// syntax.md's method bodies use.
+		if pe, ok := ex.Left.(*PostfixExpression); ok && pe.Operator == "^" && pe.Left != nil && ex.Field != nil {
+			inner := g.genExpr(pe.Left)
+			return fmt.Sprintf("%s->%s", inner, sanitizeCIdent(ex.Field.Value))
+		}
 		left := ""
 		if ex.Left != nil {
 			left = g.genExpr(ex.Left)
@@ -695,7 +863,9 @@ func (g *Codegen) genExpr(e Expression) string {
 		if ex.Field != nil {
 			field = ex.Field.Value
 		}
-		return fmt.Sprintf("%s.%s", left, field)
+		return fmt.Sprintf("%s.%s", left, sanitizeCIdent(field))
+	case *StructLiteral:
+		return g.genStructLiteral(ex)
 	case *ArrayLiteral:
 		var parts []string
 		for _, el := range ex.Elements {
@@ -958,6 +1128,23 @@ func (g *Codegen) genCall(ce *CallExpression) string {
 				return g.genCCall(fn.CSymbol, ce)
 			}
 		}
+		// Static method call: `Point.create(...)` -> tnc_Point_create(...).
+		if id, isID := fa.Left.(*Identifier); isID && fa.Field != nil {
+			if _, isStruct := g.sema.structTypes[id.Value]; isStruct {
+				return g.genStructMethodCall(id.Value, fa.Field.Value, ce, nil)
+			}
+		}
+		// Instance method call: `p.translate(...)` / `pp.method(...)` ->
+		// tnc_Point_translate((&p), ...) / tnc_Point_method(pp, ...).
+		if fa.Left != nil && fa.Field != nil {
+			recvType := g.sema.TypeOf(fa.Left)
+			switch {
+			case recvType != nil && recvType.Kind == KindStruct:
+				return g.genStructMethodCall(recvType.Name, fa.Field.Value, ce, fa.Left)
+			case recvType != nil && recvType.Kind == KindPointer && recvType.Elem != nil && recvType.Elem.Kind == KindStruct:
+				return g.genStructMethodCall(recvType.Elem.Name, fa.Field.Value, ce, fa.Left)
+			}
+		}
 		g.errorAt(ce.Token.Line, ce.Token.Column, "codegen: unsupported call target (module/method calls are not yet implemented)")
 		return "/* unsupported call */ 0"
 	}
@@ -1005,6 +1192,63 @@ func (g *Codegen) genCArg(a Expression) string {
 		return "(" + g.genExpr(a) + ").data"
 	}
 	return g.genExpr(a)
+}
+
+// genStructLiteral renders `Point { .x = 1.0, .y = 2.0 }` as a C99
+// compound literal `(Point){ .x = 1.0, .y = 2.0 }`. Sema guarantees every
+// field is present and typed, so the designated initializers are emitted
+// in source order as-is.
+func (g *Codegen) genStructLiteral(sl *StructLiteral) string {
+	t := g.sema.TypeOf(sl)
+	if t == nil || t.Kind != KindStruct {
+		g.errorAt(sl.Token.Line, sl.Token.Column, "codegen: struct literal has no resolved struct type")
+		return "/* unsupported struct literal */ {0}"
+	}
+	var parts []string
+	for _, f := range sl.Fields {
+		if f == nil || f.Name == nil {
+			continue
+		}
+		val := "0"
+		if f.Value != nil {
+			val = g.genExpr(f.Value)
+		}
+		parts = append(parts, fmt.Sprintf(".%s = %s", sanitizeCIdent(f.Name.Value), val))
+	}
+	return fmt.Sprintf("(%s){ %s }", t.CType(), strings.Join(parts, ", "))
+}
+
+// genStructMethodCall renders a call to a struct method. recv is nil for
+// static methods (`Point.create(...)` -> `tnc_Point_create(...)`); for
+// instance methods the receiver expression becomes the self argument:
+// `p.translate(...)` -> `tnc_Point_translate((&p), ...)` when self is a
+// pointer and the receiver is a struct value, or passed through directly
+// when the receiver is already a pointer or self is by-value.
+func (g *Codegen) genStructMethodCall(structName, method string, ce *CallExpression, recv Expression) string {
+	sym := g.sema.structMethods[structName][method]
+	if sym == nil {
+		g.errorAt(ce.Token.Line, ce.Token.Column, "codegen: no resolved signature for %s.%s", structName, method)
+		return "/* unsupported call */ 0"
+	}
+
+	cName := "tnc_" + sanitizeCIdent(structName) + "_" + sanitizeCIdent(method)
+
+	var args []string
+	if recv != nil {
+		recvC := g.genExpr(recv)
+		if len(sym.Params) > 0 {
+			selfType := sym.Params[0]
+			recvType := g.sema.TypeOf(recv)
+			if selfType != nil && selfType.Kind == KindPointer && (recvType == nil || recvType.Kind != KindPointer) {
+				recvC = "(&" + recvC + ")"
+			}
+		}
+		args = append(args, recvC)
+	}
+	for _, a := range ce.Arguments {
+		args = append(args, g.genExpr(a))
+	}
+	return fmt.Sprintf("%s(%s)", cName, strings.Join(args, ", "))
 }
 
 // === CLI Entry Point ===

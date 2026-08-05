@@ -1,0 +1,44 @@
+// Struct methods: instance methods receive the struct through `self`
+// (usually `self ^Rectangle`) and can mutate the receiver; static
+// methods act as constructors or free functions on the type.
+
+struct Rectangle {
+	width f32;
+	height f32;
+
+	fn area(self ^Rectangle) f32 {
+		return self^.width * self^.height;
+	}
+
+	fn perimeter(self ^Rectangle) f32 {
+		return 2.0 * (self^.width + self^.height);
+	}
+
+	fn scale(self ^Rectangle, factor f32) void {
+		self^.width *= factor;
+		self^.height *= factor;
+	}
+
+	fn isSquare(self ^Rectangle) bool {
+		return self^.width == self^.height;
+	}
+
+	static fn square(side f32) Rectangle {
+		return Rectangle { .width = side, .height = side };
+	}
+}
+
+extern "C" fn printf(fmt *const char, ...) i32;
+
+fn main() void {
+	var r = Rectangle.square(4.0);
+	printf("area = %f\n", r.area());
+
+	r.scale(2.0);
+	printf("perimeter = %f\n", r.perimeter());
+	printf("is square = %d\n", r.isSquare());
+
+	var wide Rectangle = Rectangle { .width = 10.0, .height = 2.0 };
+	printf("wide is square = %d\n", wide.isSquare());
+	printf("wide area = %f\n", wide.area());
+}

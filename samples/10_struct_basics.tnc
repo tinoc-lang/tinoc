@@ -1,0 +1,29 @@
+// Struct basics: declaration, literals, field access, and passing
+// structs by value to and from functions.
+
+struct Point {
+	x f32;
+	y f32;
+}
+
+extern "C" fn printf(fmt *const char, ...) i32;
+
+fn midpoint(a Point, b Point) Point {
+	return Point { .x = (a.x + b.x) / 2.0, .y = (a.y + b.y) / 2.0 };
+}
+
+fn main() void {
+	// struct literal with named field initializers
+	var origin Point = Point { .x = 0.0, .y = 0.0 };
+	var p Point = Point { .x = 3.0, .y = 4.0 };
+
+	// field access reads and writes
+	p.y = p.x + 1.0;
+
+	// decl-only struct: zero-initialized
+	var empty Point;
+
+	var mid = midpoint(origin, p);
+	printf("mid = (%f, %f)\n", mid.x, mid.y);
+	printf("empty = (%f, %f)\n", empty.x, empty.y);
+}

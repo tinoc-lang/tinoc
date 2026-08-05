@@ -14,12 +14,14 @@ import (
 // to emit.
 //
 // Scope for this pass: primitives (integers, floats, bool, char, void,
-// str) plus pointer types (`^T`), since that's what var/const/static
-// var/static const/fn need end-to-end. Compound types (struct/enum/union),
-// optionals, error unions, arrays/slices, and generics are recognized
-// syntactically elsewhere in the AST but are not yet resolved by Sema;
-// referencing them here produces a clear "not yet supported" diagnostic
-// rather than a silent wrong answer.
+// str), pointer types (`^T`), and user structs (`struct Name { ... }`
+// with fields, methods, and static methods) since those are what
+// var/const/static var/static const/fn/struct need end-to-end. The
+// remaining compound types (enum/union), optionals, error unions,
+// arrays/slices, and generics are recognized syntactically elsewhere in
+// the AST but are not yet resolved by Sema; referencing them here
+// produces a clear "not yet supported" diagnostic rather than a silent
+// wrong answer.
 
 // TypeKind categorizes a resolved Type.
 type TypeKind int
@@ -33,8 +35,24 @@ const (
 	KindFloat
 	KindStr
 	KindPointer
-	KindUnknown // valid but not yet resolvable by this pass (struct/enum/etc)
+	KindStruct
+	KindUnknown // valid but not yet resolvable by this pass (enum/union/array/etc)
 )
+
+// StructFieldInfo is a resolved struct field: its name and resolved type,
+// as stored on a KindStruct *Type for lookup by both Sema (field access
+// checking) and Codegen (typedef emission).
+type StructFieldInfo struct {
+	Name string
+	Type *Type
+}
+
+func (sf *StructFieldInfo) String() string {
+	if sf == nil || sf.Type == nil {
+		return ""
+	}
+	return sf.Name + " " + sf.Type.String()
+}
 
 // Type is Sema's resolved representation of a Tinoc type.
 type Type struct {
@@ -51,6 +69,11 @@ type Type struct {
 
 	// Pointer-specific.
 	Elem *Type
+
+	// Struct-specific: ordered fields and a name -> index map, populated
+	// by Sema when the struct declaration is resolved.
+	Fields     []*StructFieldInfo
+	FieldIndex map[string]int
 }
 
 func (t *Type) String() string {
@@ -84,6 +107,10 @@ func (t *Type) CType() string {
 		return t.Name // tinoc.h defines u8/i32/f32/usize/... 1:1 with Tinoc's own names
 	case KindPointer:
 		return t.Elem.CType() + "*"
+	case KindStruct:
+		// Emitted as a typedef named after the struct; sanitize so a
+		// struct whose name collides with a C keyword still yields valid C.
+		return sanitizeCIdent(t.Name)
 	default:
 		return t.Name
 	}
@@ -170,6 +197,8 @@ func typesEqual(a, b *Type) bool {
 		return a.Name == b.Name
 	case KindFloat:
 		return a.Name == b.Name
+	case KindStruct:
+		return a.Name == b.Name
 	default:
 		return a.Kind == b.Kind
 	}
@@ -201,17 +230,21 @@ func (s *Sema) resolveTypeExpr(te TypeExpr) *Type {
 		if prim, ok := primitiveTypes[t.Name]; ok {
 			return prim
 		}
-		// A type imported from a C header (#importc), e.g. FILE, size_t,
-		// or a user struct tag: use the header-derived type.
+		// A type imported from a C header (#importc), e.g. FILE, size_t:
+		// use the header-derived type.
 		if ct, ok := s.cTypes[t.Name]; ok {
 			return ct
 		}
-		// Not a known primitive: likely a struct/enum/union name, which
-		// this pass doesn't resolve yet. Treated as KindUnknown (valid,
-		// opaque) rather than an error so var/const/fn involving
-		// user-defined types don't hard-fail sema wholesale -- codegen
-		// will surface a clear "unsupported" diagnostic if it's actually
-		// asked to generate code for one.
+		// A user-declared struct: return its registered, resolved type.
+		if st, ok := s.structTypes[t.Name]; ok {
+			return st
+		}
+		// Not a known primitive, C type, or struct: likely an enum/union
+		// name (or an unknown name), which this pass doesn't resolve yet.
+		// Treated as KindUnknown (valid, opaque) rather than an error so
+		// var/const/fn involving user-defined types don't hard-fail sema
+		// wholesale -- codegen will surface a clear "unsupported"
+		// diagnostic if it's actually asked to generate code for one.
 		return &Type{Kind: KindUnknown, Name: t.Name}
 
 	case *CQualType:

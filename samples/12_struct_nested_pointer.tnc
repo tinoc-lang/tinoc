@@ -1,0 +1,60 @@
+// Nested structs, pointers to structs, a self-referencing struct
+// (linked list), and Tinoc's by-value copy semantics.
+
+struct Vec2 {
+	x f32;
+	y f32;
+}
+
+struct Particle {
+	pos Vec2;
+	velocity Vec2;
+	alive bool;
+
+	fn step(self ^Particle, dt f32) void {
+		self^.pos.x += self^.velocity.x * dt;
+		self^.pos.y += self^.velocity.y * dt;
+	}
+
+	fn speedSquared(self ^Particle) f32 {
+		return self^.velocity.x * self^.velocity.x + self^.velocity.y * self^.velocity.y;
+	}
+}
+
+struct Node {
+	value i32;
+	next ^Node;
+}
+
+extern "C" fn printf(fmt *const char, ...) i32;
+
+fn sumList(head ^Node) i32 {
+	var total i32 = 0;
+	var cur ^Node = head;
+	while cur != null {
+		total += cur^.value;
+		cur = cur^.next;
+	}
+	return total;
+}
+
+fn main() void {
+	var p Particle = Particle {
+		.pos = Vec2 { .x = 1.0, .y = 1.0 },
+		.velocity = Vec2 { .x = 2.0, .y = 0.0 },
+		.alive = true,
+	};
+
+	var copy = p;      // structs are copied by value
+	copy.pos.x = 99.0; // mutating the copy leaves p untouched
+	p.step(3.0);
+
+	printf("pos = (%f, %f)\n", p.pos.x, p.pos.y);
+	printf("copy.x = %f, orig.x = %f\n", copy.pos.x, p.pos.x);
+	printf("speed^2 = %f\n", p.speedSquared());
+
+	var n1 Node = Node { .value = 1, .next = null };
+	var n2 Node = Node { .value = 2, .next = &n1 };
+	var n3 Node = Node { .value = 3, .next = &n2 };
+	printf("sum = %d\n", sumList(&n3));
+}
