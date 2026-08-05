@@ -3,6 +3,7 @@ package src
 import (
 	"fmt"
 	"path/filepath"
+	"strings"
 )
 
 // === Semantic Analysis ===
@@ -118,6 +119,15 @@ type Sema struct {
 	externCFuncs   map[string]*Symbol
 	cTypes         map[string]*Type
 
+	// structTypes holds every declared struct's resolved *Type by name
+	// (interned once at registration, so type equality is by identity or
+	// name); structMethods holds each struct's method table by method
+	// name. Both are populated before any function/struct body is
+	// checked, so calls and self-references resolve regardless of
+	// textual order.
+	structTypes   map[string]*Type
+	structMethods map[string]map[string]*Symbol
+
 	// currentFn tracks the function being checked, for `return` type
 	// checking. nil at top level.
 	currentFn *Symbol
@@ -159,6 +169,8 @@ func NewSema(diags *Diagnostics) *Sema {
 		importCModules: make(map[string]*CImportModule),
 		externCFuncs:   make(map[string]*Symbol),
 		cTypes:         make(map[string]*Type),
+		structTypes:    make(map[string]*Type),
+		structMethods:  make(map[string]map[string]*Symbol),
 		cStrArgs:       make(map[Expression]bool),
 	}
 }
@@ -190,7 +202,25 @@ func (s *Sema) Check(prog *Program) {
 		}
 	}
 
-	// Pass 1: register every top-level function signature first, so calls
+	// Pass 1: register every struct's type name first, so fields can
+	// reference their own struct via pointers (struct Node { next ^Node; })
+	// and methods' `self ^Node` parameters resolve during signature
+	// registration.
+	for _, stmt := range prog.Statements {
+		if st, ok := stmt.(*StructStatement); ok {
+			s.registerStructName(st)
+		}
+	}
+
+	// Pass 2: resolve struct fields and register method signatures, now
+	// that every struct name is visible.
+	for _, stmt := range prog.Statements {
+		if st, ok := stmt.(*StructStatement); ok {
+			s.resolveStruct(st)
+		}
+	}
+
+	// Pass 3: register every top-level function signature first, so calls
 	// can appear textually before the function they call (Tinoc, like C
 	// via forward declarations, allows this -- main() calling helpers
 	// defined further down the file is the common case, see samples/*).
@@ -202,7 +232,7 @@ func (s *Sema) Check(prog *Program) {
 		}
 	}
 
-	// Pass 2: check bodies and top-level var/const statements in order.
+	// Pass 4: check bodies and top-level var/const statements in order.
 	for _, stmt := range prog.Statements {
 		s.checkStatement(stmt)
 	}
@@ -346,6 +376,156 @@ func (s *Sema) registerExternCFunc(ecs *ExternCFuncStatement) {
 	s.global.Define(sym)
 }
 
+// === Structs ===
+
+// registerStructName creates the intered KindStruct *Type for a struct
+// declaration (empty fields for now) so later passes can resolve the name
+// from anywhere -- including inside the struct's own field types and its
+// methods' `self ^Name` parameters, which is what makes `struct Node {
+// next ^Node; }` type-check.
+func (s *Sema) registerStructName(st *StructStatement) {
+	if st.Name == nil {
+		return
+	}
+	name := st.Name.Value
+	line, col := st.Token.Line, st.Token.Column
+
+	if _, dup := s.structTypes[name]; dup {
+		s.errorAt(line, col, "%s redeclared in this block", name)
+		return
+	}
+
+	t := &Type{Kind: KindStruct, Name: name, FieldIndex: make(map[string]int)}
+	s.structTypes[name] = t
+	s.structMethods[name] = make(map[string]*Symbol)
+}
+
+// resolveStruct resolves a struct's field types and registers its method
+// signatures. Runs after every struct name is registered, so fields and
+// self params can reference any struct (including the one being defined).
+func (s *Sema) resolveStruct(st *StructStatement) {
+	if st.Name == nil {
+		return
+	}
+	t := s.structTypes[st.Name.Value]
+	if t == nil {
+		return // duplicate/error already reported during name registration
+	}
+
+	seen := make(map[string]bool)
+	for _, f := range st.Fields {
+		if f == nil || f.Name == nil {
+			continue
+		}
+		name := f.Name.Value
+		if seen[name] {
+			s.errorAt(f.Name.Token.Line, f.Name.Token.Column, "duplicate field %s in struct %s", name, st.Name.Value)
+			continue
+		}
+		seen[name] = true
+
+		var ft *Type
+		if f.Type != nil {
+			ft = s.resolveTypeExpr(f.Type)
+		}
+		if ft == nil {
+			s.errorAt(f.Name.Token.Line, f.Name.Token.Column, "field %s has an unsupported or unknown type", name)
+			ft = &Type{Kind: KindInvalid}
+		}
+		// A struct cannot contain itself by value (C requires complete
+		// types for by-value members); a pointer to itself is fine.
+		if ft.Kind == KindStruct && ft.Name == st.Name.Value {
+			s.errorAt(f.Name.Token.Line, f.Name.Token.Column, "struct %s contains itself by value (use ^%s for the field type)", st.Name.Value, st.Name.Value)
+		}
+
+		t.Fields = append(t.Fields, &StructFieldInfo{Name: name, Type: ft})
+		t.FieldIndex[name] = len(t.Fields) - 1
+	}
+
+	for _, m := range st.Methods {
+		s.registerStructMethod(st.Name.Value, m)
+	}
+}
+
+// registerStructMethod registers one method (instance or static) of a
+// struct into that struct's method table. Instance methods must declare a
+// `self` first parameter typed `^Name` or `Name`; static methods take
+// ordinary parameters only.
+func (s *Sema) registerStructMethod(structName string, fn *FunctionStatement) {
+	if fn == nil || fn.Name == nil {
+		return
+	}
+	name := fn.Name.Value
+	line, col := fn.Token.Line, fn.Token.Column
+
+	if len(fn.GenericParams) > 0 {
+		s.errorAt(line, col, "generic methods are not yet supported (%s.%s)", structName, name)
+		return
+	}
+	if fn.Variadic {
+		s.errorAt(line, col, "defining variadic Tinoc methods is not yet supported (%s.%s)", structName, name)
+		return
+	}
+	if _, dup := s.structMethods[structName][name]; dup {
+		s.errorAt(line, col, "%s.%s redeclared", structName, name)
+		return
+	}
+
+	sym := &Symbol{Name: name, Kind: SymFunc, IsStatic: fn.IsStatic}
+
+	seen := make(map[string]bool)
+	for _, p := range fn.Params {
+		if p == nil || p.Name == nil {
+			continue
+		}
+		pname := p.Name.Value
+		if pname != "self" {
+			if seen[pname] {
+				s.errorAt(line, col, "duplicate parameter %s", pname)
+			}
+			seen[pname] = true
+		}
+		var pt *Type
+		if p.Type != nil {
+			pt = s.resolveTypeExpr(p.Type)
+		} else {
+			s.errorAt(line, col, "parameter %s is missing a type", pname)
+			pt = &Type{Kind: KindInvalid}
+		}
+		sym.Params = append(sym.Params, pt)
+		sym.ParamNames = append(sym.ParamNames, pname)
+	}
+
+	if !fn.IsStatic {
+		if len(sym.Params) == 0 {
+			s.errorAt(line, col, "instance method %s.%s needs a self parameter (self ^%s or self %s)", structName, name, structName, structName)
+		} else {
+			selfType := sym.Params[0]
+			valid := selfType != nil &&
+				((selfType.Kind == KindPointer && selfType.Elem != nil && selfType.Elem.Kind == KindStruct && selfType.Elem.Name == structName) ||
+					(selfType.Kind == KindStruct && selfType.Name == structName))
+			if !valid {
+				s.errorAt(line, col, "self parameter of %s.%s must be ^%s or %s, got %s", structName, name, structName, structName, typeStringOrInvalid(selfType))
+			}
+		}
+	}
+
+	if fn.ReturnType != nil {
+		sym.ReturnType = s.resolveTypeExpr(fn.ReturnType)
+	} else {
+		sym.ReturnType = typeVoid
+	}
+
+	s.structMethods[structName][name] = sym
+}
+
+func typeStringOrInvalid(t *Type) string {
+	if t == nil {
+		return "<invalid>"
+	}
+	return t.String()
+}
+
 // === Statement Checking ===
 
 func (s *Sema) checkStatement(stmt Statement) {
@@ -370,15 +550,17 @@ func (s *Sema) checkStatement(stmt Statement) {
 		s.checkWhileStatement(st)
 	case *ForStatement:
 		s.checkForStatement(st)
+	case *StructStatement:
+		s.checkStructStatement(st)
 	case *BreakStatement, *ContinueStatement, *ImportStatement, *ImportCStatement, *ExternCFuncStatement:
 		// Nothing to resolve for this pass (imports/extern decls were
-		// processed in Check's passes 0/1).
+		// processed in Check's passes 0-3).
 	case nil:
 		// Stray/skipped statement (e.g. parser recovered from an error).
 	default:
-		// Struct/enum/union/switch/etc bodies aren't checked by this pass
-		// yet; intentionally silent so partial programs using them don't
-		// spam unrelated diagnostics for constructs Sema doesn't cover.
+		// Enum/union/switch/etc bodies aren't checked by this pass yet;
+		// intentionally silent so partial programs using them don't spam
+		// unrelated diagnostics for constructs Sema doesn't cover.
 	}
 }
 
@@ -525,13 +707,40 @@ func (s *Sema) checkFunctionStatement(fn *FunctionStatement) {
 		return
 	}
 
+	s.checkFunctionBody(fn.Name.Value, sym, fn.Params, fn.Body, fn.Token, false)
+}
+
+// checkStructStatement checks a struct declaration's method bodies (its
+// fields and signatures were resolved during registration).
+func (s *Sema) checkStructStatement(st *StructStatement) {
+	if st.Name == nil {
+		return
+	}
+	for _, m := range st.Methods {
+		if m == nil || m.Name == nil {
+			continue
+		}
+		sym := s.structMethods[st.Name.Value][m.Name.Value]
+		if sym == nil {
+			continue
+		}
+		s.checkFunctionBody(st.Name.Value+"."+m.Name.Value, sym, m.Params, m.Body, m.Token, true)
+	}
+}
+
+// checkFunctionBody is the shared body-checking core for top-level
+// functions and struct methods: it establishes the function scope
+// (parameters bound, currentFn set), checks every body statement, and
+// enforces the missing-return rule for non-void functions. isMethod only
+// changes the diagnostic phrasing.
+func (s *Sema) checkFunctionBody(label string, sym *Symbol, params []*Parameter, body *BlockStatement, tok Token, isMethod bool) {
 	prevFn := s.currentFn
 	prevScope := s.current
 	s.currentFn = sym
 	s.current = newScope(s.global)
 
-	for i, p := range fn.Params {
-		if p.Name == nil {
+	for i, p := range params {
+		if p == nil || p.Name == nil {
 			continue
 		}
 		var pt *Type
@@ -541,12 +750,16 @@ func (s *Sema) checkFunctionStatement(fn *FunctionStatement) {
 		s.current.Define(&Symbol{Name: p.Name.Value, Kind: SymParam, Type: pt, Mutable: false})
 	}
 
-	if fn.Body != nil {
-		for _, st := range fn.Body.Statements {
+	if body != nil {
+		for _, st := range body.Statements {
 			s.checkStatement(st)
 		}
-		if sym.ReturnType != nil && sym.ReturnType.Kind != KindVoid && !blockAlwaysReturns(fn.Body) {
-			s.errorAt(fn.Token.Line, fn.Token.Column, "missing return at end of function %s", fn.Name.Value)
+		if sym.ReturnType != nil && sym.ReturnType.Kind != KindVoid && !blockAlwaysReturns(body) {
+			if isMethod {
+				s.errorAt(tok.Line, tok.Column, "missing return at end of method %s", label)
+			} else {
+				s.errorAt(tok.Line, tok.Column, "missing return at end of function %s", label)
+			}
 		}
 	}
 
@@ -753,12 +966,7 @@ func (s *Sema) inferExpression(e Expression) *Type {
 		}
 		return &Type{Kind: KindUnknown, Name: "generic"}
 	case *StructLiteral:
-		for _, f := range ex.Fields {
-			if f.Value != nil {
-				s.checkExpression(f.Value)
-			}
-		}
-		return &Type{Kind: KindUnknown, Name: "struct"}
+		return s.checkStructLiteral(ex)
 	default:
 		return &Type{Kind: KindUnknown}
 	}
@@ -805,27 +1013,59 @@ func (s *Sema) checkIdentifier(id *Identifier) *Type {
 	return &Type{Kind: KindInvalid}
 }
 
-// checkFieldAccess resolves `alias.member` for #importc modules: function
-// members keep their call signature (checked at the call site), constant
-// members (extern vars, enum constants, simple macros) resolve to their
-// C type. Non-module field access stays unresolved like before.
+// checkFieldAccess resolves `alias.member` for #importc modules, struct
+// static member references (`Type.method`), and struct field/method
+// access on a struct-typed value (`p.x`, `p.method`, `self^.x`).
+// Function members keep their call signature (checked at the call site);
+// constant members and struct fields resolve to their types.
 func (s *Sema) checkFieldAccess(fa *FieldAccessExpression) *Type {
-	mod, ok := s.moduleAlias(fa.Left)
-	if !ok || fa.Field == nil {
-		if fa.Left != nil {
-			s.checkExpression(fa.Left)
+	// 1. #importc module member: cio.EOF / cio.stdin / cio.printf.
+	if mod, ok := s.moduleAlias(fa.Left); ok && fa.Field != nil {
+		member := fa.Field.Value
+		if fn, ok := mod.Funcs[member]; ok {
+			return fn.ReturnType // bare member reference; call sites check the full signature
 		}
-		return &Type{Kind: KindUnknown, Name: "field"}
+		if c, ok := mod.Consts[member]; ok {
+			return c.Type
+		}
+		s.errorAt(fa.Token.Line, fa.Token.Column, "undefined: %s.%s", mod.Alias, member)
+		return &Type{Kind: KindInvalid}
 	}
-	member := fa.Field.Value
-	if fn, ok := mod.Funcs[member]; ok {
-		return fn.ReturnType // bare member reference; call sites check the full signature
+
+	// 2. Struct static member reference: `Point.create` (bare, non-call).
+	if id, isID := fa.Left.(*Identifier); isID && fa.Field != nil {
+		if st, ok := s.structTypes[id.Value]; ok {
+			if m, ok := s.structMethods[st.Name][fa.Field.Value]; ok {
+				return m.ReturnType // call sites check the full signature
+			}
+			s.errorAt(fa.Token.Line, fa.Token.Column, "type %s has no static member %s", st.Name, fa.Field.Value)
+			return &Type{Kind: KindInvalid}
+		}
 	}
-	if c, ok := mod.Consts[member]; ok {
-		return c.Type
+
+	// 3. Field/method access on a struct-typed value: `p.x`, `self^.x`,
+	// `getPoint().x`. The receiver type drives everything.
+	if fa.Left != nil && fa.Field != nil {
+		recvType := s.checkExpression(fa.Left)
+		if recvType != nil && recvType.Kind == KindStruct {
+			if idx, ok := recvType.FieldIndex[fa.Field.Value]; ok {
+				return recvType.Fields[idx].Type
+			}
+			if m, ok := s.structMethods[recvType.Name][fa.Field.Value]; ok {
+				return m.ReturnType // bare method reference; call sites check the full signature
+			}
+			s.errorAt(fa.Token.Line, fa.Token.Column, "type %s has no field or method %s", recvType.Name, fa.Field.Value)
+			return &Type{Kind: KindInvalid}
+		}
 	}
-	s.errorAt(fa.Token.Line, fa.Token.Column, "undefined: %s.%s", mod.Alias, member)
-	return &Type{Kind: KindInvalid}
+
+	// Anything else (module names without member access, non-struct field
+	// access) stays unresolved; checkExpression on the left still runs so
+	// undefined-name errors surface.
+	if fa.Left != nil {
+		s.checkExpression(fa.Left)
+	}
+	return &Type{Kind: KindUnknown, Name: "field"}
 }
 
 // moduleAlias returns the #importc module aliased by the expression, if
@@ -837,6 +1077,163 @@ func (s *Sema) moduleAlias(e Expression) (*CImportModule, bool) {
 	}
 	mod, ok := s.importCModules[id.Value]
 	return mod, ok
+}
+
+// checkStructLiteral type-checks `Point { .x = 1.0, .y = 2.0 }` against
+// the named struct: every field must exist (with a compatible value
+// type), no field may repeat, and every declared field must be present
+// (a struct literal is an exhaustive description of the value, so
+// omissions are reported rather than silently zero-filled).
+func (s *Sema) checkStructLiteral(sl *StructLiteral) *Type {
+	st := s.resolveTypeExpr(sl.Type)
+	if st == nil {
+		return &Type{Kind: KindUnknown, Name: "struct"}
+	}
+	if st.Kind != KindStruct {
+		s.errorAt(sl.Token.Line, sl.Token.Column, "%s is not a struct type", st.String())
+		return &Type{Kind: KindUnknown, Name: "struct"}
+	}
+
+	seen := make(map[string]bool)
+	for _, f := range sl.Fields {
+		if f == nil || f.Name == nil {
+			continue
+		}
+		fname := f.Name.Value
+		idx, ok := st.FieldIndex[fname]
+		if !ok {
+			s.errorAt(f.Name.Token.Line, f.Name.Token.Column, "unknown field %s in struct %s", fname, st.Name)
+			continue
+		}
+		if seen[fname] {
+			s.errorAt(f.Name.Token.Line, f.Name.Token.Column, "duplicate field %s in struct literal", fname)
+			continue
+		}
+		seen[fname] = true
+
+		ft := st.Fields[idx].Type
+		if f.Value == nil {
+			continue
+		}
+		vt := s.checkExpression(f.Value)
+		if isUntypedLiteral(f.Value) && vt.isNumeric() && ft.isNumeric() {
+			s.resolvedTypes[f.Value] = ft
+			continue
+		}
+		if ft.Kind == KindUnknown || ft.Kind == KindInvalid || vt.Kind == KindUnknown || vt.Kind == KindInvalid {
+			continue
+		}
+		if !assignable(ft, vt) {
+			s.errorAt(f.Name.Token.Line, f.Name.Token.Column, "%s", describeMismatch(fmt.Sprintf("field %s", fname), vt, ft))
+		}
+	}
+
+	var missing []string
+	for _, sf := range st.Fields {
+		if !seen[sf.Name] {
+			missing = append(missing, sf.Name)
+		}
+	}
+	if len(missing) > 0 {
+		s.errorAt(sl.Token.Line, sl.Token.Column, "missing field(s) in %s literal: %s", st.Name, strings.Join(missing, ", "))
+	}
+
+	return st
+}
+
+// checkStructMethodCall type-checks `p.method(args)` (isStatic=false,
+// receiver is a value/pointer of struct type) and `Type.method(args)`
+// (isStatic=true, receiver is the type name). Instance method arguments
+// are checked against the method's parameters after the implicit self
+// slot; static methods have no self slot.
+func (s *Sema) checkStructMethodCall(ce *CallExpression, st *Type, method string, isStatic bool) *Type {
+	methods := s.structMethods[st.Name]
+	m, ok := methods[method]
+	if !ok {
+		s.errorAt(ce.Token.Line, ce.Token.Column, "type %s has no %smethod %s", st.Name, map[bool]string{true: "static ", false: ""}[isStatic], method)
+		return &Type{Kind: KindInvalid}
+	}
+	if m.IsStatic != isStatic {
+		if isStatic {
+			s.errorAt(ce.Token.Line, ce.Token.Column, "method %s.%s is not static; call it on a value of type %s", st.Name, method, st.Name)
+		} else {
+			s.errorAt(ce.Token.Line, ce.Token.Column, "static method %s.%s must be called on the type name %s, not on a value", st.Name, method, st.Name)
+		}
+		return m.ReturnType
+	}
+
+	if len(ce.GenericArgs) > 0 {
+		s.errorAt(ce.Token.Line, ce.Token.Column, "generic method calls are not yet supported (%s.%s)", st.Name, method)
+	}
+
+	offset := 0
+	if !isStatic {
+		offset = 1 // skip the implicit self parameter
+	}
+	s.checkCallArgs(ce, m, st.Name+"."+method, offset)
+
+	return m.ReturnType
+}
+
+// checkCallArgs checks a call's arguments against a function/method
+// symbol, starting at param offset (0 for plain functions and static
+// methods, 1 for instance methods whose self slot is implicit). It
+// handles variadic counts, untyped-literal adaptation, and the str ->
+// C-string-pointer unwrap for #importc/extern "C" calls.
+func (s *Sema) checkCallArgs(ce *CallExpression, sym *Symbol, calleeName string, offset int) {
+	fixed := len(sym.Params) - offset
+
+	if sym.Variadic {
+		if len(ce.Arguments) < fixed {
+			s.errorAt(ce.Token.Line, ce.Token.Column, "not enough arguments in call to %s\n\thave (%d args)\n\twant at least (%d args)",
+				calleeName, len(ce.Arguments), fixed)
+		}
+	} else if len(ce.Arguments) != fixed {
+		s.errorAt(ce.Token.Line, ce.Token.Column, "not enough arguments in call to %s\n\thave (%d args)\n\twant (%d args)",
+			calleeName, len(ce.Arguments), fixed)
+	}
+
+	n := len(ce.Arguments)
+	if fixed < n {
+		n = fixed
+	}
+	for i := 0; i < n; i++ {
+		argType := s.checkExpression(ce.Arguments[i])
+		want := sym.Params[offset+i]
+		if want == nil || argType == nil {
+			continue
+		}
+		if isUntypedLiteral(ce.Arguments[i]) && argType.isNumeric() && want.isNumeric() {
+			s.resolvedTypes[ce.Arguments[i]] = want
+			continue
+		}
+		// Tinoc's `str` (a {data,len} struct) implicitly converts to a C
+		// `const char *` / `char *` parameter: codegen passes the data
+		// pointer instead of the struct. Record the retype so codegen
+		// knows to emit the unwrapped form.
+		if sym.IsCImport && argType.Kind == KindStr && isCStringPtr(want) {
+			s.resolvedTypes[ce.Arguments[i]] = want
+			s.cStrArgs[ce.Arguments[i]] = true
+			continue
+		}
+		if want.Kind == KindUnknown || argType.Kind == KindUnknown || argType.Kind == KindInvalid {
+			continue
+		}
+		if !assignable(want, argType) {
+			s.errorAt(ce.Token.Line, ce.Token.Column, "%s", describeMismatch(
+				fmt.Sprintf("argument %d to %s", i+1, calleeName), argType, want))
+		}
+	}
+	// Extra arguments beyond the param count (variadic C calls, or
+	// already-flagged mismatch calls) still get checked so their own
+	// inner expressions are resolved for codegen robustness. str-typed
+	// variadic arguments must be unwrapped to their data pointer in C.
+	for i := n; i < len(ce.Arguments); i++ {
+		argType := s.checkExpression(ce.Arguments[i])
+		if sym.IsCImport && argType != nil && argType.Kind == KindStr {
+			s.cStrArgs[ce.Arguments[i]] = true
+		}
+	}
 }
 
 func (s *Sema) checkPrefixExpression(pe *PrefixExpression) *Type {
@@ -920,10 +1317,30 @@ func (s *Sema) checkInfixExpression(ie *InfixExpression) *Type {
 		return typeBool
 
 	case comparisonOps[ie.Operator]:
+		// A bare integer/float literal on either side adapts to the other
+		// operand's type, e.g. `f32Val > 0.0` or `i64Val == 0`, the same
+		// way the arithmetic branch below adapts literals.
+		if isUntypedLiteral(ie.Left) && rt != nil && rt.isNumeric() {
+			lt = rt
+			s.resolvedTypes[ie.Left] = rt
+		} else if isUntypedLiteral(ie.Right) && lt != nil && lt.isNumeric() {
+			rt = lt
+			s.resolvedTypes[ie.Right] = lt
+		}
 		s.checkOperandsCompatible(ie, lt, rt)
+		// C has no equality operator for structs, so comparing them is
+		// rejected outright rather than miscompiled.
+		if (lt != nil && lt.Kind == KindStruct) || (rt != nil && rt.Kind == KindStruct) {
+			s.errorAt(ie.Token.Line, ie.Token.Column, "invalid operation: cannot compare values of type %s with %s", typeStringOrInvalid(lt), typeStringOrInvalid(rt))
+			return typeBool
+		}
 		return typeBool
 
 	default: // arithmetic / bitwise
+		if (lt != nil && lt.Kind == KindStruct) || (rt != nil && rt.Kind == KindStruct) {
+			s.errorAt(ie.Token.Line, ie.Token.Column, "invalid operation: operator %s not defined on %s (type %s)", ie.Operator, ie.Left.String(), typeStringOrInvalid(lt))
+			return &Type{Kind: KindInvalid}
+		}
 		// Untyped literal on either side adapts to the other operand's
 		// type, e.g. `x + 1` where x is i64 -- 1 adapts to i64 rather
 		// than forcing a mismatch against its own default i32.
@@ -1020,6 +1437,29 @@ func (s *Sema) checkCallExpression(ce *CallExpression) *Type {
 				s.errorAt(ce.Token.Line, ce.Token.Column, "undefined: %s.%s", mod.Alias, member)
 				return &Type{Kind: KindInvalid}
 			}
+		} else if fa.Left != nil && fa.Field != nil {
+			// Static method call: `Point.create(...)` — the receiver is the
+			// bare type name, which resolves against the struct registry
+			// (never as a value, so checkExpression is skipped for it).
+			if id, isID := fa.Left.(*Identifier); isID {
+				if st, ok := s.structTypes[id.Value]; ok {
+					return s.checkStructMethodCall(ce, st, fa.Field.Value, true)
+				}
+			}
+			// Instance method call: `p.translate(...)` on a struct-typed
+			// (or pointer-to-struct) receiver.
+			recvType := s.checkExpression(fa.Left)
+			switch {
+			case recvType != nil && recvType.Kind == KindStruct:
+				return s.checkStructMethodCall(ce, recvType, fa.Field.Value, false)
+			case recvType != nil && recvType.Kind == KindPointer && recvType.Elem != nil && recvType.Elem.Kind == KindStruct:
+				return s.checkStructMethodCall(ce, recvType.Elem, fa.Field.Value, false)
+			default:
+				for _, a := range ce.Arguments {
+					s.checkExpression(a)
+				}
+				return &Type{Kind: KindUnknown, Name: "call"}
+			}
 		} else {
 			if ce.Function != nil {
 				s.checkExpression(ce.Function)
@@ -1056,59 +1496,7 @@ func (s *Sema) checkCallExpression(ce *CallExpression) *Type {
 		s.errorAt(ce.Token.Line, ce.Token.Column, "generic calls are not yet supported (%s)", calleeName)
 	}
 
-	// Variadic functions accept any number of arguments at or above the
-	// fixed-parameter count; non-variadic require an exact match.
-	if sym.Variadic {
-		if len(ce.Arguments) < len(sym.Params) {
-			s.errorAt(ce.Token.Line, ce.Token.Column, "not enough arguments in call to %s\n\thave (%d args)\n\twant at least (%d args)",
-				calleeName, len(ce.Arguments), len(sym.Params))
-		}
-	} else if len(ce.Arguments) != len(sym.Params) {
-		s.errorAt(ce.Token.Line, ce.Token.Column, "not enough arguments in call to %s\n\thave (%d args)\n\twant (%d args)",
-			calleeName, len(ce.Arguments), len(sym.Params))
-	}
-
-	n := len(ce.Arguments)
-	if len(sym.Params) < n {
-		n = len(sym.Params)
-	}
-	for i := 0; i < n; i++ {
-		argType := s.checkExpression(ce.Arguments[i])
-		want := sym.Params[i]
-		if want == nil || argType == nil {
-			continue
-		}
-		if isUntypedLiteral(ce.Arguments[i]) && argType.isNumeric() && want.isNumeric() {
-			s.resolvedTypes[ce.Arguments[i]] = want
-			continue
-		}
-		// Tinoc's `str` (a {data,len} struct) implicitly converts to a C
-		// `const char *` / `char *` parameter: codegen passes the data
-		// pointer instead of the struct. Record the retype so codegen
-		// knows to emit the unwrapped form.
-		if sym.IsCImport && argType.Kind == KindStr && isCStringPtr(want) {
-			s.resolvedTypes[ce.Arguments[i]] = want
-			s.cStrArgs[ce.Arguments[i]] = true
-			continue
-		}
-		if want.Kind == KindUnknown || argType.Kind == KindUnknown || argType.Kind == KindInvalid {
-			continue
-		}
-		if !assignable(want, argType) {
-			s.errorAt(ce.Token.Line, ce.Token.Column, "%s", describeMismatch(
-				fmt.Sprintf("argument %d to %s", i+1, calleeName), argType, want))
-		}
-	}
-	// Extra arguments beyond the param count (variadic C calls, or
-	// already-flagged mismatch calls) still get checked so their own
-	// inner expressions are resolved for codegen robustness. str-typed
-	// variadic arguments must be unwrapped to their data pointer in C.
-	for i := n; i < len(ce.Arguments); i++ {
-		argType := s.checkExpression(ce.Arguments[i])
-		if sym.IsCImport && argType != nil && argType.Kind == KindStr {
-			s.cStrArgs[ce.Arguments[i]] = true
-		}
-	}
+	s.checkCallArgs(ce, sym, calleeName, 0)
 
 	return sym.ReturnType
 }

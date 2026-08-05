@@ -1,0 +1,42 @@
+// A small high-score board built from structs: instance methods mutate
+// player state, structs flow through ordinary functions, and `str`
+// fields print through C interop.
+
+struct Player {
+	name str;
+	score i32;
+
+	fn addScore(self ^Player, points i32) void {
+		self^.score += points;
+	}
+
+	fn isHighScore(self ^Player, threshold i32) bool {
+		return self^.score >= threshold;
+	}
+}
+
+extern "C" fn printf(fmt *const char, ...) i32;
+
+fn best(a Player, b Player) Player {
+	if a.score >= b.score {
+		return a;
+	}
+	return b;
+}
+
+fn main() void {
+	var alice Player = Player { .name = "Alice", .score = 10 };
+	var bob Player = Player { .name = "Bob", .score = 25 };
+
+	alice.addScore(20);
+	bob.addScore(5);
+
+	var winner = best(alice, bob);
+
+	printf("Alice score = %d\n", alice.score);
+	printf("Bob score = %d\n", bob.score);
+	printf("Bob is high = %d\n", bob.isHighScore(30));
+
+	// str fields passed to C calls are unwrapped to their .data pointer
+	printf("winner = %s\n", winner.name);
+}

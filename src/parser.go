@@ -66,8 +66,9 @@ var precedences = map[TokenType]precedence{
 
 	TOKEN_AMP:   BITWISE,
 	TOKEN_PIPE:  BITWISE,
-	TOKEN_CARET: BITWISE, // Note: `^` as infix is bitwise-xor-ish usage is
-	// reserved; as postfix it is pointer-deref (handled separately below).
+	TOKEN_CARET: POSTFIX, // `^` binds as the pointer-dereference postfix (x^),
+	// so `a * self^.x` parses as `a * ((self^).x)`; binary xor (`^` as an
+	// infix) is reserved but never registered, so nothing is lost.
 
 	TOKEN_LSHIFT: SHIFT,
 	TOKEN_RSHIFT: SHIFT,
@@ -138,6 +139,7 @@ func NewParser(source string) *Parser {
 
 	p.prefixParseFns = make(map[TokenType]prefixParseFn)
 	p.registerPrefix(TOKEN_IDENT, p.parseIdentifier)
+	p.registerPrefix(TOKEN_SELF, p.parseIdentifier) // `self` in method bodies parses as a plain identifier
 	p.registerPrefix(TOKEN_INT, p.parseIntegerLiteral)
 	p.registerPrefix(TOKEN_FLOAT, p.parseFloatLiteral)
 	p.registerPrefix(TOKEN_STRING, p.parseStringLiteral)
@@ -261,6 +263,8 @@ func (p *Parser) parseStatement() Statement {
 		return p.parseReturnStatement()
 	case TOKEN_FN:
 		return p.parseFunctionStatement(false)
+	case TOKEN_STRUCT:
+		return p.parseStructStatement()
 	case TOKEN_PUB:
 		return p.parsePubStatement()
 	case TOKEN_STATIC:
@@ -530,6 +534,14 @@ func (p *Parser) parsePubStatement() Statement {
 		}
 		return fn
 	}
+	if p.peekTokenIs(TOKEN_STRUCT) {
+		p.nextToken()
+		stmt := p.parseStructStatement()
+		if s, ok := stmt.(*StructStatement); ok {
+			s.IsPub = true
+		}
+		return stmt
+	}
 	// `pub const` / `pub var` / `pub struct` etc. reuse the same
 	// declaration parsers; the pub-ness itself isn't tracked on those
 	// nodes yet since this is a partial AST.
@@ -537,6 +549,12 @@ func (p *Parser) parsePubStatement() Statement {
 	return p.parseStatement()
 }
 
+// parseStaticStatement handles the `static` modifier, which currently
+// prefixes three statement kinds: `static fn` (static method inside a
+// struct/union/enum body), `static var`, and `static const`. The modifier
+// itself carries no new token; it is folded into IsStatic on the resulting
+// node so downstream stages (sema, codegen) can tell static bindings/
+// functions apart from ordinary ones without re-inspecting tokens.
 // parseStaticStatement handles the `static` modifier, which currently
 // prefixes three statement kinds: `static fn` (static method inside a
 // struct/union/enum body), `static var`, and `static const`. The modifier
@@ -567,6 +585,94 @@ func (p *Parser) parseStaticStatement() Statement {
 		return nil
 	}
 }
+
+// parseStructStatement handles a struct declaration:
+//
+//	struct <Name> {
+//	    <field> <type>;
+//	    ...
+//	    fn <method>(self ^<Name>, ...) <type> {...}
+//	    static fn <method>(...) <type> {...}
+//	}
+//
+// Field lines are `name type;` pairs; method lines start with `fn` (or
+// `static fn`). Generic struct headers (`struct Pair:T {` and
+// `struct Map:(K, V) {`) are recognized and rejected with a clear
+// "not yet supported" diagnostic, but the generic args are still
+// consumed so parsing can continue past them.
+func (p *Parser) parseStructStatement() Statement {
+	stmt := &StructStatement{Token: p.curToken}
+
+	if !p.expectPeek(TOKEN_IDENT) {
+		return nil
+	}
+	stmt.Name = &Identifier{Token: p.curToken, Value: p.curToken.Literal}
+
+	// Reject generic struct headers: `struct Pair:T {` / `struct Map:(K, V) {`.
+	if p.peekTokenIs(TOKEN_COLON) {
+		p.nextToken() // consume ':'
+		if p.peekTokenIs(TOKEN_LPAREN) {
+			p.nextToken() // consume '('
+			p.parseIdentList(TOKEN_RPAREN)
+		} else if p.peekTokenIs(TOKEN_IDENT) {
+			p.nextToken()
+		}
+		p.addError("generic structs are not yet supported (%s)", stmt.Name.Value)
+	}
+
+	if !p.expectPeek(TOKEN_LBRACE) {
+		return nil
+	}
+	p.nextToken() // consume '{'
+
+	for !p.curTokenIs(TOKEN_RBRACE) && !p.curTokenIs(TOKEN_EOF) {
+		switch p.curToken.Type {
+		case TOKEN_FN:
+			if m, ok := p.parseFunctionStatement(false).(*FunctionStatement); ok {
+				stmt.Methods = append(stmt.Methods, m)
+			}
+		case TOKEN_STATIC:
+			p.nextToken() // consume 'static'
+			if p.curTokenIs(TOKEN_FN) {
+				if m, ok := p.parseFunctionStatement(true).(*FunctionStatement); ok {
+					stmt.Methods = append(stmt.Methods, m)
+				}
+			} else {
+				p.addError("expected 'fn' after 'static' inside struct body, got %s (%q)", p.curToken.Type, p.curToken.Literal)
+			}
+		case TOKEN_SEMICOLON:
+			// Stray semicolon inside a struct body; skip silently.
+		default:
+			if field := p.parseStructField(); field != nil {
+				stmt.Fields = append(stmt.Fields, field)
+			}
+		}
+		p.nextToken()
+	}
+
+	return stmt
+}
+
+// parseStructField parses a single `<name> <type>;` field line, starting
+// at curToken (the field name).
+func (p *Parser) parseStructField() *StructField {
+	if !p.curTokenIs(TOKEN_IDENT) {
+		p.addError("expected field name inside struct body, got %s (%q)", p.curToken.Type, p.curToken.Literal)
+		return nil
+	}
+	field := &StructField{Name: &Identifier{Token: p.curToken, Value: p.curToken.Literal}}
+
+	if p.peekTokenIs(TOKEN_SEMICOLON) || p.peekTokenIs(TOKEN_RBRACE) {
+		p.addError("field %s is missing a type", field.Name.Value)
+		return nil
+	}
+	p.nextToken()
+	field.Type = p.parseType()
+
+	p.skipSemicolon()
+	return field
+}
+
 
 func (p *Parser) parseFunctionStatement(isStatic bool) Statement {
 	stmt := &FunctionStatement{Token: p.curToken, IsStatic: isStatic}
@@ -1329,6 +1435,10 @@ func printASTNode(n Node, depth int, useColor bool) {
 				printASTNode(s, depth+1, useColor)
 			}
 		}
+	case *StructStatement:
+		for _, m := range v.Methods {
+			printASTNode(m, depth+1, useColor)
+		}
 	case *BlockStatement:
 		for _, s := range v.Statements {
 			printASTNode(s, depth+1, useColor)
@@ -1377,6 +1487,8 @@ func nodeLabel(n Node) string {
 		return "ImportStatement"
 	case *ImportCStatement:
 		return "ImportCStatement"
+	case *StructStatement:
+		return "StructStatement"
 	case *ExternCFuncStatement:
 		return "ExternCFuncStatement"
 	default:
@@ -1391,6 +1503,11 @@ func nodeSummary(n Node) string {
 	switch v := n.(type) {
 	case *FunctionStatement:
 		return " " + v.Name.String() + "(...)"
+	case *StructStatement:
+		if v.Name != nil {
+			return " " + v.Name.String()
+		}
+		return ""
 	case *IfStatement, *WhileStatement, *ForStatement, *BlockStatement:
 		return ""
 	default:
