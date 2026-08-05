@@ -277,6 +277,10 @@ func (p *Parser) parseStatement() Statement {
 		return p.parseContinueStatement()
 	case TOKEN_IMPORT:
 		return p.parseImportStatement()
+	case TOKEN_IMPORTC:
+		return p.parseImportCStatement()
+	case TOKEN_EXTERN:
+		return p.parseExternCStatement()
 	case TOKEN_LBRACE:
 		return p.parseBlockStatement()
 	case TOKEN_SEMICOLON:
@@ -586,7 +590,9 @@ func (p *Parser) parseFunctionStatement(isStatic bool) Statement {
 	if !p.expectPeek(TOKEN_LPAREN) {
 		return nil
 	}
-	stmt.Params = p.parseFunctionParams()
+	var variadic bool
+	stmt.Params, variadic = p.parseFunctionParamsEx()
+	stmt.Variadic = variadic
 
 	// Return type (required by grammar, but tolerated as void if omitted).
 	if !p.peekTokenIs(TOKEN_LBRACE) {
@@ -599,6 +605,109 @@ func (p *Parser) parseFunctionStatement(isStatic bool) Statement {
 	}
 	stmt.Body = p.parseBlockStatement()
 
+	return stmt
+}
+
+// === #importc / extern "C" ===
+
+// parseImportCStatement handles `#importc "stdio.h" ["stdlib.h" ...] [as cio];`.
+// Zero or more header strings are followed by an optional `as <alias>;`
+// suffix; when the alias is omitted it defaults to the first header's file
+// stem (e.g. `#importc "stdio.h";` -> calls go through `stdio.printf(...)`).
+func (p *Parser) parseImportCStatement() Statement {
+	stmt := &ImportCStatement{Token: p.curToken}
+
+	if !p.expectPeek(TOKEN_STRING) {
+		return nil
+	}
+	stmt.Headers = append(stmt.Headers, p.curToken.Literal)
+	for p.peekTokenIs(TOKEN_STRING) {
+		p.nextToken()
+		stmt.Headers = append(stmt.Headers, p.curToken.Literal)
+	}
+
+	if p.peekTokenIs(TOKEN_IDENT) && p.peekToken.Literal == "as" {
+		p.nextToken() // consume 'as'
+		if !p.expectPeek(TOKEN_IDENT) {
+			return nil
+		}
+		stmt.Alias = p.curToken.Literal
+	} else {
+		stmt.Alias = defaultImportCAlias(stmt.Headers)
+	}
+
+	p.skipSemicolon()
+	return stmt
+}
+
+func defaultImportCAlias(headers []string) string {
+	if len(headers) == 0 {
+		return "c"
+	}
+	base := headers[0]
+	if idx := strings.LastIndex(base, "/"); idx >= 0 {
+		base = base[idx+1:]
+	}
+	if idx := strings.LastIndex(base, "."); idx > 0 {
+		base = base[:idx]
+	}
+	if base == "" {
+		return "c"
+	}
+	return base
+}
+
+// parseExternCStatement handles `extern "C" fn name(.symbol)?(params, ...) RetType;`.
+// It parses like a function declaration but ends at a semicolon instead of
+// a body: the declared function is a real C function called by its C
+// symbol, so there is nothing to define.
+func (p *Parser) parseExternCStatement() Statement {
+	stmt := &ExternCFuncStatement{Token: p.curToken}
+
+	if !p.expectPeek(TOKEN_STRING) {
+		return nil
+	}
+	// The linkage spec string must be "C" (or "C++" accepted leniently by
+	// some callers); anything else is rejected to catch `extern "foo"`.
+	if p.curToken.Literal != "C" && p.curToken.Literal != "C++" {
+		p.addError("expected \"C\" linkage after 'extern', got %q", p.curToken.Literal)
+		return nil
+	}
+
+	if !p.expectPeek(TOKEN_FN) {
+		return nil
+	}
+	if !p.expectPeek(TOKEN_IDENT) {
+		return nil
+	}
+	stmt.Name = &Identifier{Token: p.curToken, Value: p.curToken.Literal}
+	stmt.CSymbol = stmt.Name.Value
+
+	// Optional `.symbol` form lets the Tinoc name differ from the real C
+	// symbol: `extern "C" fn my_printf.printf(fmt ^char, ...) i32;`.
+	if p.peekTokenIs(TOKEN_DOT) {
+		p.nextToken() // consume '.'
+		if !p.expectPeek(TOKEN_IDENT) {
+			return nil
+		}
+		stmt.CSymbol = p.curToken.Literal
+	}
+
+	if !p.expectPeek(TOKEN_LPAREN) {
+		return nil
+	}
+	params, variadic := p.parseFunctionParamsEx()
+	stmt.Params = params
+	stmt.Variadic = variadic
+
+	if !p.peekTokenIs(TOKEN_SEMICOLON) {
+		p.nextToken()
+		stmt.ReturnType = p.parseType()
+	} else {
+		stmt.ReturnType = &NamedType{Token: p.curToken, Name: "void"}
+	}
+
+	p.skipSemicolon()
 	return stmt
 }
 
@@ -627,12 +736,31 @@ func (p *Parser) parseIdentList(closing TokenType) []string {
 	return idents
 }
 
+// parseFunctionParams parses a `(a i32, b i32, ...)` parameter list into
+// the parameter slice, dropping the variadic marker.
 func (p *Parser) parseFunctionParams() []*Parameter {
+	params, _ := p.parseFunctionParamsEx()
+	return params
+}
+
+// parseFunctionParamsEx is parseFunctionParams' variadic-aware form: it
+// also reports whether the list ended in `...` (TOKEN_ELLIPSIS). The
+// trailing ellipsis can only appear in last position, after a comma.
+func (p *Parser) parseFunctionParamsEx() ([]*Parameter, bool) {
 	var params []*Parameter
 
 	if p.peekTokenIs(TOKEN_RPAREN) {
 		p.nextToken()
-		return params
+		return params, false
+	}
+
+	if p.peekTokenIs(TOKEN_ELLIPSIS) {
+		// `(...)`: variadic with zero fixed parameters. The parser
+		// represents it faithfully; Sema rejects it for extern "C" fns
+		// (C requires at least one named parameter before `...`).
+		p.nextToken()
+		p.expectPeek(TOKEN_RPAREN)
+		return params, true
 	}
 
 	p.nextToken()
@@ -640,14 +768,19 @@ func (p *Parser) parseFunctionParams() []*Parameter {
 
 	for p.peekTokenIs(TOKEN_COMMA) {
 		p.nextToken()
+		if p.peekTokenIs(TOKEN_ELLIPSIS) {
+			p.nextToken() // consume '...'
+			p.expectPeek(TOKEN_RPAREN)
+			return params, true
+		}
 		p.nextToken()
 		params = append(params, p.parseSingleParam())
 	}
 
 	if !p.expectPeek(TOKEN_RPAREN) {
-		return params
+		return params, false
 	}
-	return params
+	return params, false
 }
 
 func (p *Parser) parseSingleParam() *Parameter {
@@ -990,10 +1123,21 @@ func (p *Parser) parseOptionalUnwrapPostfix(left Expression) Expression {
 // (`[N]T`, `[_]T`, `[N:x]T`, `[]T`).
 func (p *Parser) parseType() TypeExpr {
 	switch p.curToken.Type {
-	case TOKEN_CARET:
+	case TOKEN_CARET, TOKEN_ASTERISK:
+		// `^T` is Tinoc's native pointer spelling; `*T` is accepted as a
+		// C-compatible alias (used by `extern "C" fn` declarations like
+		// `fmt *const char`). Both produce the same PointerType node.
 		tok := p.curToken
 		p.nextToken()
 		return &PointerType{Token: tok, Elem: p.parseType()}
+
+	case TOKEN_CONST:
+		// `const T` / `*const char`: the qualifier is preserved for
+		// faithful C-prototype reconstruction but ignored by the type
+		// checker.
+		tok := p.curToken
+		p.nextToken()
+		return &CQualType{Token: tok, Qual: "const", Elem: p.parseType()}
 
 	case TOKEN_QUESTION:
 		tok := p.curToken
@@ -1009,6 +1153,14 @@ func (p *Parser) parseType() TypeExpr {
 		return p.parseArrayType()
 
 	case TOKEN_IDENT:
+		// `volatile` / `restrict` are C qualifiers, not named types; treat
+		// them like `const` (kept for prototype spelling, ignored for
+		// typing).
+		if p.curToken.Literal == "volatile" || p.curToken.Literal == "restrict" {
+			tok := p.curToken
+			p.nextToken()
+			return &CQualType{Token: tok, Qual: tok.Literal, Elem: p.parseType()}
+		}
 		return p.parseNamedOrGenericType()
 
 	default:
@@ -1223,6 +1375,10 @@ func nodeLabel(n Node) string {
 		return "ContinueStatement"
 	case *ImportStatement:
 		return "ImportStatement"
+	case *ImportCStatement:
+		return "ImportCStatement"
+	case *ExternCFuncStatement:
+		return "ExternCFuncStatement"
 	default:
 		return fmt.Sprintf("%T", n)
 	}

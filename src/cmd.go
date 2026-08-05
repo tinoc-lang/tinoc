@@ -376,6 +376,7 @@ func runCompilerPipeline(mode string, config PipelineConfig) {
 
 	stage(useColor, "CODEGEN", "transpiling %s to C", config.FilePath)
 	gen := NewCodegen(sema, diags)
+	gen.sourceDir = filepath.Dir(config.FilePath)
 	cCode := gen.Generate(program)
 
 	if diags.HasErrors() {
@@ -465,7 +466,10 @@ func compileGeneratedC(cc *CCompiler, sourcePath, cCode, outName string, verbose
 		}
 	}
 
-	args := cc.BuildArgs(cFile, outPath, []string{workDir})
+	// The source file's directory is added as an include path so
+	// #importc'd local headers (`#include "myheader.h"`) resolve even
+	// though the generated C is compiled from a temp work directory.
+	args := cc.BuildArgs(cFile, outPath, []string{workDir, filepath.Dir(sourcePath)})
 
 	if verbose {
 		if useColor {

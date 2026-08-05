@@ -1,0 +1,20 @@
+// Demonstrates `extern "C" fn`: hand-declare a real C function without
+// parsing any header. The declaration is fully type-checked at comptime
+// (wrong argument counts/types are compile errors) and codegen emits a C
+// prototype plus a plain call to the real symbol.
+//
+//   extern "C" fn printf(fmt *const char, ...) i32;
+//   extern "C" fn my_puts.puts(s *const char) i32;  // .symbol form
+
+extern "C" fn printf(fmt *const char, ...) i32;
+extern "C" fn strlen(s *const char) usize;
+extern "C" fn exit(status i32) void;
+
+fn main() void {
+	printf("Raw C call: %d\n", 42);
+
+	var msg str = "tinoc";
+	printf("len of \"%s\" is %zu\n", msg, strlen(msg));
+
+	exit(0);
+}

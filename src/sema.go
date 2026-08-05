@@ -2,6 +2,7 @@ package src
 
 import (
 	"fmt"
+	"path/filepath"
 )
 
 // === Semantic Analysis ===
@@ -50,6 +51,16 @@ type Symbol struct {
 	Params     []*Type
 	ParamNames []string
 	ReturnType *Type
+
+	// C-interop fields (importc members and extern "C" fn declarations).
+	// CSymbol is the real C name the call should use (e.g. "printf"); when
+	// empty the symbol is a plain Tinoc function (codegen applies its
+	// tnc_ prefix). IsCImport marks extern "C" fn / imported functions so
+	// codegen knows to emit the C name directly and unwrap `str` args to
+	// their underlying data pointer.
+	CSymbol   string
+	IsCImport bool
+	Variadic  bool
 }
 
 // Scope is a single lexical scope: function body, block, or the file's
@@ -95,6 +106,18 @@ type Sema struct {
 	funcs   map[string]*Symbol // top-level function table, for forward calls
 	current *Scope
 
+	// sourceDir is the directory of the file being checked, used to
+	// resolve local headers named by #importc.
+	sourceDir string
+
+	// importCModules holds the symbol surface of every #importc, keyed by
+	// alias ("cio"); externCFuncs holds every `extern "C" fn` by its
+	// Tinoc callable name; cTypes is the global registry of C typedefs /
+	// struct / enum tags that resolveTypeExpr falls back to.
+	importCModules map[string]*CImportModule
+	externCFuncs   map[string]*Symbol
+	cTypes         map[string]*Type
+
 	// currentFn tracks the function being checked, for `return` type
 	// checking. nil at top level.
 	currentFn *Symbol
@@ -111,6 +134,12 @@ type Sema struct {
 	// initializer expression to key resolvedTypes off of).
 	declVarTypes   map[*VarStatement]*Type
 	declConstTypes map[*ConstStatement]*Type
+
+	// cStrArgs marks call arguments that must be passed to C as their
+	// underlying data pointer rather than as a Tinoc str struct (e.g. a
+	// `str` variable handed to printf's variadic %s). Codegen consults it
+	// when rendering real C calls.
+	cStrArgs map[Expression]bool
 }
 
 // NewSema constructs a Sema instance bound to the given diagnostics
@@ -127,6 +156,10 @@ func NewSema(diags *Diagnostics) *Sema {
 		resolvedTypes:  make(map[Expression]*Type),
 		declVarTypes:   make(map[*VarStatement]*Type),
 		declConstTypes: make(map[*ConstStatement]*Type),
+		importCModules: make(map[string]*CImportModule),
+		externCFuncs:   make(map[string]*Symbol),
+		cTypes:         make(map[string]*Type),
+		cStrArgs:       make(map[Expression]bool),
 	}
 }
 
@@ -148,6 +181,15 @@ func (s *Sema) errorAt(line, col int, format string, args ...interface{}) {
 // Check runs semantic analysis over the whole program. It is safe to call
 // once per Program; call Errors()/Diagnostics() after to see the result.
 func (s *Sema) Check(prog *Program) {
+	// Pass 0: process every #importc by invoking the C header parser
+	// (clang/gcc) and registering the resulting module under its alias.
+	// A failing import is a hard error reported at the directive.
+	for _, stmt := range prog.Statements {
+		if ics, ok := stmt.(*ImportCStatement); ok {
+			s.importCModule(ics)
+		}
+	}
+
 	// Pass 1: register every top-level function signature first, so calls
 	// can appear textually before the function they call (Tinoc, like C
 	// via forward declarations, allows this -- main() calling helpers
@@ -155,12 +197,40 @@ func (s *Sema) Check(prog *Program) {
 	for _, stmt := range prog.Statements {
 		if fn, ok := stmt.(*FunctionStatement); ok {
 			s.registerFunctionSignature(fn)
+		} else if ecs, ok := stmt.(*ExternCFuncStatement); ok {
+			s.registerExternCFunc(ecs)
 		}
 	}
 
 	// Pass 2: check bodies and top-level var/const statements in order.
 	for _, stmt := range prog.Statements {
 		s.checkStatement(stmt)
+	}
+}
+
+// importCModule runs the C header parser for one #importc statement and
+// registers the resulting module under its alias.
+func (s *Sema) importCModule(ics *ImportCStatement) {
+	if len(ics.Headers) == 0 {
+		s.errorAt(ics.Token.Line, ics.Token.Column, "#importc requires at least one header, e.g. #importc \"stdio.h\" as cio;")
+		return
+	}
+	if _, dup := s.importCModules[ics.Alias]; dup {
+		s.errorAt(ics.Token.Line, ics.Token.Column, "C module %s already imported", ics.Alias)
+		return
+	}
+	mod, err := ImportCHeaders(ics.Alias, ics.Headers, s.sourceDir)
+	if err != nil {
+		s.errorAt(ics.Token.Line, ics.Token.Column, "%v", err)
+		return
+	}
+	s.importCModules[ics.Alias] = mod
+	// Fold the header's type names into the global registry so Tinoc
+	// source can name them (e.g. `var f FILE` after importing stdio.h).
+	for name, t := range mod.Types {
+		if _, exists := s.cTypes[name]; !exists {
+			s.cTypes[name] = t
+		}
 	}
 }
 
@@ -174,6 +244,11 @@ func (s *Sema) registerFunctionSignature(fn *FunctionStatement) {
 
 	if len(fn.GenericParams) > 0 {
 		s.errorAt(fn.Token.Line, fn.Token.Column, "generic functions are not yet supported (%s)", name)
+		return
+	}
+
+	if fn.Variadic {
+		s.errorAt(fn.Token.Line, fn.Token.Column, "defining variadic Tinoc functions is not yet supported (%s) — declare the C function instead: extern \"C\" fn %s(...) RetType;", name, name)
 		return
 	}
 
@@ -217,6 +292,60 @@ func (s *Sema) registerFunctionSignature(fn *FunctionStatement) {
 	s.global.Define(sym)
 }
 
+// registerExternCFunc registers an `extern "C" fn` declaration: a real C
+// function called by its C symbol, but type-checked like any other
+// function in Tinoc. A variadic declaration needs at least one named
+// parameter before the `...` (C's own rule).
+func (s *Sema) registerExternCFunc(ecs *ExternCFuncStatement) {
+	if ecs.Name == nil {
+		return
+	}
+	name := ecs.Name.Value
+	line, col := ecs.Token.Line, ecs.Token.Column
+
+	if _, exists := s.funcs[name]; exists {
+		s.errorAt(line, col, "%s redeclared in this block", name)
+		return
+	}
+	if ecs.Variadic && len(ecs.Params) == 0 {
+		s.errorAt(line, col, "variadic C function %s needs at least one named parameter before '...'", name)
+		return
+	}
+
+	sym := &Symbol{Name: name, Kind: SymFunc, IsCImport: true, CSymbol: ecs.CSymbol, Variadic: ecs.Variadic}
+
+	seenParams := make(map[string]bool)
+	for _, p := range ecs.Params {
+		if p == nil || p.Name == nil {
+			continue
+		}
+		pname := p.Name.Value
+		if seenParams[pname] {
+			s.errorAt(line, col, "duplicate parameter %s", pname)
+		}
+		seenParams[pname] = true
+		var pt *Type
+		if p.Type != nil {
+			pt = s.resolveTypeExpr(p.Type)
+		} else {
+			s.errorAt(line, col, "parameter %s is missing a type", pname)
+			pt = &Type{Kind: KindInvalid}
+		}
+		sym.Params = append(sym.Params, pt)
+		sym.ParamNames = append(sym.ParamNames, pname)
+	}
+
+	if ecs.ReturnType != nil {
+		sym.ReturnType = s.resolveTypeExpr(ecs.ReturnType)
+	} else {
+		sym.ReturnType = typeVoid
+	}
+
+	s.funcs[name] = sym
+	s.externCFuncs[name] = sym
+	s.global.Define(sym)
+}
+
 // === Statement Checking ===
 
 func (s *Sema) checkStatement(stmt Statement) {
@@ -241,8 +370,9 @@ func (s *Sema) checkStatement(stmt Statement) {
 		s.checkWhileStatement(st)
 	case *ForStatement:
 		s.checkForStatement(st)
-	case *BreakStatement, *ContinueStatement, *ImportStatement:
-		// Nothing to resolve for this pass.
+	case *BreakStatement, *ContinueStatement, *ImportStatement, *ImportCStatement, *ExternCFuncStatement:
+		// Nothing to resolve for this pass (imports/extern decls were
+		// processed in Check's passes 0/1).
 	case nil:
 		// Stray/skipped statement (e.g. parser recovered from an error).
 	default:
@@ -613,12 +743,10 @@ func (s *Sema) inferExpression(e Expression) *Type {
 		}
 		return &Type{Kind: KindUnknown, Name: "index"}
 	case *FieldAccessExpression:
-		// Module member access (io.println) and struct field access both
-		// parse to this node; neither is resolved by this pass.
-		if ex.Left != nil {
-			s.checkExpression(ex.Left)
-		}
-		return &Type{Kind: KindUnknown, Name: "field"}
+		// Module member access (cio.printf / io.println) and struct field
+		// access both parse to this node. C module members (#importc) are
+		// resolved here; other modules stay unresolved.
+		return s.checkFieldAccess(ex)
 	case *GenericExpression:
 		if ex.Base != nil {
 			s.checkExpression(ex.Base)
@@ -667,8 +795,48 @@ func (s *Sema) checkIdentifier(id *Identifier) *Type {
 	if sym, ok := s.funcs[id.Value]; ok {
 		return sym.ReturnType // bare function reference in expr position; rare, best-effort
 	}
+	// A #importc alias used outside member access (e.g. `var x = cio;`)
+	// has no value type; report it as an opaque module rather than an
+	// undefined-name error, since the name is defined.
+	if _, ok := s.importCModules[id.Value]; ok {
+		return &Type{Kind: KindUnknown, Name: "module"}
+	}
 	s.errorAt(id.Token.Line, id.Token.Column, "undefined: %s", id.Value)
 	return &Type{Kind: KindInvalid}
+}
+
+// checkFieldAccess resolves `alias.member` for #importc modules: function
+// members keep their call signature (checked at the call site), constant
+// members (extern vars, enum constants, simple macros) resolve to their
+// C type. Non-module field access stays unresolved like before.
+func (s *Sema) checkFieldAccess(fa *FieldAccessExpression) *Type {
+	mod, ok := s.moduleAlias(fa.Left)
+	if !ok || fa.Field == nil {
+		if fa.Left != nil {
+			s.checkExpression(fa.Left)
+		}
+		return &Type{Kind: KindUnknown, Name: "field"}
+	}
+	member := fa.Field.Value
+	if fn, ok := mod.Funcs[member]; ok {
+		return fn.ReturnType // bare member reference; call sites check the full signature
+	}
+	if c, ok := mod.Consts[member]; ok {
+		return c.Type
+	}
+	s.errorAt(fa.Token.Line, fa.Token.Column, "undefined: %s.%s", mod.Alias, member)
+	return &Type{Kind: KindInvalid}
+}
+
+// moduleAlias returns the #importc module aliased by the expression, if
+// the expression is a bare identifier naming one.
+func (s *Sema) moduleAlias(e Expression) (*CImportModule, bool) {
+	id, ok := e.(*Identifier)
+	if !ok {
+		return nil, false
+	}
+	mod, ok := s.importCModules[id.Value]
+	return mod, ok
 }
 
 func (s *Sema) checkPrefixExpression(pe *PrefixExpression) *Type {
@@ -833,10 +1001,48 @@ func (s *Sema) checkAssignExpression(ae *AssignExpression) *Type {
 }
 
 func (s *Sema) checkCallExpression(ce *CallExpression) *Type {
-	ident, isIdent := ce.Function.(*Identifier)
-	if !isIdent {
-		// Method calls / module calls (io.println(...), self.foo(...)) are
-		// FieldAccessExpression callees, not yet resolved by this pass.
+	calleeName := ""
+	var sym *Symbol
+
+	if fa, ok := ce.Function.(*FieldAccessExpression); ok {
+		// `cio.printf(...)`: resolve the member signature inside the
+		// #importc module. Non-C module calls (io.println) stay
+		// unresolved, same as before.
+		if mod, isMod := s.moduleAlias(fa.Left); isMod && fa.Field != nil {
+			member := fa.Field.Value
+			if fn, ok := mod.Funcs[member]; ok {
+				sym = fn
+				calleeName = mod.Alias + "." + member
+			} else {
+				for _, a := range ce.Arguments {
+					s.checkExpression(a)
+				}
+				s.errorAt(ce.Token.Line, ce.Token.Column, "undefined: %s.%s", mod.Alias, member)
+				return &Type{Kind: KindInvalid}
+			}
+		} else {
+			if ce.Function != nil {
+				s.checkExpression(ce.Function)
+			}
+			for _, a := range ce.Arguments {
+				s.checkExpression(a)
+			}
+			return &Type{Kind: KindUnknown, Name: "call"}
+		}
+	} else if ident, isIdent := ce.Function.(*Identifier); isIdent {
+		var ok bool
+		sym, ok = s.funcs[ident.Value]
+		if !ok {
+			// No first-class function values in this pass; treat as
+			// unknown-callee.
+			for _, a := range ce.Arguments {
+				s.checkExpression(a)
+			}
+			s.errorAt(ce.Token.Line, ce.Token.Column, "undefined: %s", ident.Value)
+			return &Type{Kind: KindInvalid}
+		}
+		calleeName = ident.Value
+	} else {
 		if ce.Function != nil {
 			s.checkExpression(ce.Function)
 		}
@@ -846,25 +1052,20 @@ func (s *Sema) checkCallExpression(ce *CallExpression) *Type {
 		return &Type{Kind: KindUnknown, Name: "call"}
 	}
 
-	sym, ok := s.funcs[ident.Value]
-	if !ok {
-		// Also allow calling a local variable of function type is not
-		// supported (Tinoc has no first-class function values in this
-		// pass); treat as unknown-callee.
-		for _, a := range ce.Arguments {
-			s.checkExpression(a)
-		}
-		s.errorAt(ce.Token.Line, ce.Token.Column, "undefined: %s", ident.Value)
-		return &Type{Kind: KindInvalid}
-	}
-
 	if len(ce.GenericArgs) > 0 {
-		s.errorAt(ce.Token.Line, ce.Token.Column, "generic calls are not yet supported (%s)", ident.Value)
+		s.errorAt(ce.Token.Line, ce.Token.Column, "generic calls are not yet supported (%s)", calleeName)
 	}
 
-	if len(ce.Arguments) != len(sym.Params) {
+	// Variadic functions accept any number of arguments at or above the
+	// fixed-parameter count; non-variadic require an exact match.
+	if sym.Variadic {
+		if len(ce.Arguments) < len(sym.Params) {
+			s.errorAt(ce.Token.Line, ce.Token.Column, "not enough arguments in call to %s\n\thave (%d args)\n\twant at least (%d args)",
+				calleeName, len(ce.Arguments), len(sym.Params))
+		}
+	} else if len(ce.Arguments) != len(sym.Params) {
 		s.errorAt(ce.Token.Line, ce.Token.Column, "not enough arguments in call to %s\n\thave (%d args)\n\twant (%d args)",
-			ident.Value, len(ce.Arguments), len(sym.Params))
+			calleeName, len(ce.Arguments), len(sym.Params))
 	}
 
 	n := len(ce.Arguments)
@@ -881,19 +1082,32 @@ func (s *Sema) checkCallExpression(ce *CallExpression) *Type {
 			s.resolvedTypes[ce.Arguments[i]] = want
 			continue
 		}
+		// Tinoc's `str` (a {data,len} struct) implicitly converts to a C
+		// `const char *` / `char *` parameter: codegen passes the data
+		// pointer instead of the struct. Record the retype so codegen
+		// knows to emit the unwrapped form.
+		if sym.IsCImport && argType.Kind == KindStr && isCStringPtr(want) {
+			s.resolvedTypes[ce.Arguments[i]] = want
+			s.cStrArgs[ce.Arguments[i]] = true
+			continue
+		}
 		if want.Kind == KindUnknown || argType.Kind == KindUnknown || argType.Kind == KindInvalid {
 			continue
 		}
 		if !assignable(want, argType) {
 			s.errorAt(ce.Token.Line, ce.Token.Column, "%s", describeMismatch(
-				fmt.Sprintf("argument %d to %s", i+1, ident.Value), argType, want))
+				fmt.Sprintf("argument %d to %s", i+1, calleeName), argType, want))
 		}
 	}
-	// Extra arguments beyond the param count still get checked so their
-	// own inner expressions are resolved (useful for codegen robustness
-	// even though the call itself is already flagged above).
+	// Extra arguments beyond the param count (variadic C calls, or
+	// already-flagged mismatch calls) still get checked so their own
+	// inner expressions are resolved for codegen robustness. str-typed
+	// variadic arguments must be unwrapped to their data pointer in C.
 	for i := n; i < len(ce.Arguments); i++ {
-		s.checkExpression(ce.Arguments[i])
+		argType := s.checkExpression(ce.Arguments[i])
+		if sym.IsCImport && argType != nil && argType.Kind == KindStr {
+			s.cStrArgs[ce.Arguments[i]] = true
+		}
 	}
 
 	return sym.ReturnType
@@ -915,6 +1129,7 @@ func RunSema(file, source string) (*Program, *Sema, *Diagnostics) {
 	}
 
 	sema := NewSema(diags)
+	sema.sourceDir = filepath.Dir(file)
 	if len(parseErrs) == 0 {
 		sema.Check(prog)
 	}

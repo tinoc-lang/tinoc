@@ -1,0 +1,30 @@
+// Demonstrates #importc: parse real C headers (via clang's JSON AST dump
+// when clang is installed, gcc -aux-info otherwise) and call their
+// functions / read their constants through a fully type-checked alias.
+//
+//   #importc "stdio.h" as cio;   ->  cio.printf(...), cio.stdout, cio.EOF, ...
+//   #importc "stdio.h" "string.h" as c;   ->  c.strlen(...), c.printf(...)
+//
+// The alias is optional; without `as <name>` it defaults to the first
+// header's file stem (#importc "stdio.h"; -> stdio.printf).
+
+#importc "stdio.h" "string.h" "math.h" as c;
+
+fn main() void {
+	// str values unwrap to their data pointer when passed to C.
+	var name str = "Tinoc";
+	c.printf("hello %s!\n", name);
+
+	// Return values are typed: strlen's size_t maps to u64 on LP64.
+	var len = c.strlen("abcdef");
+	c.printf("len=%zu\n", len);
+
+	// Enum constants and macros are exposed as typed constants. (Extern
+	// vars like stdout/stderr come from the clang AST path only; gcc's
+	// -aux-info fallback cannot recover variables.)
+	c.printf("EOF=%d\n", c.EOF);
+
+	// Float math from the C library, checked at comptime.
+	var root f64 = c.sqrt(16.0);
+	c.printf("sqrt(16)=%.1f\n", root);
+}

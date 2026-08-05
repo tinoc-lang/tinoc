@@ -38,9 +38,9 @@ func colorForToken(t TokenType) string {
 		TOKEN_IF, TOKEN_ELSE, TOKEN_SWITCH, TOKEN_FOR, TOKEN_WHILE, TOKEN_BREAK,
 		TOKEN_CONTINUE, TOKEN_RETURN, TOKEN_PUB, TOKEN_SELF, TOKEN_STATIC,
 		TOKEN_TEST, TOKEN_TRY, TOKEN_TRUE, TOKEN_FALSE, TOKEN_NULL,
-		TOKEN_AND, TOKEN_OR, TOKEN_ORELSE, TOKEN_CATCH:
+		TOKEN_AND, TOKEN_OR, TOKEN_ORELSE, TOKEN_CATCH, TOKEN_EXTERN:
 		return colorPurple
-	case TOKEN_IMPORT, TOKEN_RUN, TOKEN_PARTIAL:
+	case TOKEN_IMPORT, TOKEN_IMPORTC, TOKEN_RUN, TOKEN_PARTIAL:
 		return colorYellow
 	case TOKEN_LPAREN, TOKEN_RPAREN, TOKEN_LBRACE, TOKEN_RBRACE, TOKEN_LBRACK, TOKEN_RBRACK,
 		TOKEN_COMMA, TOKEN_DOT, TOKEN_COLON, TOKEN_SEMICOLON, TOKEN_HASH:
@@ -89,6 +89,7 @@ const (
 	TOKEN_PUB      TokenType = "pub"
 	TOKEN_SELF     TokenType = "self"
 	TOKEN_STATIC   TokenType = "static"
+	TOKEN_EXTERN   TokenType = "extern"
 	TOKEN_TEST     TokenType = "test"
 	TOKEN_TRY      TokenType = "try"
 	TOKEN_TRUE     TokenType = "true"
@@ -101,6 +102,7 @@ const (
 	TOKEN_CATCH  TokenType = "catch"
 
 	TOKEN_IMPORT  TokenType = "#import"
+	TOKEN_IMPORTC TokenType = "#importc"
 	TOKEN_RUN     TokenType = "#run"
 	TOKEN_PARTIAL TokenType = "#partial"
 
@@ -143,8 +145,9 @@ const (
 	TOKEN_LTE    TokenType = "<="
 	TOKEN_GTE    TokenType = ">="
 
-	TOKEN_ARROW  TokenType = "=>"
-	TOKEN_DOTDOT TokenType = ".."
+	TOKEN_ARROW    TokenType = "=>"
+	TOKEN_DOTDOT   TokenType = ".."
+	TOKEN_ELLIPSIS TokenType = "..."
 
 	TOKEN_COMMA     TokenType = ","
 	TOKEN_DOT       TokenType = "."
@@ -177,6 +180,7 @@ var keywords = map[string]TokenType{
 	"return":   TOKEN_RETURN,
 	"pub":      TOKEN_PUB,
 	"self":     TOKEN_SELF,
+	"extern":   TOKEN_EXTERN,
 	"static":   TOKEN_STATIC,
 	"test":     TOKEN_TEST,
 	"try":      TOKEN_TRY,
@@ -371,7 +375,12 @@ func (l *Lexer) NextToken() Token {
 	case '.':
 		if l.peekChar() == '.' {
 			l.readChar()
-			tok = Token{Type: TOKEN_DOTDOT, Literal: ".."}
+			if l.peekChar() == '.' {
+				l.readChar()
+				tok = Token{Type: TOKEN_ELLIPSIS, Literal: "..."}
+			} else {
+				tok = Token{Type: TOKEN_DOTDOT, Literal: ".."}
+			}
 		} else {
 			tok = l.newToken(TOKEN_DOT, l.ch)
 		}
@@ -383,6 +392,8 @@ func (l *Lexer) NextToken() Token {
 			switch fullDirective {
 			case "#import":
 				tok = Token{Type: TOKEN_IMPORT, Literal: fullDirective}
+			case "#importc":
+				tok = Token{Type: TOKEN_IMPORTC, Literal: fullDirective}
 			case "#run":
 				tok = Token{Type: TOKEN_RUN, Literal: fullDirective}
 			case "#partial":

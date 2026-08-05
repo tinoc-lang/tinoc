@@ -491,6 +491,26 @@ func (et *ErrorUnionType) String() string {
 	return "!" + elem
 }
 
+// CQualType wraps a type with a C qualifier (`const`/`volatile`/`restrict`)
+// in the C-facing declaration contexts (extern "C" fn params/returns and
+// #importc declarations). The qualifier only matters for reconstructing a
+// faithful C prototype in codegen; Tinoc's type system ignores it, so
+// resolveTypeExpr simply resolves the inner element.
+type CQualType struct {
+	Token Token // TOKEN_CONST or TOKEN_IDENT (volatile/restrict)
+	Qual  string
+	Elem  TypeExpr
+}
+
+func (qt *CQualType) typeNode()            {}
+func (qt *CQualType) TokenLiteral() string { return qt.Token.Literal }
+func (qt *CQualType) String() string {
+	if qt.Elem == nil {
+		return qt.Qual
+	}
+	return qt.Qual + " " + qt.Elem.String()
+}
+
 // ArrayType represents fixed-size (`[N]T`), inferred-size (`[_]T`), and
 // sentinel-terminated (`[N:x]T`) arrays, as well as slices (`[]T`).
 type ArrayType struct {
@@ -666,6 +686,7 @@ type FunctionStatement struct {
 	Name          *Identifier
 	GenericParams []string // e.g. ["T"] or ["A", "B"]; empty when non-generic
 	Params        []*Parameter
+	Variadic      bool // ends with `...` (only meaningful for extern "C" fns; definitions are rejected in sema)
 	ReturnType    TypeExpr
 	Body          *BlockStatement
 	IsPub         bool
@@ -827,6 +848,79 @@ func (is *ImportStatement) String() string {
 	out.WriteString(strings.Join(is.Path, "."))
 	if is.Wildcard {
 		out.WriteString(".*")
+	}
+	out.WriteString(";")
+	return out.String()
+}
+
+// ImportCStatement represents `#importc "header.h" ["other.h"...] [as alias];`.
+// It asks the compiler to parse the given C headers (via clang's JSON AST
+// dump, or gcc's -aux-info fallback) and register every function, extern
+// variable, enum constant, typedef, and simple macro under `alias`, so the
+// rest of the file can call e.g. `cio.printf(...)` with full type safety.
+// Codegen emits a matching `#include` for each header so the declarations
+// resolve at C compile time.
+type ImportCStatement struct {
+	Token   Token    // TOKEN_IMPORTC
+	Headers []string // header names exactly as written, e.g. ["stdio.h"]
+	Alias   string   // namespace used for member access, e.g. "cio"
+}
+
+func (ics *ImportCStatement) statementNode()       {}
+func (ics *ImportCStatement) TokenLiteral() string { return ics.Token.Literal }
+func (ics *ImportCStatement) String() string {
+	var out bytes.Buffer
+	out.WriteString("#importc ")
+	for i, h := range ics.Headers {
+		if i > 0 {
+			out.WriteString(" ")
+		}
+		out.WriteString("\"" + h + "\"")
+	}
+	if ics.Alias != "" {
+		out.WriteString(" as " + ics.Alias)
+	}
+	out.WriteString(";")
+	return out.String()
+}
+
+// ExternCFuncStatement represents `extern "C" fn name(.c_symbol)?(params, ...) ReturnType;`.
+// It declares a C function by hand — no header parsing — so the rest of
+// the file can call it by its Tinoc name with full type checking. Codegen
+// emits a C prototype for it and calls it by its real C symbol.
+type ExternCFuncStatement struct {
+	Token      Token // TOKEN_EXTERN
+	Name       *Identifier
+	CSymbol    string // real C symbol; defaults to Name when the `.alias` form is unused
+	Params     []*Parameter
+	Variadic   bool
+	ReturnType TypeExpr
+}
+
+func (ecs *ExternCFuncStatement) statementNode()       {}
+func (ecs *ExternCFuncStatement) TokenLiteral() string { return ecs.Token.Literal }
+func (ecs *ExternCFuncStatement) String() string {
+	var out bytes.Buffer
+	out.WriteString("extern \"C\" fn ")
+	out.WriteString(ecs.Name.String())
+	if ecs.CSymbol != "" && ecs.CSymbol != ecs.Name.Value {
+		out.WriteString("." + ecs.CSymbol)
+	}
+	out.WriteString("(")
+	params := make([]string, 0, len(ecs.Params))
+	for _, p := range ecs.Params {
+		params = append(params, p.String())
+	}
+	out.WriteString(strings.Join(params, ", "))
+	if ecs.Variadic {
+		if len(params) > 0 {
+			out.WriteString(", ")
+		}
+		out.WriteString("...")
+	}
+	out.WriteString(") ")
+	if ecs.ReturnType != nil {
+		out.WriteString(ecs.ReturnType.String())
 	}
 	out.WriteString(";")
 	return out.String()

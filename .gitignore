@@ -33,3 +33,6 @@ go.work.sum
 
 # build directory 
 build/
+
+# tinoc header-parser cache (#importc clang/gcc dump cache)
+.tinoc_cache/
