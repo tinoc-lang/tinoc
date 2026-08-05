@@ -1,0 +1,38 @@
+// Fibonacci — recursion and forward references in Tinoc.
+//
+// A function may call itself (and may be called before its textual
+// definition, since Sema registers every signature up front and codegen
+// emits C forward declarations). This sample prints the first ten
+// Fibonacci numbers, computed two ways: recursively via fib(), and
+// iteratively with a loop to cross-check the values.
+
+extern "C" fn printf(fmt *const char, ...) i32;
+
+fn fib(n i32) i32 {
+	if n < 2 {
+		return n;
+	}
+	return fib(n - 1) + fib(n - 2);
+}
+
+fn fibIter(n i32) i32 {
+	if n < 2 {
+		return n;
+	}
+	var a i32 = 0;
+	var b i32 = 1;
+	var i i32 = 2;
+	while i <= n {
+		var next i32 = a + b;
+		a = b;
+		b = next;
+		i += 1;
+	}
+	return b;
+}
+
+fn main() void {
+	for 0..10 |i| {
+		printf("fib(%d) = %d (iter: %d)\n", i, fib(i), fibIter(i));
+	}
+}

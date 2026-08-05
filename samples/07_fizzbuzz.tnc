@@ -1,0 +1,22 @@
+// FizzBuzz — the classic loop, in Tinoc.
+//
+// Demonstrates the currently supported subset that this sample relies on:
+// for-range loops (for 1..101 |n|), if / else if / else chains, the
+// modulo operator, and an extern "C" fn declared by hand (no header
+// parsing needed for a single libc call).
+
+extern "C" fn printf(fmt *const char, ...) i32;
+
+fn main() void {
+	for 1..101 |n| {
+		if n % 15 == 0 {
+			printf("FizzBuzz\n");
+		} else if n % 3 == 0 {
+			printf("Fizz\n");
+		} else if n % 5 == 0 {
+			printf("Buzz\n");
+		} else {
+			printf("%d\n", n);
+		}
+	}
+}
