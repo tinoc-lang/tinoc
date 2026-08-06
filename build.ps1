@@ -7,12 +7,13 @@
     Run './build.ps1 help' for the full command list.
 #>
 
-# Note: no [CmdletBinding()] here — it auto-injects the common -Verbose
-# and -Debug parameters, which would collide with the explicit switches
-# declared below ("A parameter with the name 'Verbose' was defined
-# multiple times"). A plain param() block keeps -Debug/-Verbose working.
+# Note: no [CmdletBinding()] and no [Parameter(...)] attributes here.
+# Either one turns this script into an *advanced function*, which
+# auto-injects the common -Verbose/-Debug parameters and collides with
+# the explicit switches declared below ("A parameter with the name
+# 'Verbose' was defined multiple times"). In a plain script the first
+# parameter binds positionally anyway, so ./build.ps1 ci still works.
 param(
-    [Parameter(Position = 0)]
     [ValidateSet("build", "build-all", "run", "test", "cover", "vet", "fmt", "fmt-check",
                  "lint", "deps", "check", "install", "clean", "ci", "version", "help")]
     [string]$Command = "build",
