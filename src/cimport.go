@@ -184,7 +184,7 @@ func smokeTestDumper(d *headerDumper) bool {
 	if err != nil {
 		return false
 	}
-	defer os.RemoveAll(dir)
+	defer func() { _ = os.RemoveAll(dir) }()
 	wrapper := filepath.Join(dir, "wrap.c")
 	if err := os.WriteFile(wrapper, []byte("#include <stddef.h>\n"), 0o644); err != nil {
 		return false
@@ -218,7 +218,7 @@ func ImportCHeaders(alias string, headers []string, sourceDir string) (*CImportM
 	if err != nil {
 		return nil, err
 	}
-	defer os.RemoveAll(workDir)
+	defer func() { _ = os.RemoveAll(workDir) }()
 
 	wrapperSrc := cWrapperSource(headers, sourceDir)
 	wrapper := filepath.Join(workDir, "wrap.c")
