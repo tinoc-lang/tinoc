@@ -841,16 +841,10 @@ func (p *Parser) parseIdentList(closing TokenType) []string {
 	return idents
 }
 
-// parseFunctionParams parses a `(a i32, b i32, ...)` parameter list into
-// the parameter slice, dropping the variadic marker.
-func (p *Parser) parseFunctionParams() []*Parameter {
-	params, _ := p.parseFunctionParamsEx()
-	return params
-}
-
-// parseFunctionParamsEx is parseFunctionParams' variadic-aware form: it
-// also reports whether the list ended in `...` (TOKEN_ELLIPSIS). The
-// trailing ellipsis can only appear in last position, after a comma.
+// parseFunctionParamsEx parses a `(a i32, b i32, ...)` parameter list into
+// the parameter slice, also reporting whether the list ended in `...`
+// (TOKEN_ELLIPSIS). The trailing ellipsis can only appear in last
+// position, after a comma.
 func (p *Parser) parseFunctionParamsEx() ([]*Parameter, bool) {
 	var params []*Parameter
 
