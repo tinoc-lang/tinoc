@@ -10,7 +10,8 @@
     from source with ./build.ps1 build instead of downloading a release.
 #>
 
-[CmdletBinding()]
+# Note: no [CmdletBinding()] here — it auto-injects the common -Verbose
+# parameter, which would collide with the explicit switch declared below.
 param(
     [switch]$Local,
     [switch]$Force,

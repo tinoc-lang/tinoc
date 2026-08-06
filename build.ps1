@@ -7,7 +7,10 @@
     Run './build.ps1 help' for the full command list.
 #>
 
-[CmdletBinding()]
+# Note: no [CmdletBinding()] here — it auto-injects the common -Verbose
+# and -Debug parameters, which would collide with the explicit switches
+# declared below ("A parameter with the name 'Verbose' was defined
+# multiple times"). A plain param() block keeps -Debug/-Verbose working.
 param(
     [Parameter(Position = 0)]
     [ValidateSet("build", "build-all", "run", "test", "cover", "vet", "fmt", "fmt-check",
