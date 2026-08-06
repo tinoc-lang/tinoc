@@ -18,7 +18,7 @@ import (
 //  2. `extern "C" fn printf(fmt *const char, ...) i32;` — hand-declared
 //     C functions, no header parsing involved.
 //
-// These tests generate real C99, compile it with the host C compiler,
+// These tests generate real C11, compile it with the host C compiler,
 // run the resulting binary, and assert on actual stdout / exit codes,
 // proving the whole pipeline (lex -> parse -> sema -> codegen -> C
 // compiler -> execution) for real libc calls.

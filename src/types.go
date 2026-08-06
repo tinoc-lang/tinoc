@@ -86,7 +86,7 @@ func (t *Type) String() string {
 	return t.Name
 }
 
-// CType returns the C99 type spelling to emit for this Type, per the
+// CType returns the C11 type spelling to emit for this Type, per the
 // mapping table in syntax.md (Tinoc Type -> C Equivalent), using the
 // aliases tinoc.h defines (u8, i32, f64, str, ...) rather than the raw
 // stdint.h names, since generated code includes tinoc.h.

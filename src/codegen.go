@@ -9,7 +9,7 @@ import (
 
 // === Codegen ===
 //
-// Codegen turns a Sema-checked *Program into C99 source text. It only
+// Codegen turns a Sema-checked *Program into C11 source text. It only
 // emits code for the constructs this pass supports end-to-end: var,
 // const, static var, static const, and fn (including their bodies:
 // return, if/else, while, for (range and collection forms), break,
@@ -1194,7 +1194,7 @@ func (g *Codegen) genCArg(a Expression) string {
 	return g.genExpr(a)
 }
 
-// genStructLiteral renders `Point { .x = 1.0, .y = 2.0 }` as a C99
+// genStructLiteral renders `Point { .x = 1.0, .y = 2.0 }` as a C11
 // compound literal `(Point){ .x = 1.0, .y = 2.0 }`. Sema guarantees every
 // field is present and typed, so the designated initializers are emitted
 // in source order as-is.

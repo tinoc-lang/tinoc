@@ -6,7 +6,7 @@
 
 <p align="center">
   <strong>This Is Not C</strong><br>
-  A modern systems programming language that transpiles to C99.
+  A modern systems programming language that transpiles to C11.
 </p>
 
 <p align="center">
@@ -23,7 +23,10 @@
 ## Table of Contents
 
 - [About](#about)
+- [Language Support](#language-support)
 - [Example Program](#example-program)
+- [Changelog](#changelog)
+- [Release Checklist](#release-checklist)
 - [Important Links](#important-links)
 - [Contributing](#contributing)
 - [License](#license)
@@ -40,7 +43,31 @@ Tinoc is a short form of **T**his **I**s **No**t **C**, commonly known as **T**i
 
 **NOTE:** Tinoc respects C and its usage. Tinoc is built on the philosophy that programming should be **Meaningful**, **Accurate**, **Robust**, **Maximum Performance**, and **Simple**.
 
-**Tinoc** transpiles to C99 for maximum system support.
+**Tinoc** transpiles to C11 for maximum system support — C11 unlocks features like `_Generic` dispatch in the `tinoc.h` runtime (saturating arithmetic) and gives the compiler room to grow (optionals, error unions, typed enums) without fighting the target language.
+
+---
+
+## Language Support
+
+What the compiler supports end-to-end in the current release:
+
+| Feature | Status | Notes |
+| --- | --- | --- |
+| `var` / `const` (incl. `static`) | ✅ | Explicit or inferred types; const-mutability enforced |
+| `fn` functions | ✅ | Forward calls, argument/return type checking, missing-return checks |
+| `struct` + methods | ✅ | Fields, struct literals (`Point { .x = 1.0 }`), instance methods (`self ^Point`), static methods, by-value copy/params/returns |
+| Pointers | ✅ | `^T`, `&x`, `x^` deref, pointers to structs, `self^.x` → `self->x` |
+| Control flow | ✅ | `if` / `else if` / `else`, `while`, `for 0..10 |i|`, `break`, `continue` |
+| Literals & operators | ✅ | Integer (all bases, `_` separators), float, string, char, bool; arithmetic/comparison/logical/bitwise |
+| C interop | ✅ | `#importc "header.h" as alias;` (clang/gcc parsing) and `extern "C" fn` declarations |
+| Generic functions / structs | ❌ | `fn foo:T(...)`, `struct Pair:T` — rejected with a clear "not yet supported" diagnostic |
+| `enum` / `union` | ❌ | Planned after structs |
+| `switch` | ❌ | Planned |
+| Arrays / slices | ❌ | `[N]T`, `[]T`, `for coll |x|` — planned |
+| Optionals / error unions | ❌ | `?T`, `!T`, `orelse`, `catch` — planned |
+| Standard library (`std.io`, ...) | ❌ | Module system is next after the type system |
+
+See [`CHANGELOG.md`](CHANGELOG.md) for what landed in each version and [`CHECKLIST.md`](CHECKLIST.md) for the release process.
 
 ---
 
