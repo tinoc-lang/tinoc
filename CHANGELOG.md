@@ -20,6 +20,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   installer smoke test in `--local` mode.
 - The release workflow now attaches a `SHA256SUMS` manifest to every release,
   so installers can verify downloads.
+- **`.gitattributes`**: Go and shell sources are pinned to LF line endings on
+  checkout everywhere, so `gofmt -l` no longer false-fails on Windows CI
+  (where git used to check out CRLF).
+
+### Fixed
+
+- **Installers**: `--local` no longer prompts to "update" when the built
+  version equals the installed version — the fresh source build is installed
+  directly. Re-running the installer with the latest version already
+  installed now exits before downloading anything.
+- **Installers**: `--force`/`--yes` now actually reinstalls over an
+  identical installed version instead of reporting "already installed".
+- **CLI**: color output is only emitted when stdout is a real terminal, so
+  piped commands like `tinoc version | awk ...` return plain text (this was
+  breaking the installer's version parsing on systems with TERM set).
+- **Version reporting**: `build.sh` / `build.ps1` now inject the version into
+  `src.Version` via `-ldflags` (the old `-X main.version` target never
+  existed, so release binaries always reported the hardcoded `0.1.0`).
+- **Installers**: installed-version comparisons normalize a leading `v`, so a
+  `VERSION` file written as `v0.1.0` (e.g. by an earlier installer) is
+  correctly treated as equal to `0.1.0` instead of triggering a spurious
+  "update available" prompt.
+- **Installers**: `--verbose` now prints the download/fetch commands it runs.
+- **Installers**: confirmation prompts now decline gracefully when there is no
+  interactive terminal (CI, piped input, cron) instead of aborting the whole
+  install with an error — the binary still installs and manual PATH
+  instructions are printed.
 
 ## [0.1.0] - 2026-08-05
 

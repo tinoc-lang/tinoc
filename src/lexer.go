@@ -54,6 +54,12 @@ func supportsColor() bool {
 	if os.Getenv("NO_COLOR") != "" {
 		return false
 	}
+	// Only emit ANSI codes when stdout is a real terminal. Piped or
+	// redirected output (e.g. `tinoc version | awk ...` inside the
+	// installer) must stay plain so parsers never trip over escapes.
+	if fi, err := os.Stdout.Stat(); err != nil || fi.Mode()&os.ModeCharDevice == 0 {
+		return false
+	}
 	if term := os.Getenv("TERM"); term == "" || term == "dumb" {
 		return false
 	}

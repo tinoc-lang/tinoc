@@ -68,7 +68,12 @@ function Get-TargetArch {
 function Get-BinaryName($os) { if ($os -eq "windows") { return "$BinaryBase.exe" }; return $BinaryBase }
 
 function Get-LdFlags($mode) {
-    $flags = "-X main.version=$Version -X main.commit=$Commit -X main.buildDate=$BuildDate"
+    # Inject into src.Version (what `tinoc version` prints; the installers
+    # record it in VERSION). Strip a leading "v" so the binary reports
+    # "0.1.0". (The old -X main.version target never existed, so binaries
+    # always reported the hardcoded 0.1.0.)
+    $ver = $Version.TrimStart("v", "V")
+    $flags = "-X github.com/tinoc-lang/tinoc/src.Version=$ver"
     if ($mode -eq "release") { $flags = "-s -w $flags" }
     return $flags
 }

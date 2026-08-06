@@ -67,7 +67,12 @@ binary_name() {
 }
 
 ldflags() {
-    local flags="-X main.version=${VERSION} -X main.commit=${COMMIT} -X main.buildDate=${BUILD_DATE}"
+    # Inject the version into src.Version — the value `tinoc version` prints
+    # and the installers record in the VERSION file. Strip a leading "v" from
+    # git describe tags so the binary reports "0.1.0". (The old -X main.version
+    # target never existed, so binaries always reported the hardcoded 0.1.0.)
+    local ver="${VERSION#v}"
+    local flags="-X github.com/tinoc-lang/tinoc/src.Version=${ver}"
     if [ "$1" = "release" ]; then flags="-s -w ${flags}"; fi
     echo "$flags"
 }

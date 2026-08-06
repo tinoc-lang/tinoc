@@ -33,6 +33,7 @@ $script:DownloadBase = if ($env:TINOC_DOWNLOAD_BASE) { $env:TINOC_DOWNLOAD_BASE 
 $script:TinocHome = if ($Dir) { $Dir } elseif ($env:TINOC_HOME) { $env:TINOC_HOME } else { Join-Path $HOME ".tinoc" }
 $script:SpecVersion = $Version
 $script:Force = $Force -or $Yes
+$script:Verbose = [bool]$Verbose
 
 $UseColor = -not $env:NO_COLOR
 
@@ -71,11 +72,12 @@ function Format-Version($v) { return $v.TrimStart("v", "V") }
 
 function Get-InstalledVersion {
     $file = Join-Path $script:TinocHome "VERSION"
-    if (Test-Path $file) { return (Get-Content $file -Raw).Trim() }
+    if (Test-Path $file) { return (Format-Version ((Get-Content $file -Raw).Trim())) }
     return ""
 }
 
 function Invoke-DownloadFile($url, $dest) {
+    if ($script:Verbose) { Write-Step "Downloading $url" }
     try {
         Invoke-WebRequest -UseBasicParsing -Uri $url -OutFile $dest
         return $true
@@ -106,9 +108,12 @@ function Get-Sha256($path) {
     return (Get-FileHash -Algorithm SHA256 -Path $path).Hash.ToLower()
 }
 
-# Confirmation prompt; -Force/-Yes skips it.
+# Confirmation prompt; -Force/-Yes skips it. When stdin is redirected
+# (CI, piped input) the prompt is declined automatically - Read-Host
+# cannot read from a pipe and would abort under $ErrorActionPreference.
 function Confirm-Tinoc($msg) {
     if ($script:Force) { return $true }
+    if ([Console]::IsInputRedirected) { return $false }
     $yn = Read-Host "$msg [y/N]"
     return ($yn -match '^(y|yes)$')
 }
@@ -135,24 +140,30 @@ function Update-PathMaybe {
 
 # Shared install step: move $src to $TinocHome\bin\tinoc.exe, write VERSION,
 # then verify it runs and offer PATH setup. $cleanupDir (optional) is removed
-# on the early-exit paths (already installed / aborted).
-function Install-TinocBinary($src, $version, $cleanupDir) {
+# on the early-exit paths (already installed / aborted). Pass $true as
+# $localMode for -Local builds: the fresh binary is always installed (no
+# version comparison, no prompt).
+function Install-TinocBinary($src, $version, $cleanupDir, $localMode = $false) {
     $binDir = Join-Path $script:TinocHome "bin"
     New-Item -ItemType Directory -Force -Path $binDir | Out-Null
 
     $prev = Get-InstalledVersion
-    if ($prev) {
+    if (-not $localMode -and $prev) {
         if ($prev -eq $version) {
-            if ($cleanupDir) { Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $cleanupDir }
-            Write-Ok "tinoc v$version is already installed ($binDir\tinoc.exe)"
-            Write-Info "Nothing to do - run './install.ps1 -Force' to reinstall"
-            exit 0
-        }
-        Write-Warn "New version available: v$version (installed v$prev)"
-        if (-not (Confirm-Tinoc "Update tinoc from v$prev to v$version?")) {
-            if ($cleanupDir) { Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $cleanupDir }
-            Write-Info "Aborted - keeping v$prev"
-            exit 0
+            if (-not $script:Force) {
+                if ($cleanupDir) { Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $cleanupDir }
+                Write-Ok "tinoc v$version is already installed ($binDir\tinoc.exe)"
+                Write-Info "Nothing to do - run './install.ps1 -Force' to reinstall"
+                exit 0
+            }
+            Write-Step "Reinstalling tinoc v$version"
+        } else {
+            Write-Warn "New version available: v$version (installed v$prev)"
+            if (-not (Confirm-Tinoc "Update tinoc from v$prev to v$version?")) {
+                if ($cleanupDir) { Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $cleanupDir }
+                Write-Info "Aborted - keeping v$prev"
+                exit 0
+            }
         }
     }
 
@@ -204,6 +215,14 @@ function Invoke-Remote {
 
     $asset = Get-AssetName $os $arch
     $base = "$($script:DownloadBase.TrimEnd('/'))/$($script:TinocRepo)/releases/download/$tag"
+
+    # If the requested version is already installed, skip the download.
+    $prev = Get-InstalledVersion
+    if (-not $script:Force -and $prev -and ($prev -eq $version)) {
+        Write-Ok "tinoc v$version is already installed ($(Join-Path $script:TinocHome 'bin\tinoc.exe'))"
+        Write-Info "Nothing to do - run './install.ps1 -Force' to reinstall"
+        exit 0
+    }
 
     Write-Info "Fetching tinoc v$version from GitHub"
     Write-Kv "Version" "v$version"
@@ -291,9 +310,16 @@ function Invoke-Local {
         exit 1
     }
 
-    $version = ((& $bin version 2>$null) -split " ")[2]
+    # NO_COLOR guards against ANSI escapes in `tinoc version` output; the
+    # compiler also only colors real terminals, but this is belt-and-braces.
+    $env:NO_COLOR = "1"
+    try {
+        $version = Format-Version ((& $bin version 2>$null) -split " ")[2]
+    } finally {
+        Remove-Item Env:NO_COLOR -ErrorAction SilentlyContinue
+    }
     if (-not $version) { $version = "dev" }
-    Install-TinocBinary $bin $version
+    Install-TinocBinary $bin $version $null $true
 }
 
 function Invoke-Check {

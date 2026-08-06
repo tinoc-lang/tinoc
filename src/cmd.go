@@ -10,9 +10,14 @@ import (
 )
 
 const (
-	Version      = "0.1.0"
 	CompilerName = "tinoc"
 )
+
+// Version is the compiler version. build.sh / build.ps1 override it at link
+// time via -ldflags "-X github.com/tinoc-lang/tinoc/src.Version=<tag>" so
+// release binaries report the actual tag; the in-tree default keeps plain
+// `go build` / `go run` behaving sensibly.
+var Version = "0.1.0"
 
 // Color constants and supportsColor are defined in lexer.go and shared
 // across this package.

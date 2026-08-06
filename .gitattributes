@@ -1,0 +1,11 @@
+# Normalize line endings: text files are stored as LF. Go and shell sources
+# are forced to LF on checkout everywhere, so `gofmt -l` and shebang
+# execution behave identically on Linux, macOS, and Windows CI runners.
+* text=auto
+
+*.go  text eol=lf
+*.sh  text eol=lf
+*.ps1 text eol=lf
+*.md  text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
