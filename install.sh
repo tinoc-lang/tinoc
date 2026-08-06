@@ -129,15 +129,17 @@ sha256_of() { # file
 }
 
 # Ask the user to confirm; --yes/--force skips the prompt (Starship pattern:
-# read from /dev/tty so piping the script to bash still prompts correctly).
+# read from /dev/tty so `curl ... | bash` installs still prompt correctly).
+# The brace-group + 2>/dev/null silences bash's own "/dev/tty: No such
+# device" noise when there is no controlling terminal (CI, piped stdin,
+# cron); the prompt is then declined quietly instead of aborting the install.
 confirm() {
     if [ "$FORCE" = "1" ]; then return 0; fi
     printf "${C_BOLD}?${C_RESET} %s ${C_BOLD}[y/N]${C_RESET} " "$1"
     local yn
-    if ! read -r yn < /dev/tty; then
+    if ! { read -r yn < /dev/tty; } 2>/dev/null; then
         echo
-        error "Cannot read confirmation (re-run with --yes)"
-        exit 1
+        return 1
     fi
     case "$yn" in
         y|Y|yes|YES) return 0 ;;

@@ -108,9 +108,12 @@ function Get-Sha256($path) {
     return (Get-FileHash -Algorithm SHA256 -Path $path).Hash.ToLower()
 }
 
-# Confirmation prompt; -Force/-Yes skips it.
+# Confirmation prompt; -Force/-Yes skips it. When stdin is redirected
+# (CI, piped input) the prompt is declined automatically - Read-Host
+# cannot read from a pipe and would abort under $ErrorActionPreference.
 function Confirm-Tinoc($msg) {
     if ($script:Force) { return $true }
+    if ([Console]::IsInputRedirected) { return $false }
     $yn = Read-Host "$msg [y/N]"
     return ($yn -match '^(y|yes)$')
 }

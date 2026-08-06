@@ -43,6 +43,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   correctly treated as equal to `0.1.0` instead of triggering a spurious
   "update available" prompt.
 - **Installers**: `--verbose` now prints the download/fetch commands it runs.
+- **Installers**: confirmation prompts now decline gracefully when there is no
+  interactive terminal (CI, piped input, cron) instead of aborting the whole
+  install with an error — the binary still installs and manual PATH
+  instructions are printed.
 
 ## [0.1.0] - 2026-08-05
 
