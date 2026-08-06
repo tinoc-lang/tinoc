@@ -186,26 +186,32 @@ usage() {
 
 # Shared install step: put $1 (the binary) at $BIN_DIR/tinoc, write VERSION,
 # then verify it runs and offer PATH setup. $3 (optional) is a temp dir to
-# clean up on the early-exit paths (already installed / aborted).
-install_binary() { # src_binary version [cleanup_dir]
-    local src="$1" version="$2" exe
+# clean up on the early-exit paths (already installed / aborted). Pass
+# "local" as $4 for --local builds: the fresh binary is always installed
+# (no version comparison, no prompt).
+install_binary() { # src_binary version [cleanup_dir] [local]
+    local src="$1" version="$2" exe mode="${4:-remote}"
     exe="$(binary_name "$(detect_os)")"
     mkdir -p "$TINOC_HOME" "$TINOC_HOME/bin"
 
     local prev
     prev="$(installed_version)"
-    if [ -n "$prev" ]; then
+    if [ "$mode" != "local" ] && [ -n "$prev" ]; then
         if [ "$prev" = "$version" ]; then
-            rm -rf "${3:-}"
-            ok "tinoc v${version} is already installed (${TINOC_HOME}/bin/${exe})"
-            info "Nothing to do — run './install.sh --force' to reinstall"
-            exit 0
-        fi
-        warn "New version available: v${version} (installed v${prev})"
-        if ! confirm "Update tinoc from v${prev} to v${version}?"; then
-            rm -rf "${3:-}"
-            info "Aborted — keeping v${prev}"
-            exit 0
+            if [ "$FORCE" != "1" ]; then
+                rm -rf "${3:-}"
+                ok "tinoc v${version} is already installed (${TINOC_HOME}/bin/${exe})"
+                info "Nothing to do — run './install.sh --force' to reinstall"
+                exit 0
+            fi
+            step "Reinstalling tinoc v${version}"
+        else
+            warn "New version available: v${version} (installed v${prev})"
+            if ! confirm "Update tinoc from v${prev} to v${version}?"; then
+                rm -rf "${3:-}"
+                info "Aborted — keeping v${prev}"
+                exit 0
+            fi
         fi
     fi
 
@@ -308,6 +314,15 @@ cmd_remote() {
     asset="$(asset_name "$os" "$arch")"
     base="${TINOC_DOWNLOAD_BASE%/}/${TINOC_REPO}/releases/download/${tag}"
 
+    # If the requested version is already installed, skip the download.
+    local prev
+    prev="$(installed_version)"
+    if [ "$FORCE" != "1" ] && [ -n "$prev" ] && [ "$prev" = "$version" ]; then
+        ok "tinoc v${version} is already installed (${TINOC_HOME}/bin/$(binary_name "$os"))"
+        info "Nothing to do — run './install.sh --force' to reinstall"
+        exit 0
+    fi
+
     info "Fetching tinoc v${version} from GitHub"
     kv "Version" "v${version}"
     kv "Platform" "${os}/${arch}"
@@ -390,9 +405,11 @@ cmd_local() {
         exit 1
     fi
 
-    version="$("$bin" version 2>/dev/null | awk '{print $3}')"
+    # NO_COLOR guards against ANSI escapes in `tinoc version` output even on
+    # exotic TERM settings; supportsColor() also only colors real terminals.
+    version="$(NO_COLOR=1 "$bin" version 2>/dev/null | awk '{print $3}')"
     [ -z "$version" ] && version="dev"
-    install_binary "$bin" "$version"
+    install_binary "$bin" "$version" "" local
 }
 
 cmd_check() {

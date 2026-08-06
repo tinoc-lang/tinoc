@@ -135,24 +135,30 @@ function Update-PathMaybe {
 
 # Shared install step: move $src to $TinocHome\bin\tinoc.exe, write VERSION,
 # then verify it runs and offer PATH setup. $cleanupDir (optional) is removed
-# on the early-exit paths (already installed / aborted).
-function Install-TinocBinary($src, $version, $cleanupDir) {
+# on the early-exit paths (already installed / aborted). Pass $true as
+# $localMode for -Local builds: the fresh binary is always installed (no
+# version comparison, no prompt).
+function Install-TinocBinary($src, $version, $cleanupDir, $localMode = $false) {
     $binDir = Join-Path $script:TinocHome "bin"
     New-Item -ItemType Directory -Force -Path $binDir | Out-Null
 
     $prev = Get-InstalledVersion
-    if ($prev) {
+    if (-not $localMode -and $prev) {
         if ($prev -eq $version) {
-            if ($cleanupDir) { Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $cleanupDir }
-            Write-Ok "tinoc v$version is already installed ($binDir\tinoc.exe)"
-            Write-Info "Nothing to do - run './install.ps1 -Force' to reinstall"
-            exit 0
-        }
-        Write-Warn "New version available: v$version (installed v$prev)"
-        if (-not (Confirm-Tinoc "Update tinoc from v$prev to v$version?")) {
-            if ($cleanupDir) { Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $cleanupDir }
-            Write-Info "Aborted - keeping v$prev"
-            exit 0
+            if (-not $script:Force) {
+                if ($cleanupDir) { Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $cleanupDir }
+                Write-Ok "tinoc v$version is already installed ($binDir\tinoc.exe)"
+                Write-Info "Nothing to do - run './install.ps1 -Force' to reinstall"
+                exit 0
+            }
+            Write-Step "Reinstalling tinoc v$version"
+        } else {
+            Write-Warn "New version available: v$version (installed v$prev)"
+            if (-not (Confirm-Tinoc "Update tinoc from v$prev to v$version?")) {
+                if ($cleanupDir) { Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $cleanupDir }
+                Write-Info "Aborted - keeping v$prev"
+                exit 0
+            }
         }
     }
 
@@ -204,6 +210,14 @@ function Invoke-Remote {
 
     $asset = Get-AssetName $os $arch
     $base = "$($script:DownloadBase.TrimEnd('/'))/$($script:TinocRepo)/releases/download/$tag"
+
+    # If the requested version is already installed, skip the download.
+    $prev = Get-InstalledVersion
+    if (-not $script:Force -and $prev -and ($prev -eq $version)) {
+        Write-Ok "tinoc v$version is already installed ($(Join-Path $script:TinocHome 'bin\tinoc.exe'))"
+        Write-Info "Nothing to do - run './install.ps1 -Force' to reinstall"
+        exit 0
+    }
 
     Write-Info "Fetching tinoc v$version from GitHub"
     Write-Kv "Version" "v$version"
@@ -291,9 +305,16 @@ function Invoke-Local {
         exit 1
     }
 
-    $version = ((& $bin version 2>$null) -split " ")[2]
+    # NO_COLOR guards against ANSI escapes in `tinoc version` output; the
+    # compiler also only colors real terminals, but this is belt-and-braces.
+    $env:NO_COLOR = "1"
+    try {
+        $version = ((& $bin version 2>$null) -split " ")[2]
+    } finally {
+        Remove-Item Env:NO_COLOR -ErrorAction SilentlyContinue
+    }
     if (-not $version) { $version = "dev" }
-    Install-TinocBinary $bin $version
+    Install-TinocBinary $bin $version $null $true
 }
 
 function Invoke-Check {
