@@ -8,7 +8,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
-- (nothing yet)
+
+- **Installers**: `install.sh` / `install.ps1` fetch the latest GitHub release,
+  verify it against the release `SHA256SUMS` manifest, and extract it into
+  `~/.tinoc/` — with `VERSION` tracking, update checks that ask before
+  upgrading, `--local` source builds, `--check`, `--uninstall`, and
+  `--version` / `--force` / `--dir` flags.
+- **CI workflow** (`.github/workflows/ci.yml`) runs on every push and pull
+  request: deps, fmt-check, vet, lint, race tests, and a release build
+  (`build.sh ci` / `build.ps1 ci`) across ubuntu/macos/windows, plus an
+  installer smoke test in `--local` mode.
+- The release workflow now attaches a `SHA256SUMS` manifest to every release,
+  so installers can verify downloads.
 
 ## [0.1.0] - 2026-08-05
 
