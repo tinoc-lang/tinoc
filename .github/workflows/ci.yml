@@ -1,0 +1,54 @@
+name: CI
+
+# Runs on every push and pull request. Mirrors what the release workflow
+# trusts: the full `build.sh ci` / `build.ps1 ci` pipeline (deps, fmt-check,
+# vet, lint, race tests, release build) on every supported OS, followed by a
+# smoke test of the native installer in --local mode.
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Run CI pipeline (build.sh ci)
+        if: runner.os != 'Windows'
+        run: ./build.sh ci
+
+      - name: Run CI pipeline (build.ps1 ci)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./build.ps1 ci
+
+      - name: Smoke-test the native installer (--local)
+        shell: bash
+        run: |
+          set -euo pipefail
+          dir="$RUNNER_TEMP/tinoc-smoke"
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            pwsh -NoProfile -Command "./install.ps1 -Local -Yes -Dir '$dir'"
+          else
+            ./install.sh --local --yes --dir "$dir"
+          fi
+          bin="$dir/bin"
+          if [ -f "$bin/tinoc.exe" ]; then "$bin/tinoc.exe" version; else "$bin/tinoc" version; fi
+          echo "VERSION file: $(cat "$dir/VERSION")"
+          echo "Installer smoke test passed"

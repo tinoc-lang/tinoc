@@ -47,6 +47,37 @@ Tinoc is a short form of **T**his **I**s **No**t **C**, commonly known as **T**i
 
 ---
 
+## Installation
+
+Install the **latest release** binary into `~/.tinoc` — no root needed:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/tinoc-lang/tinoc/main/install.sh | bash
+```
+
+PowerShell:
+
+```powershell
+irm https://raw.githubusercontent.com/tinoc-lang/tinoc/main/install.ps1 | iex
+```
+
+The installers (`install.sh` / `install.ps1`) are companions to
+[`build.sh`](build.sh) / [`build.ps1`](build.ps1):
+
+- Fetch the **latest release** from GitHub, verify it against the release
+  `SHA256SUMS` manifest, and extract it into `~/.tinoc/` (or `$TINOC_HOME`).
+- Write a `VERSION` file next to the install. Re-running the installer checks
+  for updates and **asks before upgrading**.
+- `--local` builds from source with `./build.sh build` (or `./build.ps1 build`)
+  and installs the local binary instead of downloading.
+- Offer to add `~/.tinoc/bin` to your `PATH` after installing.
+
+Common flags: `--check` (compare installed vs latest), `--uninstall`,
+`--version 0.1.0` (specific release), `--force`/`--yes` (skip prompts),
+`--dir <path>` (override install dir). Run `install.sh --help` for the full list.
+
+---
+
 ## Language Support
 
 What the compiler supports end-to-end in the current release:

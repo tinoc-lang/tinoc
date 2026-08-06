@@ -5,7 +5,8 @@ name: Release
 # Triggers ONLY on tag pushes (e.g. `git tag v0.1.0 && git push origin v0.1.0`),
 # never on branch pushes. Cross-compiles the compiler for every supported
 # platform via build.sh build-all, packages each binary as .tar.gz (unix) or
-# .zip (windows), and creates a GitHub Release with all archives attached.
+# .zip (windows), attaches a SHA256SUMS manifest, and creates a GitHub
+# Release with all archives attached (verified by install.sh / install.ps1).
 
 on:
   push:
@@ -39,6 +40,14 @@ jobs:
             tar -czf "tinoc-${t}.tar.gz" "tinoc-${t}"
           done
           zip tinoc-windows-amd64.zip tinoc-windows-amd64.exe
+
+      - name: Generate SHA256 checksums
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum tinoc-* > SHA256SUMS
+          echo "Checksums written:"
+          cat SHA256SUMS
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2

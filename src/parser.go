@@ -673,7 +673,6 @@ func (p *Parser) parseStructField() *StructField {
 	return field
 }
 
-
 func (p *Parser) parseFunctionStatement(isStatic bool) Statement {
 	stmt := &FunctionStatement{Token: p.curToken, IsStatic: isStatic}
 

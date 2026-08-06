@@ -31,7 +31,8 @@ should be verified — before, during, and after shipping a Tinoc release.
       on the tag push **only** — never on branch pushes.
 - [ ] Workflow cross-compiles all targets (linux/darwin/windows ×
       amd64/arm64), packages each binary as `.tar.gz` (unix) or `.zip`
-      (windows), and creates the GitHub Release.
+      (windows), attaches a `SHA256SUMS` manifest, and creates the GitHub
+      Release.
 - [ ] Verify the Release on GitHub: five archives attached, correct version
       tag, and (if enabled) auto-generated release notes.
 
