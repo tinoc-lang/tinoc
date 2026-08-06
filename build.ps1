@@ -59,11 +59,27 @@ function Write-Warn ($msg) { if ($UseColor) { Write-Host "WARN " -NoNewline -For
 function Write-ErrLine ($msg) { if ($UseColor) { Write-Host "FAIL " -NoNewline -ForegroundColor Red } else { Write-Host -NoNewline "FAIL " }; Write-Host $msg }
 function Write-Kv   ($k, $v) { if ($UseColor) { Write-Host ("  {0,-10}" -f $k) -NoNewline -ForegroundColor DarkGray } else { Write-Host -NoNewline ("  {0,-10}" -f $k) }; Write-Host $v }
 
-function Get-TargetOS   { if ($env:GOOS)   { return $env:GOOS }; return "windows" }
+function Get-TargetOS {
+    if ($env:GOOS) { return $env:GOOS }
+    if ($IsLinux)  { return "linux" }
+    if ($IsMacOS)  { return "darwin" }
+    return "windows"
+}
 function Get-TargetArch {
     if ($env:GOARCH) { return $env:GOARCH }
-    if ([Environment]::Is64BitOperatingSystem) { return "amd64" }
-    return "386"
+    # Windows: PROCESSOR_ARCHITECTURE reflects the machine (AMD64/ARM64/ARM).
+    if ($env:PROCESSOR_ARCHITECTURE) {
+        if ($env:PROCESSOR_ARCHITECTURE -eq "ARM64") { return "arm64" }
+        if ($env:PROCESSOR_ARCHITECTURE -eq "ARM")   { return "arm" }
+        return "amd64"
+    }
+    # Unix (PowerShell 7+): ask the runtime directly.
+    switch ([System.Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture.ToString()) {
+        "Arm64" { return "arm64" }
+        "Arm"   { return "arm" }
+        "X86"   { return "386" }
+        default { return "amd64" }
+    }
 }
 function Get-BinaryName($os) { if ($os -eq "windows") { return "$BinaryBase.exe" }; return $BinaryBase }
 
