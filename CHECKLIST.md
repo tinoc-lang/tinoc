@@ -17,7 +17,9 @@ should be verified — before, during, and after shipping a Tinoc release.
 
 ### 2. Release prep
 
-- [ ] `src/cmd.go` `Version` const reflects the release version (`0.1.0`).
+- [ ] `src/cmd.go` `Version` default matches the release version (`0.1.0`);
+      release binaries get it overridden from the tag by `build.sh`'s
+      ldflags, so `./build/tinoc version` reports the actual release.
 - [ ] `CHANGELOG.md` has an entry for the version (move `[Unreleased]`
       items into a dated `[x.y.z]` section and reset `[Unreleased]`).
 - [ ] `README.md` language-support table is accurate for the release.

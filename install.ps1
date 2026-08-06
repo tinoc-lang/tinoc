@@ -33,6 +33,7 @@ $script:DownloadBase = if ($env:TINOC_DOWNLOAD_BASE) { $env:TINOC_DOWNLOAD_BASE 
 $script:TinocHome = if ($Dir) { $Dir } elseif ($env:TINOC_HOME) { $env:TINOC_HOME } else { Join-Path $HOME ".tinoc" }
 $script:SpecVersion = $Version
 $script:Force = $Force -or $Yes
+$script:Verbose = [bool]$Verbose
 
 $UseColor = -not $env:NO_COLOR
 
@@ -71,11 +72,12 @@ function Format-Version($v) { return $v.TrimStart("v", "V") }
 
 function Get-InstalledVersion {
     $file = Join-Path $script:TinocHome "VERSION"
-    if (Test-Path $file) { return (Get-Content $file -Raw).Trim() }
+    if (Test-Path $file) { return (Format-Version ((Get-Content $file -Raw).Trim())) }
     return ""
 }
 
 function Invoke-DownloadFile($url, $dest) {
+    if ($script:Verbose) { Write-Step "Downloading $url" }
     try {
         Invoke-WebRequest -UseBasicParsing -Uri $url -OutFile $dest
         return $true
@@ -309,7 +311,7 @@ function Invoke-Local {
     # compiler also only colors real terminals, but this is belt-and-braces.
     $env:NO_COLOR = "1"
     try {
-        $version = ((& $bin version 2>$null) -split " ")[2]
+        $version = Format-Version ((& $bin version 2>$null) -split " ")[2]
     } finally {
         Remove-Item Env:NO_COLOR -ErrorAction SilentlyContinue
     }

@@ -35,6 +35,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **CLI**: color output is only emitted when stdout is a real terminal, so
   piped commands like `tinoc version | awk ...` return plain text (this was
   breaking the installer's version parsing on systems with TERM set).
+- **Version reporting**: `build.sh` / `build.ps1` now inject the version into
+  `src.Version` via `-ldflags` (the old `-X main.version` target never
+  existed, so release binaries always reported the hardcoded `0.1.0`).
+- **Installers**: installed-version comparisons normalize a leading `v`, so a
+  `VERSION` file written as `v0.1.0` (e.g. by an earlier installer) is
+  correctly treated as equal to `0.1.0` instead of triggering a spurious
+  "update available" prompt.
+- **Installers**: `--verbose` now prints the download/fetch commands it runs.
 
 ## [0.1.0] - 2026-08-05
 

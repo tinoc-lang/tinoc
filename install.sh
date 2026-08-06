@@ -67,7 +67,9 @@ has() { command -v "$1" >/dev/null 2>&1; }
 norm_version() { printf '%s\n' "$1" | sed 's/^[vV]//'; }
 
 installed_version() {
-    [ -f "$TINOC_HOME/VERSION" ] && cat "$TINOC_HOME/VERSION" || echo ""
+    # Normalized to a bare x.y.z so comparisons stay correct even if an
+    # earlier installer recorded "v0.1.0" (or a "V" prefix).
+    [ -f "$TINOC_HOME/VERSION" ] && norm_version "$(cat "$TINOC_HOME/VERSION")" || echo ""
 }
 
 binary_name() { if [ "$1" = "windows" ]; then echo "tinoc.exe"; else echo "tinoc"; fi; }
@@ -93,6 +95,7 @@ supported_target() {
 
 download_file() { # url dest
     local url="$1" dest="$2"
+    if [ "$VERBOSE" = "1" ]; then step "curl/wget ${url}"; fi
     if has curl; then
         curl --fail --silent --show-error --location --output "$dest" "$url"
     elif has wget; then
@@ -104,6 +107,7 @@ download_file() { # url dest
 }
 
 fetch_stdout() { # url
+    if [ "$VERBOSE" = "1" ]; then step "curl/wget ${1}"; fi
     if has curl; then
         curl --fail --silent --show-error --location "$1"
     elif has wget; then
@@ -407,7 +411,9 @@ cmd_local() {
 
     # NO_COLOR guards against ANSI escapes in `tinoc version` output even on
     # exotic TERM settings; supportsColor() also only colors real terminals.
+    # Normalize a possible "v" prefix so VERSION always records bare x.y.z.
     version="$(NO_COLOR=1 "$bin" version 2>/dev/null | awk '{print $3}')"
+    version="$(norm_version "$version")"
     [ -z "$version" ] && version="dev"
     install_binary "$bin" "$version" "" local
 }
