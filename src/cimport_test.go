@@ -163,25 +163,90 @@ fn main() void {
 }
 
 func TestCImport_ExternVars(t *testing.T) {
-	// Extern globals (stdin/stdout/stderr) come from clang's JSON AST;
-	// gcc's -aux-info fallback cannot recover variables, so this test
-	// only runs when the clang path is active.
+	// Extern globals come from clang's JSON AST; gcc's -aux-info fallback
+	// cannot recover variables, so this test only runs when the clang path
+	// is active. A project-owned header is used instead of a libc one:
+	// stdin/stdout/stderr are real extern declarations on glibc but macros
+	// on macOS (the externs are __stdinp/__stdoutp/__stderrp), and other
+	// libc externs (e.g. optind) are hidden by feature-test macros under
+	// the strict -std=c11 used at compile time — so no libc symbol is
+	// portable. The header declares the extern; a companion C file
+	// compiled into the same binary provides its definition.
 	d, err := findHeaderDumper()
 	if err != nil || d.Kind != "clang" {
 		t.Skip("extern var import requires the clang AST path")
 	}
-	out, code := compileAndRun(t, `
-#importc "stdio.h" as cio;
+	cc := requireCC(t)
+	dir := t.TempDir()
+
+	header := `// extern vars for the tinoc extern-var import test
+extern int tinoc_counter;
+`
+	defs := `// definitions backing the externs declared in externs.h
+int tinoc_counter = 21;
+`
+	tnc := `#importc "externs.h" as ext;
+
+extern "C" fn exit(status i32) void;
 
 fn main() void {
-	cio.fprintf(cio.stdout, "hi\n");
+	exit(ext.tinoc_counter * 2);
 }
-`)
-	if code != 0 {
-		t.Fatalf("expected exit 0, got %d", code)
+`
+
+	if err := os.WriteFile(filepath.Join(dir, "externs.h"), []byte(header), 0o644); err != nil {
+		t.Fatalf("write header: %v", err)
 	}
-	if out != "hi\n" {
-		t.Fatalf("expected %q, got %q", "hi\n", out)
+	if err := os.WriteFile(filepath.Join(dir, "externs_def.c"), []byte(defs), 0o644); err != nil {
+		t.Fatalf("write definitions: %v", err)
+	}
+	tncPath := filepath.Join(dir, "main.tnc")
+	if err := os.WriteFile(tncPath, []byte(tnc), 0o644); err != nil {
+		t.Fatalf("write tnc: %v", err)
+	}
+
+	code, diags := GenerateC(tncPath, tnc)
+	if diags.HasErrors() {
+		for _, d := range diags.All() {
+			t.Errorf("diagnostic: %s", d.String())
+		}
+		t.FailNow()
+	}
+
+	cFile := filepath.Join(dir, "test.c")
+	if err := os.WriteFile(cFile, []byte(code), 0o644); err != nil {
+		t.Fatalf("write C file: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "tinoc.h"), []byte(RuntimeHeader), 0o644); err != nil {
+		t.Fatalf("write tinoc.h: %v", err)
+	}
+
+	binPath := filepath.Join(dir, "test.bin")
+	// BuildArgs compiles a single input; splice the extern definitions
+	// file in alongside the generated C so the extern links.
+	args := cc.BuildArgs("", binPath, []string{dir})
+	args = args[:len(args)-2] // drop the empty input and -lm
+	args = append(args, cFile, filepath.Join(dir, "externs_def.c"), "-lm")
+
+	buildCmd := exec.Command(cc.Path, args...)
+	var buildOut strings.Builder
+	buildCmd.Stdout = &buildOut
+	buildCmd.Stderr = &buildOut
+	if err := buildCmd.Run(); err != nil {
+		t.Fatalf("C compilation failed with %s: %v\n--- generated C ---\n%s\n--- compiler output ---\n%s", cc.Name, err, code, buildOut.String())
+	}
+
+	runCmd := exec.Command(binPath)
+	exitCode := 0
+	if err := runCmd.Run(); err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			exitCode = exitErr.ExitCode()
+		} else {
+			t.Fatalf("cannot run compiled binary: %v", err)
+		}
+	}
+	if exitCode != 42 {
+		t.Fatalf("expected exit 42 (extern var imported and read), got %d", exitCode)
 	}
 }
 
@@ -240,12 +305,14 @@ fn main() void {
 }
 
 func TestCImport_WrongArgType(t *testing.T) {
+	// cio.stdout is a macro on macOS (the extern is __stdoutp), so it is
+	// not portable; the wrong-arg-type check works with fprintf instead.
 	checkHasError(t, `
 #importc "stdio.h" as cio;
 
 fn main() void {
 	var n i32 = 5;
-	cio.fputs(n, cio.stdout);
+	cio.fprintf(n, "x");
 }
 `, "argument 1")
 }
