@@ -566,3 +566,143 @@ fn main() void {
 		t.Fatalf("expected exit 42 (struct passed by value to/from functions), got %d", code)
 	}
 }
+
+// === Enums ===
+
+func TestCodegen_EnumFieldlessSwitch(t *testing.T) {
+	_, code := runMainWithExit(t, `
+enum Direction {
+	North, East, South, West,
+}
+
+fn deg(d Direction) i32 {
+	switch d {
+		Direction.North => { return 0; }
+		Direction.East => { return 90; }
+		Direction.South => { return 180; }
+		Direction.West => { return 270; }
+	}
+}
+
+fn main() void {
+	tinoc_exit(deg(Direction.West) / 3);
+}
+`)
+	if code != 90 {
+		t.Fatalf("expected exit 90 (enum switch on fieldless variants), got %d", code)
+	}
+}
+
+func TestCodegen_EnumEquality(t *testing.T) {
+	_, code := runMainWithExit(t, `
+enum Color { Red, Green, Blue }
+
+fn main() void {
+	var c Color = Color.Green;
+	if c == Color.Green {
+		tinoc_exit(7);
+	} else {
+		tinoc_exit(1);
+	}
+}
+`)
+	if code != 7 {
+		t.Fatalf("expected exit 7 (enum equality), got %d", code)
+	}
+}
+
+func TestCodegen_EnumTaggedUnionPatternMatch(t *testing.T) {
+	_, code := runMainWithExit(t, `
+enum Shape {
+	Circle(f32),
+	Rect(f32, f32),
+	Point,
+}
+
+fn area(s Shape) f32 {
+	switch s {
+		Shape.Rect(w, h) => { return w * h; }
+		Shape.Circle(r) => { return 3.0 * r; }
+		Shape.Point => { return 0.0; }
+	}
+}
+
+fn main() void {
+	var r Shape = Shape.Rect(6.0, 7.0);
+	var a = area(r);
+	if a > 41.0 and a < 43.0 {
+		tinoc_exit(42);
+	} else {
+		tinoc_exit(1);
+	}
+}
+`)
+	if code != 42 {
+		t.Fatalf("expected exit 42 (tagged-union pattern match, 6*7), got %d", code)
+	}
+}
+
+func TestCodegen_EnumMethod(t *testing.T) {
+	_, code := runMainWithExit(t, `
+enum Shape {
+	Circle(f32),
+	Point,
+
+	fn isRound(self ^Shape) bool {
+		switch self^ {
+			Shape.Circle(r) => { return r > 0.0; }
+			Shape.Point => { return false; }
+		}
+	}
+}
+
+fn main() void {
+	var c Shape = Shape.Circle(5.0);
+	if c.isRound() {
+		tinoc_exit(9);
+	} else {
+		tinoc_exit(1);
+	}
+}
+`)
+	if code != 9 {
+		t.Fatalf("expected exit 9 (enum instance method via pattern match), got %d", code)
+	}
+}
+
+func TestCodegen_EnumStaticMethod(t *testing.T) {
+	_, code := runMainWithExit(t, `
+enum Color {
+	Red, Green, Blue,
+
+	static fn count() i32 {
+		return 3;
+	}
+}
+
+fn main() void {
+	tinoc_exit(Color.count());
+}
+`)
+	if code != 3 {
+		t.Fatalf("expected exit 3 (enum static method), got %d", code)
+	}
+}
+
+func TestCodegen_StrEquality(t *testing.T) {
+	_, code := runMainWithExit(t, `
+fn main() void {
+	var a str = "hello";
+	var b str = "hello";
+	var c str = "world";
+	if a == b and a != c and a == "hello" {
+		tinoc_exit(11);
+	} else {
+		tinoc_exit(1);
+	}
+}
+`)
+	if code != 11 {
+		t.Fatalf("expected exit 11 (content-based str equality), got %d", code)
+	}
+}

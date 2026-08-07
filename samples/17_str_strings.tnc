@@ -1,0 +1,28 @@
+// str strings: content-based equality (== and !=), and the operators
+// that are NOT defined on str (ordering, arithmetic) are rejected at
+// compile time instead of generating broken C.
+
+extern "C" fn printf(fmt *const char, ...) i32;
+
+fn main() void {
+	var greeting str = "hello";
+	var same str = "hello";
+	var other str = "world";
+
+	// str == / != compare by content, not by struct identity.
+	if greeting == same {
+		printf("same content\n");
+	}
+	if greeting != other {
+		printf("different content\n");
+	}
+
+	// String literals compare directly against str values.
+	if greeting == "hello" {
+		printf("literal matches\n");
+	}
+
+	// str flows through functions and C calls unchanged.
+	var combined str = greeting;
+	printf("value = %s\n", combined);
+}

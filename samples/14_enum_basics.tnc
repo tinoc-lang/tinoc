@@ -1,0 +1,45 @@
+// Enums: fieldless variants, equality, and exhaustive switches.
+// An enum switch over every variant needs no `_` default arm — like
+// Zig, listing all variants is exhaustive.
+
+enum Direction {
+	North, East, South, West,
+}
+
+extern "C" fn printf(fmt *const char, ...) i32;
+
+fn arrow(d Direction) str {
+	switch d {
+		Direction.North => { return "^"; }
+		Direction.East  => { return ">"; }
+		Direction.South => { return "v"; }
+		Direction.West  => { return "<"; }
+	}
+}
+
+fn main() void {
+	var facing Direction = Direction.East;
+
+	if facing == Direction.East {
+		printf("facing east\n");
+	}
+
+	// Enums print as their C int tag; compare before printing.
+	printf("arrow = %s\n", arrow(facing));
+
+	var turns i32 = 0;
+	var d Direction = Direction.North;
+	while turns < 4 {
+		printf("step %d: %s\n", turns, arrow(d));
+		if d == Direction.North {
+			d = Direction.East;
+		} else if d == Direction.East {
+			d = Direction.South;
+		} else if d == Direction.South {
+			d = Direction.West;
+		} else {
+			d = Direction.North;
+		}
+		turns += 1;
+	}
+}

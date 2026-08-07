@@ -122,11 +122,13 @@ type Sema struct {
 	// structTypes holds every declared struct's resolved *Type by name
 	// (interned once at registration, so type equality is by identity or
 	// name); structMethods holds each struct's method table by method
-	// name. Both are populated before any function/struct body is
-	// checked, so calls and self-references resolve regardless of
-	// textual order.
+	// name. enumTypes / enumMethods do the same for enums. All four are
+	// populated before any function/struct/enum body is checked, so
+	// calls and self-references resolve regardless of textual order.
 	structTypes   map[string]*Type
 	structMethods map[string]map[string]*Symbol
+	enumTypes     map[string]*Type
+	enumMethods   map[string]map[string]*Symbol
 
 	// currentFn tracks the function being checked, for `return` type
 	// checking. nil at top level.
@@ -171,6 +173,8 @@ func NewSema(diags *Diagnostics) *Sema {
 		cTypes:         make(map[string]*Type),
 		structTypes:    make(map[string]*Type),
 		structMethods:  make(map[string]map[string]*Symbol),
+		enumTypes:      make(map[string]*Type),
+		enumMethods:    make(map[string]map[string]*Symbol),
 		cStrArgs:       make(map[Expression]bool),
 	}
 }
@@ -202,21 +206,25 @@ func (s *Sema) Check(prog *Program) {
 		}
 	}
 
-	// Pass 1: register every struct's type name first, so fields can
-	// reference their own struct via pointers (struct Node { next ^Node; })
-	// and methods' `self ^Node` parameters resolve during signature
-	// registration.
+	// Pass 1: register every struct's and enum's type name first, so
+	// fields and payloads can reference their own type via pointers
+	// (struct Node { next ^Node; }) and methods' `self ^Node` parameters
+	// resolve during signature registration.
 	for _, stmt := range prog.Statements {
 		if st, ok := stmt.(*StructStatement); ok {
 			s.registerStructName(st)
+		} else if es, ok := stmt.(*EnumStatement); ok {
+			s.registerEnumName(es)
 		}
 	}
 
-	// Pass 2: resolve struct fields and register method signatures, now
-	// that every struct name is visible.
+	// Pass 2: resolve struct fields/enum variants and register method
+	// signatures, now that every struct/enum name is visible.
 	for _, stmt := range prog.Statements {
 		if st, ok := stmt.(*StructStatement); ok {
 			s.resolveStruct(st)
+		} else if es, ok := stmt.(*EnumStatement); ok {
+			s.resolveEnum(es)
 		}
 	}
 
@@ -447,11 +455,101 @@ func (s *Sema) resolveStruct(st *StructStatement) {
 	}
 }
 
+// === Enums ===
+
+// registerEnumName creates the interned KindEnum *Type for an enum
+// declaration (no variants yet) so later passes can resolve the name from
+// anywhere -- including struct fields referencing the enum and the enum's
+// own methods' `self ^Name` parameters.
+func (s *Sema) registerEnumName(es *EnumStatement) {
+	if es.Name == nil {
+		return
+	}
+	name := es.Name.Value
+	line, col := es.Token.Line, es.Token.Column
+
+	if _, dup := s.enumTypes[name]; dup {
+		s.errorAt(line, col, "%s redeclared in this block", name)
+		return
+	}
+
+	t := &Type{Kind: KindEnum, Name: name, EnumVariantIdx: make(map[string]int)}
+	s.enumTypes[name] = t
+	s.enumMethods[name] = make(map[string]*Symbol)
+}
+
+// resolveEnum resolves an enum's variants (and their payload types) and
+// registers its method signatures. Runs after every struct/enum name is
+// registered, so payloads and self params can reference any struct or
+// enum.
+func (s *Sema) resolveEnum(es *EnumStatement) {
+	if es.Name == nil {
+		return
+	}
+	t := s.enumTypes[es.Name.Value]
+	if t == nil {
+		return // duplicate/error already reported during name registration
+	}
+
+	seen := make(map[string]bool)
+	for _, v := range es.Variants {
+		if v == nil || v.Name == nil {
+			continue
+		}
+		name := v.Name.Value
+		if seen[name] {
+			s.errorAt(v.Name.Token.Line, v.Name.Token.Column, "duplicate variant %s in enum %s", name, es.Name.Value)
+			continue
+		}
+		seen[name] = true
+
+		info := &EnumVariantInfo{Name: name}
+		for _, te := range v.Types {
+			if te == nil {
+				continue
+			}
+			pt := s.resolveTypeExpr(te)
+			if pt == nil {
+				s.errorAt(v.Name.Token.Line, v.Name.Token.Column, "variant %s.%s has an unsupported or unknown payload type", es.Name.Value, name)
+				pt = &Type{Kind: KindInvalid}
+			}
+			info.Types = append(info.Types, pt)
+		}
+		if len(info.Types) > 0 {
+			t.HasPayload = true
+		}
+
+		t.EnumVariants = append(t.EnumVariants, info)
+		t.EnumVariantIdx[name] = len(t.EnumVariants) - 1
+	}
+
+	for _, m := range es.Methods {
+		s.registerEnumMethod(es.Name.Value, m)
+	}
+}
+
 // registerStructMethod registers one method (instance or static) of a
 // struct into that struct's method table. Instance methods must declare a
 // `self` first parameter typed `^Name` or `Name`; static methods take
 // ordinary parameters only.
 func (s *Sema) registerStructMethod(structName string, fn *FunctionStatement) {
+	s.registerTypeMethod(structName, s.structMethods, fn, KindStruct)
+}
+
+// registerEnumMethod registers one method (instance or static) of an enum
+// into that enum's method table, with the same self-parameter rules as
+// struct methods.
+func (s *Sema) registerEnumMethod(enumName string, fn *FunctionStatement) {
+	s.registerTypeMethod(enumName, s.enumMethods, fn, KindEnum)
+}
+
+// registerTypeMethod is the shared method-registration core for structs
+// and enums: it type-checks and records one method's signature into the
+// given per-type method table. Instance methods must declare a `self`
+// first parameter typed `^Name` or `Name` (where Name is the struct or
+// enum being defined, per selfKind); static methods take ordinary
+// parameters only.
+func (s *Sema) registerTypeMethod(typeName string, methods map[string]map[string]*Symbol, fn *FunctionStatement, selfKind TypeKind) {
 	if fn == nil || fn.Name == nil {
 		return
 	}
@@ -459,15 +557,15 @@ func (s *Sema) registerStructMethod(structName string, fn *FunctionStatement) {
 	line, col := fn.Token.Line, fn.Token.Column
 
 	if len(fn.GenericParams) > 0 {
-		s.errorAt(line, col, "generic methods are not yet supported (%s.%s)", structName, name)
+		s.errorAt(line, col, "generic methods are not yet supported (%s.%s)", typeName, name)
 		return
 	}
 	if fn.Variadic {
-		s.errorAt(line, col, "defining variadic Tinoc methods is not yet supported (%s.%s)", structName, name)
+		s.errorAt(line, col, "defining variadic Tinoc methods is not yet supported (%s.%s)", typeName, name)
 		return
 	}
-	if _, dup := s.structMethods[structName][name]; dup {
-		s.errorAt(line, col, "%s.%s redeclared", structName, name)
+	if _, dup := methods[typeName][name]; dup {
+		s.errorAt(line, col, "%s.%s redeclared", typeName, name)
 		return
 	}
 
@@ -498,14 +596,14 @@ func (s *Sema) registerStructMethod(structName string, fn *FunctionStatement) {
 
 	if !fn.IsStatic {
 		if len(sym.Params) == 0 {
-			s.errorAt(line, col, "instance method %s.%s needs a self parameter (self ^%s or self %s)", structName, name, structName, structName)
+			s.errorAt(line, col, "instance method %s.%s needs a self parameter (self ^%s or self %s)", typeName, name, typeName, typeName)
 		} else {
 			selfType := sym.Params[0]
 			valid := selfType != nil &&
-				((selfType.Kind == KindPointer && selfType.Elem != nil && selfType.Elem.Kind == KindStruct && selfType.Elem.Name == structName) ||
-					(selfType.Kind == KindStruct && selfType.Name == structName))
+				((selfType.Kind == KindPointer && selfType.Elem != nil && selfType.Elem.Kind == selfKind && selfType.Elem.Name == typeName) ||
+					(selfType.Kind == selfKind && selfType.Name == typeName))
 			if !valid {
-				s.errorAt(line, col, "self parameter of %s.%s must be ^%s or %s, got %s", structName, name, structName, structName, typeStringOrInvalid(selfType))
+				s.errorAt(line, col, "self parameter of %s.%s must be ^%s or %s, got %s", typeName, name, typeName, typeName, typeStringOrInvalid(selfType))
 			}
 		}
 	}
@@ -516,7 +614,7 @@ func (s *Sema) registerStructMethod(structName string, fn *FunctionStatement) {
 		sym.ReturnType = typeVoid
 	}
 
-	s.structMethods[structName][name] = sym
+	methods[typeName][name] = sym
 }
 
 func typeStringOrInvalid(t *Type) string {
@@ -552,15 +650,19 @@ func (s *Sema) checkStatement(stmt Statement) {
 		s.checkForStatement(st)
 	case *StructStatement:
 		s.checkStructStatement(st)
+	case *EnumStatement:
+		s.checkEnumStatement(st)
+	case *SwitchStatement:
+		s.checkSwitchStatement(st)
 	case *BreakStatement, *ContinueStatement, *ImportStatement, *ImportCStatement, *ExternCFuncStatement:
 		// Nothing to resolve for this pass (imports/extern decls were
 		// processed in Check's passes 0-3).
 	case nil:
 		// Stray/skipped statement (e.g. parser recovered from an error).
 	default:
-		// Enum/union/switch/etc bodies aren't checked by this pass yet;
-		// intentionally silent so partial programs using them don't spam
-		// unrelated diagnostics for constructs Sema doesn't cover.
+		// Union bodies aren't checked by this pass yet; intentionally
+		// silent so partial programs using them don't spam unrelated
+		// diagnostics for constructs Sema doesn't cover.
 	}
 }
 
@@ -728,6 +830,185 @@ func (s *Sema) checkStructStatement(st *StructStatement) {
 	}
 }
 
+// checkEnumStatement checks an enum declaration's method bodies (its
+// variants and signatures were resolved during registration).
+func (s *Sema) checkEnumStatement(es *EnumStatement) {
+	if es.Name == nil {
+		return
+	}
+	for _, m := range es.Methods {
+		if m == nil || m.Name == nil {
+			continue
+		}
+		sym := s.enumMethods[es.Name.Value][m.Name.Value]
+		if sym == nil {
+			continue
+		}
+		s.checkFunctionBody(es.Name.Value+"."+m.Name.Value, sym, m.Params, m.Body, m.Token, true)
+	}
+}
+
+// checkSwitchStatement checks a switch statement: every arm value must be
+// compatible with the switch expression's type (enum variants for enum
+// switches, integer/char literals for integer switches), and each arm's
+// body is checked in its own scope.
+func (s *Sema) checkSwitchStatement(sw *SwitchStatement) {
+	var valueType *Type
+	if sw.Value != nil {
+		valueType = s.checkExpression(sw.Value)
+	}
+
+	// Only enums and integer/char values can be switched on (matching
+	// C's switch semantics and syntax.md). str, floats, bools, structs
+	// and pointers are rejected here with a proper diagnostic rather
+	// than emitted as C that fails to compile (e.g. `switch (a)` where a
+	// is a str struct is not an integer expression in C).
+	if valueType != nil && valueType.Kind != KindUnknown && valueType.Kind != KindInvalid {
+		switch valueType.Kind {
+		case KindEnum, KindInt, KindChar:
+			// supported
+		default:
+			s.errorAt(sw.Token.Line, sw.Token.Column, "cannot switch on value of type %s (switch supports enums, integers, and chars)", valueType.String())
+		}
+	}
+
+	prev := s.current
+	s.current = newScope(prev)
+	for _, arm := range sw.Arms {
+		if arm == nil {
+			continue
+		}
+		// Enum pattern-binding arms: `Shape.Rect(w, h) => { ... }`.
+		// The arm value parses as a constructor call, but in switch
+		// position its arguments are *binding names* that receive the
+		// variant's payload, not expressions. Bind them in the arm's
+		// scope and validate the variant before checking the body.
+		if s.checkSwitchPattern(arm, valueType) {
+			if arm.Body != nil {
+				for _, st := range arm.Body.Statements {
+					s.checkStatement(st)
+				}
+			}
+			continue
+		}
+		if arm.Value != nil {
+			armType := s.checkExpression(arm.Value)
+			if valueType != nil && armType != nil && valueType.Kind != KindUnknown && valueType.Kind != KindInvalid {
+				switch valueType.Kind {
+				case KindEnum:
+					// Enum switches match on variant references of the same
+					// enum; anything else (another enum, an integer literal)
+					// can never equal a value of this enum.
+					if armType.Kind != KindEnum || armType.Name != valueType.Name {
+						s.errorAt(sw.Token.Line, sw.Token.Column, "mismatched types in switch: cannot match %s against %s", armType.String(), valueType.String())
+					}
+				case KindInt, KindChar:
+					// Untyped integer/char literals adapt to the switch
+					// expression's type, e.g. `switch x { 1 => ... }` with
+					// x: i64 -- the literal is retyped like any comparison.
+					if isUntypedLiteral(arm.Value) && armType.isNumeric() {
+						s.resolvedTypes[arm.Value] = valueType
+					} else if armType.Kind != KindInt && armType.Kind != KindChar {
+						s.errorAt(sw.Token.Line, sw.Token.Column, "mismatched types in switch: cannot match %s against %s", armType.String(), valueType.String())
+					}
+				}
+			}
+		}
+		if arm.Body != nil {
+			for _, st := range arm.Body.Statements {
+				s.checkStatement(st)
+			}
+		}
+	}
+	s.current = prev
+}
+
+// checkSwitchPattern handles enum pattern-binding switch arms:
+// `Shape.Rect(w, h) => { ... }`. The arm value parses as a constructor
+// call, but in switch position its arguments are binding names that
+// receive the variant's payload, not expressions. Returns true when the
+// arm is such a pattern arm (bindings registered in the arm's scope and
+// the variant validated); false for ordinary value arms.
+func (s *Sema) checkSwitchPattern(arm *SwitchArm, valueType *Type) bool {
+	ce, ok := arm.Value.(*CallExpression)
+	if !ok {
+		return false
+	}
+	fa, ok := ce.Function.(*FieldAccessExpression)
+	if !ok || fa.Left == nil || fa.Field == nil {
+		return false
+	}
+	id, isID := fa.Left.(*Identifier)
+	if !isID {
+		return false
+	}
+	et, ok := s.enumTypes[id.Value]
+	if !ok {
+		return false
+	}
+	idx, isVariant := et.EnumVariantIdx[fa.Field.Value]
+	if !isVariant {
+		return false
+	}
+	info := et.EnumVariants[idx]
+
+	// The switch value must be the same enum type; patterns for a
+	// different enum can never match (checked here rather than in the
+	// generic arm check, which would misreport the binding names as
+	// undefined).
+	if valueType != nil && valueType.Kind != KindUnknown && valueType.Kind != KindInvalid {
+		if valueType.Kind != KindEnum || valueType.Name != et.Name {
+			s.errorAt(ce.Token.Line, ce.Token.Column, "mismatched types in switch: cannot match %s against %s", et.Name, valueType.String())
+			return true
+		}
+	}
+
+	// Validate the binding count against the variant's payload and bind
+	// each name in the arm's scope with its payload type.
+	if len(ce.Arguments) != len(info.Types) {
+		s.errorAt(ce.Token.Line, ce.Token.Column, "pattern %s.%s expects %d binding(s), got %d", et.Name, fa.Field.Value, len(info.Types), len(ce.Arguments))
+	}
+	n := len(info.Types)
+	if len(ce.Arguments) < n {
+		n = len(ce.Arguments)
+	}
+	for i := 0; i < n; i++ {
+		arg, isIdent := ce.Arguments[i].(*Identifier)
+		if !isIdent {
+			s.errorAt(ce.Token.Line, ce.Token.Column, "pattern binding in %s.%s must be a name, not an expression", et.Name, fa.Field.Value)
+			continue
+		}
+		// `_` is a wildcard binding: it consumes the payload slot but
+		// introduces no name, so it is not registered in the scope.
+		if arg.Value == "_" {
+			continue
+		}
+		if info.Types[i] != nil {
+			s.current.Define(&Symbol{Name: arg.Value, Type: info.Types[i], Mutable: true})
+		}
+	}
+	// Record the arm value's type as the enum so codegen can emit the
+	// case label and payload bindings.
+	s.resolvedTypes[arm.Value] = et
+	return true
+}
+
+// switchArmVariant extracts the variant name from a switch arm value
+// when it names an enum variant, whether as a plain reference
+// (`Shape.Point`) or a pattern arm (`Shape.Rect(w, h)`). Returns "" for
+// anything else (literals, defaults handled separately).
+func switchArmVariant(v Expression) string {
+	if fa, ok := v.(*FieldAccessExpression); ok && fa.Field != nil {
+		return fa.Field.Value
+	}
+	if ce, ok := v.(*CallExpression); ok {
+		if fa, ok2 := ce.Function.(*FieldAccessExpression); ok2 && fa.Field != nil {
+			return fa.Field.Value
+		}
+	}
+	return ""
+}
+
 // checkFunctionBody is the shared body-checking core for top-level
 // functions and struct methods: it establishes the function scope
 // (parameters bound, currentFn set), checks every body statement, and
@@ -754,7 +1035,7 @@ func (s *Sema) checkFunctionBody(label string, sym *Symbol, params []*Parameter,
 		for _, st := range body.Statements {
 			s.checkStatement(st)
 		}
-		if sym.ReturnType != nil && sym.ReturnType.Kind != KindVoid && !blockAlwaysReturns(body) {
+		if sym.ReturnType != nil && sym.ReturnType.Kind != KindVoid && !s.blockAlwaysReturns(body) {
 			if isMethod {
 				s.errorAt(tok.Line, tok.Column, "missing return at end of method %s", label)
 			} else {
@@ -774,25 +1055,64 @@ func (s *Sema) checkFunctionBody(label string, sym *Symbol, params []*Parameter,
 // (including loops, since Tinoc has no exhaustiveness signal on them) is
 // treated as "may not return", matching Go's own conservative
 // terminating-statement analysis in spirit.
-func blockAlwaysReturns(b *BlockStatement) bool {
+func (s *Sema) blockAlwaysReturns(b *BlockStatement) bool {
 	if b == nil || len(b.Statements) == 0 {
 		return false
 	}
 	last := b.Statements[len(b.Statements)-1]
-	return stmtAlwaysReturns(last)
+	return s.stmtAlwaysReturns(last)
 }
 
-func stmtAlwaysReturns(stmt Statement) bool {
+func (s *Sema) stmtAlwaysReturns(stmt Statement) bool {
 	switch st := stmt.(type) {
 	case *ReturnStatement:
 		return true
 	case *BlockStatement:
-		return blockAlwaysReturns(st)
+		return s.blockAlwaysReturns(st)
 	case *IfStatement:
 		if st.Alternative == nil {
 			return false // no else -> falls through when condition is false
 		}
-		return blockAlwaysReturns(st.Consequence) && stmtAlwaysReturns(st.Alternative)
+		return s.blockAlwaysReturns(st.Consequence) && s.stmtAlwaysReturns(st.Alternative)
+	case *SwitchStatement:
+		// A switch always returns when every arm returns AND either there
+		// is a `_` default arm or the switch exhaustively matches every
+		// variant of an enum (the Zig-style pattern, where listing all
+		// variants makes the default redundant). Integer switches always
+		// need an explicit default since exhaustiveness is unprovable.
+		hasDefault := false
+		matched := make(map[string]bool)
+		valueType := s.resolvedTypes[st.Value]
+		for _, arm := range st.Arms {
+			if arm == nil {
+				continue
+			}
+			if arm.Value == nil {
+				hasDefault = true
+			} else if valueType != nil && valueType.Kind == KindEnum {
+				// Both `Shape.Point` (plain variant ref) and
+				// `Shape.Rect(w, h)` (pattern arm) count as matching
+				// the variant they name.
+				if v := switchArmVariant(arm.Value); v != "" {
+					matched[v] = true
+				}
+			}
+			if !s.blockAlwaysReturns(arm.Body) {
+				return false
+			}
+		}
+		if hasDefault {
+			return true
+		}
+		if valueType != nil && valueType.Kind == KindEnum {
+			for _, v := range valueType.EnumVariants {
+				if v != nil && !matched[v.Name] {
+					return false
+				}
+			}
+			return true
+		}
+		return false
 	default:
 		return false
 	}
@@ -1041,6 +1361,20 @@ func (s *Sema) checkFieldAccess(fa *FieldAccessExpression) *Type {
 			s.errorAt(fa.Token.Line, fa.Token.Column, "type %s has no static member %s", st.Name, fa.Field.Value)
 			return &Type{Kind: KindInvalid}
 		}
+		// 2b. Enum member reference: `Direction.North` (a variant constant)
+		// or `Direction.make` (a static method). Variants resolve to the
+		// enum type itself; static methods to their return type (call
+		// sites check the full signature).
+		if et, ok := s.enumTypes[id.Value]; ok {
+			if _, isVariant := et.EnumVariantIdx[fa.Field.Value]; isVariant {
+				return et
+			}
+			if m, ok := s.enumMethods[et.Name][fa.Field.Value]; ok {
+				return m.ReturnType
+			}
+			s.errorAt(fa.Token.Line, fa.Token.Column, "enum %s has no variant or method %s", et.Name, fa.Field.Value)
+			return &Type{Kind: KindInvalid}
+		}
 	}
 
 	// 3. Field/method access on a struct-typed value: `p.x`, `self^.x`,
@@ -1055,6 +1389,14 @@ func (s *Sema) checkFieldAccess(fa *FieldAccessExpression) *Type {
 				return m.ReturnType // bare method reference; call sites check the full signature
 			}
 			s.errorAt(fa.Token.Line, fa.Token.Column, "type %s has no field or method %s", recvType.Name, fa.Field.Value)
+			return &Type{Kind: KindInvalid}
+		}
+		// Enum-typed values only expose their methods: `s.kindName()`.
+		if recvType != nil && recvType.Kind == KindEnum {
+			if m, ok := s.enumMethods[recvType.Name][fa.Field.Value]; ok {
+				return m.ReturnType
+			}
+			s.errorAt(fa.Token.Line, fa.Token.Column, "enum %s has no method %s", recvType.Name, fa.Field.Value)
 			return &Type{Kind: KindInvalid}
 		}
 	}
@@ -1139,6 +1481,99 @@ func (s *Sema) checkStructLiteral(sl *StructLiteral) *Type {
 	}
 
 	return st
+}
+
+// checkEnumConstructor type-checks an enum variant construction call,
+// `Shape.Circle(5.0)`: the argument list must match the variant's payload
+// types exactly. Fieldless variants are also callable with zero
+// arguments (`Shape.Point()`), matching how the enum section of syntax.md
+// constructs values uniformly.
+func (s *Sema) checkEnumConstructor(ce *CallExpression, et *Type, variant string) *Type {
+	idx, ok := et.EnumVariantIdx[variant]
+	if !ok {
+		s.errorAt(ce.Token.Line, ce.Token.Column, "enum %s has no variant %s", et.Name, variant)
+		for _, a := range ce.Arguments {
+			s.checkExpression(a)
+		}
+		return &Type{Kind: KindInvalid}
+	}
+	info := et.EnumVariants[idx]
+
+	if len(info.Types) == 0 {
+		if len(ce.Arguments) > 0 {
+			s.errorAt(ce.Token.Line, ce.Token.Column, "not enough arguments in call to %s.%s\n\thave (%d args)\n\twant (0 args)", et.Name, variant, len(ce.Arguments))
+		}
+		for _, a := range ce.Arguments {
+			s.checkExpression(a)
+		}
+		return et
+	}
+
+	if len(ce.Arguments) != len(info.Types) {
+		s.errorAt(ce.Token.Line, ce.Token.Column, "not enough arguments in call to %s.%s\n\thave (%d args)\n\twant (%d args)", et.Name, variant, len(ce.Arguments), len(info.Types))
+	}
+
+	n := len(ce.Arguments)
+	if len(info.Types) < n {
+		n = len(info.Types)
+	}
+	for i := 0; i < n; i++ {
+		argType := s.checkExpression(ce.Arguments[i])
+		want := info.Types[i]
+		if want == nil || argType == nil {
+			continue
+		}
+		if isUntypedLiteral(ce.Arguments[i]) && argType.isNumeric() && want.isNumeric() {
+			s.resolvedTypes[ce.Arguments[i]] = want
+			continue
+		}
+		if want.Kind == KindUnknown || want.Kind == KindInvalid || argType.Kind == KindUnknown || argType.Kind == KindInvalid {
+			continue
+		}
+		if !assignable(want, argType) {
+			s.errorAt(ce.Token.Line, ce.Token.Column, "%s", describeMismatch(fmt.Sprintf("argument %d to %s.%s", i+1, et.Name, variant), argType, want))
+		}
+	}
+	// Extra arguments beyond the payload count (already-flagged mismatches)
+	// still get checked so their inner expressions resolve.
+	for i := n; i < len(ce.Arguments); i++ {
+		s.checkExpression(ce.Arguments[i])
+	}
+
+	return et
+}
+
+// checkEnumMethodCall type-checks `s.method(args)` (isStatic=false,
+// receiver is a value/pointer of enum type) and `Type.method(args)`
+// (isStatic=true, receiver is the type name), mirroring
+// checkStructMethodCall for structs.
+func (s *Sema) checkEnumMethodCall(ce *CallExpression, et *Type, method string, isStatic bool) *Type {
+	methods := s.enumMethods[et.Name]
+	m, ok := methods[method]
+	if !ok {
+		s.errorAt(ce.Token.Line, ce.Token.Column, "enum %s has no %smethod %s", et.Name, map[bool]string{true: "static ", false: ""}[isStatic], method)
+		return &Type{Kind: KindInvalid}
+	}
+	if m.IsStatic != isStatic {
+		if isStatic {
+			s.errorAt(ce.Token.Line, ce.Token.Column, "method %s.%s is not static; call it on a value of type %s", et.Name, method, et.Name)
+		} else {
+			s.errorAt(ce.Token.Line, ce.Token.Column, "static method %s.%s must be called on the type name %s, not on a value", et.Name, method, et.Name)
+		}
+		return m.ReturnType
+	}
+
+	if len(ce.GenericArgs) > 0 {
+		s.errorAt(ce.Token.Line, ce.Token.Column, "generic method calls are not yet supported (%s.%s)", et.Name, method)
+	}
+
+	offset := 0
+	if !isStatic {
+		offset = 1 // skip the implicit self parameter
+	}
+	s.checkCallArgs(ce, m, et.Name+"."+method, offset)
+
+	return m.ReturnType
 }
 
 // checkStructMethodCall type-checks `p.method(args)` (isStatic=false,
@@ -1334,10 +1769,28 @@ func (s *Sema) checkInfixExpression(ie *InfixExpression) *Type {
 			s.errorAt(ie.Token.Line, ie.Token.Column, "invalid operation: cannot compare values of type %s with %s", typeStringOrInvalid(lt), typeStringOrInvalid(rt))
 			return typeBool
 		}
+		// str supports content equality (==/!= via the tinoc_str_eq
+		// runtime helper) but has no ordering: `<`, `>`, `<=`, `>=` on a
+		// str would emit C comparing structs with a binary operator,
+		// which does not compile. Reject them as a proper diagnostic
+		// rather than letting the C compiler fail downstream.
+		if ie.Operator != "==" && ie.Operator != "!=" {
+			if (lt != nil && lt.Kind == KindStr) || (rt != nil && rt.Kind == KindStr) {
+				s.errorAt(ie.Token.Line, ie.Token.Column, "invalid operation: operator %s not defined on str (str supports only == and !=)", ie.Operator)
+				return typeBool
+			}
+		}
 		return typeBool
 
 	default: // arithmetic / bitwise
 		if (lt != nil && lt.Kind == KindStruct) || (rt != nil && rt.Kind == KindStruct) {
+			s.errorAt(ie.Token.Line, ie.Token.Column, "invalid operation: operator %s not defined on %s (type %s)", ie.Operator, ie.Left.String(), typeStringOrInvalid(lt))
+			return &Type{Kind: KindInvalid}
+		}
+		// str has no arithmetic/bitwise operators. Rejecting here (rather
+		// than silently emitting C that fails to compile, e.g. `"a" + "b"`)
+		// keeps the error a proper semantic diagnostic.
+		if (lt != nil && lt.Kind == KindStr) || (rt != nil && rt.Kind == KindStr) {
 			s.errorAt(ie.Token.Line, ie.Token.Column, "invalid operation: operator %s not defined on %s (type %s)", ie.Operator, ie.Left.String(), typeStringOrInvalid(lt))
 			return &Type{Kind: KindInvalid}
 		}
@@ -1438,22 +1891,35 @@ func (s *Sema) checkCallExpression(ce *CallExpression) *Type {
 				return &Type{Kind: KindInvalid}
 			}
 		} else if fa.Left != nil && fa.Field != nil {
-			// Static method call: `Point.create(...)` — the receiver is the
-			// bare type name, which resolves against the struct registry
-			// (never as a value, so checkExpression is skipped for it).
+			// Static method call / enum constructor: the receiver is the
+			// bare type name, which resolves against the struct/enum
+			// registries (never as a value, so checkExpression is skipped
+			// for it). Enum variant references (`Shape.Circle(5.0)`) are
+			// constructor calls; anything else on an enum type name is a
+			// static method call.
 			if id, isID := fa.Left.(*Identifier); isID {
 				if st, ok := s.structTypes[id.Value]; ok {
 					return s.checkStructMethodCall(ce, st, fa.Field.Value, true)
 				}
+				if et, ok := s.enumTypes[id.Value]; ok {
+					if _, isVariant := et.EnumVariantIdx[fa.Field.Value]; isVariant {
+						return s.checkEnumConstructor(ce, et, fa.Field.Value)
+					}
+					return s.checkEnumMethodCall(ce, et, fa.Field.Value, true)
+				}
 			}
 			// Instance method call: `p.translate(...)` on a struct-typed
-			// (or pointer-to-struct) receiver.
+			// (or pointer-to-struct/enum) receiver.
 			recvType := s.checkExpression(fa.Left)
 			switch {
 			case recvType != nil && recvType.Kind == KindStruct:
 				return s.checkStructMethodCall(ce, recvType, fa.Field.Value, false)
 			case recvType != nil && recvType.Kind == KindPointer && recvType.Elem != nil && recvType.Elem.Kind == KindStruct:
 				return s.checkStructMethodCall(ce, recvType.Elem, fa.Field.Value, false)
+			case recvType != nil && recvType.Kind == KindEnum:
+				return s.checkEnumMethodCall(ce, recvType, fa.Field.Value, false)
+			case recvType != nil && recvType.Kind == KindPointer && recvType.Elem != nil && recvType.Elem.Kind == KindEnum:
+				return s.checkEnumMethodCall(ce, recvType.Elem, fa.Field.Value, false)
 			default:
 				for _, a := range ce.Arguments {
 					s.checkExpression(a)

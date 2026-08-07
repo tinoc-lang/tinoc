@@ -41,6 +41,15 @@ type Codegen struct {
 	// value-less return from an int function.
 	inMain bool
 
+	// curRetC is the C return type of the function currently being
+	// generated, and curRetNeedsValue whether that type is non-void. An
+	// exhaustive enum switch (all variants matched, no `_` arm) leaves C
+	// unable to prove the function returns; genSwitch appends a dead-code
+	// `default: return <zero>;` arm to silence the warning without
+	// changing behavior.
+	curRetC          string
+	curRetNeedsValue bool
+
 	// forwardDecls collects C prototypes for every Tinoc function so
 	// call order in the source doesn't have to match C's top-to-bottom
 	// declare-before-use rule (Tinoc, like Sema's own signature pass,
@@ -105,22 +114,27 @@ func (g *Codegen) Generate(prog *Program) string {
 		}
 	}
 
-	// Struct pre-pass: emit every struct's tag forward declaration and
-	// typedef first (in source order), so function/method prototypes that
-	// mention struct types -- emitted later in the forward-decl block --
-	// and every use in bodies sees a complete struct. Pointer fields to
-	// structs defined later in the file work because of the tag forward
-	// declarations; by-value fields to later structs are invalid C, same
-	// as in C itself, and surface at C compile time.
-	var structs bytes.Buffer
+	// Type pre-pass: emit every enum's and struct's C type first (in
+	// source order), so function/method prototypes that mention them --
+	// emitted later in the forward-decl block -- and every use in bodies
+	// sees a complete type. Enums are emitted before structs because
+	// struct fields commonly reference enum types; by-value struct
+	// payloads on enums still require the struct to be declared first,
+	// same as in C itself, and surface at C compile time.
+	var types bytes.Buffer
 	main := &g.out
-	g.out = structs
+	g.out = types
+	for _, stmt := range prog.Statements {
+		if es, ok := stmt.(*EnumStatement); ok {
+			g.genEnumTypeDef(es)
+		}
+	}
 	for _, stmt := range prog.Statements {
 		if st, ok := stmt.(*StructStatement); ok {
 			g.genStructTypeDef(st)
 		}
 	}
-	structs = g.out
+	types = g.out
 	g.out = *main
 
 	var body bytes.Buffer
@@ -145,8 +159,8 @@ func (g *Codegen) Generate(prog *Program) string {
 	}
 	final.WriteString("\n")
 
-	final.Write(structs.Bytes())
-	if structs.Len() > 0 {
+	final.Write(types.Bytes())
+	if types.Len() > 0 {
 		final.WriteString("\n")
 	}
 
@@ -178,6 +192,8 @@ func (g *Codegen) genTopLevelStatement(stmt Statement) {
 		g.genTopLevelConst(st)
 	case *StructStatement:
 		g.genStructMethods(st)
+	case *EnumStatement:
+		g.genEnumMethods(st)
 	case *ImportStatement:
 		// #import is Sema-level module resolution, not a C construct;
 		// nothing to emit. (std.io's io.println etc are not yet backed
@@ -207,6 +223,97 @@ func (g *Codegen) genExternCFuncProto(ecs *ExternCFuncStatement) {
 		ret = cDeclTypeSpelling(ecs.ReturnType)
 	}
 	g.forwardDecls = append(g.forwardDecls, fmt.Sprintf("%s %s(%s)", ret, ecs.CSymbol, cParamListSpelling(ecs)))
+}
+
+// === Enums ===
+
+// genEnumTypeDef emits one enum's C type. Fieldless enums become a plain
+// C enum whose constants are namespaced as `<Enum>_<Variant>` (so
+// variants of different enums never collide); enums with payload data
+// become a tagged union -- a `tag` field plus an anonymous union holding
+// one `<Variant>_<index>` member per payload slot -- with the variant
+// tags emitted as anonymous-enum integer constants so switch case labels
+// stay real integer constant expressions.
+func (g *Codegen) genEnumTypeDef(es *EnumStatement) {
+	if es.Name == nil {
+		return
+	}
+	t := g.sema.enumTypes[es.Name.Value]
+	if t == nil {
+		return
+	}
+	name := sanitizeCIdent(es.Name.Value)
+
+	if t.HasPayload {
+		g.writeln("typedef struct %s {", name)
+		g.indent++
+		g.writeln("i32 tag;")
+		g.writeln("union {")
+		g.indent++
+		for _, v := range t.EnumVariants {
+			if v == nil || len(v.Types) == 0 {
+				continue
+			}
+			// Each payload-carrying variant gets its own anonymous struct
+			// inside the union, so multi-field payloads don't overlap
+			// each other (a flattened union would alias Rect.w with
+			// Rect.h and corrupt payloads at runtime).
+			g.writeln("struct {")
+			g.indent++
+			for i, pt := range v.Types {
+				if pt == nil {
+					continue
+				}
+				g.writeln("%s %s_%d;", cTypeOrFallback(pt), sanitizeCIdent(v.Name), i)
+			}
+			g.indent--
+			g.writeln("} %s;", sanitizeCIdent(v.Name))
+		}
+		g.indent--
+		g.writeln("} data;")
+		g.indent--
+		g.writeln("} %s;", name)
+		g.writeln("enum {")
+		g.indent++
+		for i, v := range t.EnumVariants {
+			if v == nil {
+				continue
+			}
+			g.writeln("%s_%s = %d,", name, sanitizeCIdent(v.Name), i)
+		}
+		g.indent--
+		g.writeln("};")
+	} else {
+		g.writeln("typedef enum %s {", name)
+		g.indent++
+		for i, v := range t.EnumVariants {
+			if v == nil {
+				continue
+			}
+			line := fmt.Sprintf("%s_%s", name, sanitizeCIdent(v.Name))
+			if i < len(t.EnumVariants)-1 {
+				line += ","
+			}
+			g.writeln("%s", line)
+		}
+		g.indent--
+		g.writeln("} %s;", name)
+	}
+	g.out.WriteString("\n")
+}
+
+// genEnumMethods emits every method of an enum, mirroring
+// genStructMethods: C prototypes go into the shared forward-decl block
+// and definitions follow the enum's typedef.
+func (g *Codegen) genEnumMethods(es *EnumStatement) {
+	if es.Name == nil {
+		return
+	}
+	for _, m := range es.Methods {
+		if m != nil {
+			g.genTypeMethod(es.Name.Value, g.sema.enumMethods[es.Name.Value], m)
+		}
+	}
 }
 
 // === Structs ===
@@ -253,28 +360,28 @@ func (g *Codegen) genStructMethods(st *StructStatement) {
 	}
 	for _, m := range st.Methods {
 		if m != nil {
-			g.genMethod(st.Name.Value, m)
+			g.genTypeMethod(st.Name.Value, g.sema.structMethods[st.Name.Value], m)
 		}
 	}
 }
 
-// genMethod renders a single struct method (instance or static). Method
-// symbols are resolved from Sema's per-struct method table (never
-// s.funcs), and the C name is mangled as tnc_<Struct>_<method> so methods
-// of different structs never collide.
-func (g *Codegen) genMethod(structName string, fn *FunctionStatement) {
+// genTypeMethod renders a single struct/enum method (instance or
+// static). Method symbols are resolved from Sema's per-type method table
+// (never s.funcs), and the C name is mangled as tnc_<Type>_<method> so
+// methods of different types never collide.
+func (g *Codegen) genTypeMethod(typeName string, methods map[string]*Symbol, fn *FunctionStatement) {
 	if fn.Name == nil {
 		return
 	}
 
-	sym := g.sema.structMethods[structName][fn.Name.Value]
+	sym := methods[fn.Name.Value]
 	if sym == nil {
-		g.errorAt(fn.Token.Line, fn.Token.Column, "codegen: no resolved signature for %s.%s (sema did not run or failed)", structName, fn.Name.Value)
+		g.errorAt(fn.Token.Line, fn.Token.Column, "codegen: no resolved signature for %s.%s (sema did not run or failed)", typeName, fn.Name.Value)
 		return
 	}
 
 	retC := cReturnType(sym.ReturnType, fn.Name.Value)
-	cName := "tnc_" + sanitizeCIdent(structName) + "_" + sanitizeCIdent(fn.Name.Value)
+	cName := "tnc_" + sanitizeCIdent(typeName) + "_" + sanitizeCIdent(fn.Name.Value)
 
 	var params []string
 	offset := 0
@@ -296,6 +403,11 @@ func (g *Codegen) genMethod(structName string, fn *FunctionStatement) {
 
 	g.forwardDecls = append(g.forwardDecls, fmt.Sprintf("%s %s(%s)", retC, cName, paramList))
 
+	prevRetC := g.curRetC
+	prevRetNeeds := g.curRetNeedsValue
+	g.curRetC = retC
+	g.curRetNeedsValue = sym.ReturnType != nil && sym.ReturnType.Kind != KindVoid
+
 	g.writeln("%s %s(%s) {", retC, cName, paramList)
 	g.indent++
 	if fn.Body != nil {
@@ -306,6 +418,9 @@ func (g *Codegen) genMethod(structName string, fn *FunctionStatement) {
 	g.indent--
 	g.writeln("}")
 	g.out.WriteString("\n")
+
+	g.curRetC = prevRetC
+	g.curRetNeedsValue = prevRetNeeds
 }
 
 // cSelfParamType renders the C type for a method's self parameter: `^T`
@@ -387,7 +502,11 @@ func (g *Codegen) genFunction(fn *FunctionStatement) {
 	g.forwardDecls = append(g.forwardDecls, fmt.Sprintf("%s %s(%s)", retC, cName, paramList))
 
 	prevInMain := g.inMain
+	prevRetC := g.curRetC
+	prevRetNeeds := g.curRetNeedsValue
 	g.inMain = isMain
+	g.curRetC = retC
+	g.curRetNeedsValue = isMain || (sym.ReturnType != nil && sym.ReturnType.Kind != KindVoid)
 
 	g.writeln("%s %s(%s) {", retC, cName, paramList)
 	g.indent++
@@ -396,7 +515,7 @@ func (g *Codegen) genFunction(fn *FunctionStatement) {
 			g.genStatement(st)
 		}
 	}
-	if isMain && !blockAlwaysReturns(fn.Body) {
+	if isMain && !g.sema.blockAlwaysReturns(fn.Body) {
 		g.writeln("return 0;")
 	}
 	g.indent--
@@ -404,6 +523,8 @@ func (g *Codegen) genFunction(fn *FunctionStatement) {
 	g.out.WriteString("\n")
 
 	g.inMain = prevInMain
+	g.curRetC = prevRetC
+	g.curRetNeedsValue = prevRetNeeds
 }
 
 // cFunctionName maps a Tinoc function name to its C symbol. `main` passes
@@ -545,7 +666,7 @@ func zeroValue(t *Type) string {
 		return "tinoc_str_lit(\"\", 0)"
 	case KindPointer:
 		return "NULL"
-	case KindStruct:
+	case KindStruct, KindEnum:
 		// Aggregate zero-initializer: every member gets zeroed, matching
 		// Tinoc's decl-only `var p Point;` semantics.
 		return "{0}"
@@ -580,6 +701,8 @@ func (g *Codegen) genStatement(stmt Statement) {
 			return
 		}
 		g.writeln("break;")
+	case *SwitchStatement:
+		g.genSwitch(st)
 	case *ContinueStatement:
 		if g.loopDepth == 0 {
 			g.errorAt(st.Token.Line, st.Token.Column, "codegen: continue outside a loop")
@@ -787,6 +910,191 @@ func (g *Codegen) genFor(f *ForStatement) {
 	g.writeln("}")
 }
 
+// genSwitch lowers Tinoc's switch statement to a C switch, emitting each
+// arm as its own braced block terminated by an explicit `break;` (no
+// fallthrough, matching syntax.md's notes). Values with payload-carrying
+// enum types switch on their `tag` field; every arm value (enum variant
+// constant or integer literal) renders to the matching C constant via
+// genExpr. Arm bodies declare in their own scope so Tinoc block scoping
+// matches C's braced-case scoping.
+func (g *Codegen) genSwitch(sw *SwitchStatement) {
+	value := ""
+	if sw.Value != nil {
+		value = g.genExpr(sw.Value)
+	}
+	// Tagged-union enums carry their discriminant in `.tag`; the switch
+	// value is that field, and arms match against the tag constants.
+	// The full value is still needed to bind payload fields in pattern
+	// arms (`Shape.Rect(w, h)` reads `(value).data.Rect_0` etc).
+	fullValue := value
+	if t := g.sema.TypeOf(sw.Value); t != nil && t.Kind == KindEnum && t.HasPayload {
+		value = "(" + value + ").tag"
+	}
+
+	g.writeln("switch (%s) {", value)
+	g.indent++
+	for _, arm := range sw.Arms {
+		if arm == nil {
+			continue
+		}
+		if arm.Value == nil {
+			g.writeln("default:")
+		} else if g.genSwitchPatternArm(arm, fullValue) {
+			// Pattern arm fully emitted (case label + payload bindings).
+			continue
+		} else {
+			// Plain variant arm (`Shape.Point`) or literal. The case label
+			// compares against `.tag` for tagged unions, so a fieldless
+			// variant reference must emit its bare tag constant -- not the
+			// full struct value genExpr would produce for a tagged union.
+			g.writeln("case %s:", g.genSwitchArmLabel(arm.Value))
+		}
+		g.indent++
+		g.writeln("{")
+		g.indent++
+		if arm.Body != nil {
+			for _, s := range arm.Body.Statements {
+				g.genStatement(s)
+			}
+		}
+		g.writeln("break;")
+		g.indent--
+		g.writeln("}")
+		g.indent--
+	}
+	// An exhaustive enum switch has no `_` arm by definition; C cannot
+	// prove the switch value always matches, so a non-void enclosing
+	// function would warn "control reaches end of non-void function".
+	// Emit a dead-code default returning the type's zero value — sema
+	// guarantees it is unreachable (every variant is matched), so it
+	// never changes behavior, but it keeps the generated C warning-free.
+	if g.curRetNeedsValue && g.isExhaustiveEnumSwitch(sw) {
+		g.writeln("default:")
+		g.indent++
+		g.writeln("return %s;", cZeroValue(g.curRetC))
+		g.indent--
+	}
+	g.indent--
+	g.writeln("}")
+}
+
+// isExhaustiveEnumSwitch reports whether sw matches every variant of an
+// enum value and has no `_` default arm (so control cannot fall off the
+// switch at runtime). Used only to place dead-code C fallbacks.
+func (g *Codegen) isExhaustiveEnumSwitch(sw *SwitchStatement) bool {
+	t := g.sema.TypeOf(sw.Value)
+	if t == nil || t.Kind != KindEnum {
+		return false
+	}
+	hasDefault := false
+	matched := make(map[string]bool)
+	for _, arm := range sw.Arms {
+		if arm == nil {
+			continue
+		}
+		if arm.Value == nil {
+			hasDefault = true
+		} else if v := switchArmVariant(arm.Value); v != "" {
+			matched[v] = true
+		}
+	}
+	if hasDefault {
+		return false
+	}
+	for _, v := range t.EnumVariants {
+		if v != nil && !matched[v.Name] {
+			return false
+		}
+	}
+	return true
+}
+
+// cZeroValue renders the C zero-initializer for a C type name.
+func cZeroValue(cType string) string {
+	return "(" + cType + "){0}"
+}
+
+// genSwitchArmLabel renders a switch arm's case label. For enum variant
+// references this is the variant's tag constant (never the full struct
+// value, even for tagged unions, since the switch value is `.tag`); for
+// literals it is the literal itself.
+func (g *Codegen) genSwitchArmLabel(v Expression) string {
+	if fa, ok := v.(*FieldAccessExpression); ok && fa.Left != nil && fa.Field != nil {
+		if id, isID := fa.Left.(*Identifier); isID {
+			if et, ok := g.sema.enumTypes[id.Value]; ok {
+				if _, isVariant := et.EnumVariantIdx[fa.Field.Value]; isVariant {
+					return sanitizeCIdent(id.Value) + "_" + sanitizeCIdent(fa.Field.Value)
+				}
+			}
+		}
+	}
+	return g.genExpr(v)
+}
+
+// genSwitchPatternArm emits one enum pattern-binding arm of a switch:
+// `Shape.Rect(w, h) => { ... }`. It writes the case label (the variant's
+// tag constant), binds each pattern name to its payload field, and emits
+// the arm body. Returns true when the arm was a pattern arm (fully
+// emitted, caller must not emit anything else); false for ordinary value
+// arms (plain variant refs, integer literals, `_` handled by the caller).
+func (g *Codegen) genSwitchPatternArm(arm *SwitchArm, value string) bool {
+	ce, ok := arm.Value.(*CallExpression)
+	if !ok {
+		return false
+	}
+	fa, ok := ce.Function.(*FieldAccessExpression)
+	if !ok || fa.Left == nil || fa.Field == nil {
+		return false
+	}
+	id, isID := fa.Left.(*Identifier)
+	if !isID {
+		return false
+	}
+	et, ok := g.sema.enumTypes[id.Value]
+	if !ok {
+		return false
+	}
+	idx, isVariant := et.EnumVariantIdx[fa.Field.Value]
+	if !isVariant {
+		return false
+	}
+	info := et.EnumVariants[idx]
+	name := sanitizeCIdent(et.Name)
+	variant := sanitizeCIdent(info.Name)
+
+	g.writeln("case %s_%s:", name, variant)
+	g.indent++
+	g.writeln("{")
+	g.indent++
+	n := len(info.Types)
+	if len(ce.Arguments) < n {
+		n = len(ce.Arguments)
+	}
+	for i := 0; i < n; i++ {
+		arg, isIdent := ce.Arguments[i].(*Identifier)
+		if !isIdent || info.Types[i] == nil {
+			continue
+		}
+		// `_` is a wildcard binding: it consumes the payload slot but
+		// doesn't declare a local, so no unused-variable warning.
+		if arg.Value == "_" {
+			continue
+		}
+		g.writeln("%s %s = (%s).data.%s.%s_%d;",
+			cTypeOrFallback(info.Types[i]), sanitizeCIdent(arg.Value), value, variant, variant, i)
+	}
+	if arm.Body != nil {
+		for _, s := range arm.Body.Statements {
+			g.genStatement(s)
+		}
+	}
+	g.writeln("break;")
+	g.indent--
+	g.writeln("}")
+	g.indent--
+	return true
+}
+
 // === Expressions ===
 //
 // genExpr renders an expression to a C source fragment. It leans on
@@ -846,6 +1154,24 @@ func (g *Codegen) genExpr(e Expression) string {
 		if mod, ok := g.sema.moduleAlias(ex.Left); ok && ex.Field != nil {
 			if c, ok := mod.Consts[ex.Field.Value]; ok {
 				return c.CSymbol
+			}
+		}
+		// Enum variant reference: `Direction.North` -> `Direction_North`
+		// (the namespaced C constant emitted in the enum typedef). For a
+		// tagged-union enum the value is the full struct, so a fieldless
+		// variant reference becomes a compound literal with just its tag
+		// set (`((Shape){ .tag = Shape_Point })`); only in switch case
+		// labels (which compare against `.tag`) is the bare constant
+		// wanted -- genSwitch handles that separately.
+		if id, isID := ex.Left.(*Identifier); isID && ex.Field != nil {
+			if et, ok := g.sema.enumTypes[id.Value]; ok {
+				if _, isVariant := et.EnumVariantIdx[ex.Field.Value]; isVariant {
+					constName := sanitizeCIdent(id.Value) + "_" + sanitizeCIdent(ex.Field.Value)
+					if et.HasPayload {
+						return fmt.Sprintf("((%s){ .tag = %s })", sanitizeCIdent(id.Value), constName)
+					}
+					return constName
+				}
 			}
 		}
 		// `self^.x` renders as `self->x` (the C idiom for accessing a
@@ -1082,6 +1408,20 @@ func (g *Codegen) genInfix(ie *InfixExpression) string {
 		right = g.genExpr(ie.Right)
 	}
 
+	// str is a struct in C, which cannot be compared with ==/!=; both
+	// sides compare by content through the tinoc_str_eq runtime helper.
+	if ie.Operator == "==" || ie.Operator == "!=" {
+		lt := g.sema.TypeOf(ie.Left)
+		rt := g.sema.TypeOf(ie.Right)
+		if (lt != nil && lt.Kind == KindStr) || (rt != nil && rt.Kind == KindStr) {
+			eq := fmt.Sprintf("tinoc_str_eq(%s, %s)", left, right)
+			if ie.Operator == "!=" {
+				return "(!" + eq + ")"
+			}
+			return eq
+		}
+	}
+
 	if cop, ok := cInfixOp(ie.Operator); ok {
 		return fmt.Sprintf("(%s %s %s)", left, cop, right)
 	}
@@ -1128,14 +1468,23 @@ func (g *Codegen) genCall(ce *CallExpression) string {
 				return g.genCCall(fn.CSymbol, ce)
 			}
 		}
-		// Static method call: `Point.create(...)` -> tnc_Point_create(...).
+		// Static method call / enum constructor: `Point.create(...)` ->
+		// tnc_Point_create(...); `Shape.Circle(5.0)` -> a tagged-union
+		// compound literal; `Shape.kindName(...)` -> tnc_Shape_kindName(...).
 		if id, isID := fa.Left.(*Identifier); isID && fa.Field != nil {
 			if _, isStruct := g.sema.structTypes[id.Value]; isStruct {
 				return g.genStructMethodCall(id.Value, fa.Field.Value, ce, nil)
 			}
+			if et, isEnum := g.sema.enumTypes[id.Value]; isEnum {
+				if _, isVariant := et.EnumVariantIdx[fa.Field.Value]; isVariant {
+					return g.genEnumConstructor(id.Value, fa.Field.Value, ce)
+				}
+				return g.genEnumMethodCall(id.Value, fa.Field.Value, ce, nil)
+			}
 		}
 		// Instance method call: `p.translate(...)` / `pp.method(...)` ->
-		// tnc_Point_translate((&p), ...) / tnc_Point_method(pp, ...).
+		// tnc_Point_translate((&p), ...) / tnc_Point_method(pp, ...);
+		// `s.kindName()` / `sp.method(...)` for enums similarly.
 		if fa.Left != nil && fa.Field != nil {
 			recvType := g.sema.TypeOf(fa.Left)
 			switch {
@@ -1143,6 +1492,10 @@ func (g *Codegen) genCall(ce *CallExpression) string {
 				return g.genStructMethodCall(recvType.Name, fa.Field.Value, ce, fa.Left)
 			case recvType != nil && recvType.Kind == KindPointer && recvType.Elem != nil && recvType.Elem.Kind == KindStruct:
 				return g.genStructMethodCall(recvType.Elem.Name, fa.Field.Value, ce, fa.Left)
+			case recvType != nil && recvType.Kind == KindEnum:
+				return g.genEnumMethodCall(recvType.Name, fa.Field.Value, ce, fa.Left)
+			case recvType != nil && recvType.Kind == KindPointer && recvType.Elem != nil && recvType.Elem.Kind == KindEnum:
+				return g.genEnumMethodCall(recvType.Elem.Name, fa.Field.Value, ce, fa.Left)
 			}
 		}
 		g.errorAt(ce.Token.Line, ce.Token.Column, "codegen: unsupported call target (module/method calls are not yet implemented)")
@@ -1218,20 +1571,63 @@ func (g *Codegen) genStructLiteral(sl *StructLiteral) string {
 	return fmt.Sprintf("(%s){ %s }", t.CType(), strings.Join(parts, ", "))
 }
 
-// genStructMethodCall renders a call to a struct method. recv is nil for
-// static methods (`Point.create(...)` -> `tnc_Point_create(...)`); for
-// instance methods the receiver expression becomes the self argument:
+// genEnumConstructor renders a tagged-union enum construction call,
+// `Shape.Circle(5.0)` -> `((Shape){ .tag = Shape_Circle, .data.Circle_0 =
+// 5.0 })`. Fieldless variants construct a tag-only literal.
+func (g *Codegen) genEnumConstructor(enumName, variant string, ce *CallExpression) string {
+	et := g.sema.enumTypes[enumName]
+	if et == nil {
+		g.errorAt(ce.Token.Line, ce.Token.Column, "codegen: no resolved type for enum %s", enumName)
+		return "/* unsupported enum construction */ {0}"
+	}
+	name := sanitizeCIdent(enumName)
+
+	idx, ok := et.EnumVariantIdx[variant]
+	if !ok {
+		g.errorAt(ce.Token.Line, ce.Token.Column, "codegen: enum %s has no variant %s", enumName, variant)
+		return "/* unsupported enum construction */ {0}"
+	}
+	info := et.EnumVariants[idx]
+
+	var parts []string
+	for i, a := range ce.Arguments {
+		if i >= len(info.Types) {
+			break
+		}
+		parts = append(parts, fmt.Sprintf(".data.%s.%s_%d = %s", sanitizeCIdent(variant), sanitizeCIdent(variant), i, g.genExpr(a)))
+	}
+	if len(parts) > 0 {
+		return fmt.Sprintf("((%s){ .tag = %s_%s, %s })", name, name, sanitizeCIdent(variant), strings.Join(parts, ", "))
+	}
+	return fmt.Sprintf("((%s){ .tag = %s_%s })", name, name, sanitizeCIdent(variant))
+}
+
+// genEnumMethodCall renders a call to an enum method, delegating to the
+// shared genTypeMethodCall (recv is nil for static methods).
+func (g *Codegen) genEnumMethodCall(enumName, method string, ce *CallExpression, recv Expression) string {
+	return g.genTypeMethodCall(enumName, method, g.sema.enumMethods[enumName], ce, recv)
+}
+
+// genStructMethodCall renders a call to a struct method, delegating to the
+// shared genTypeMethodCall.
+func (g *Codegen) genStructMethodCall(structName, method string, ce *CallExpression, recv Expression) string {
+	return g.genTypeMethodCall(structName, method, g.sema.structMethods[structName], ce, recv)
+}
+
+// genTypeMethodCall renders a call to a struct/enum method. recv is nil
+// for static methods (`Point.create(...)` -> `tnc_Point_create(...)`);
+// for instance methods the receiver expression becomes the self argument:
 // `p.translate(...)` -> `tnc_Point_translate((&p), ...)` when self is a
 // pointer and the receiver is a struct value, or passed through directly
 // when the receiver is already a pointer or self is by-value.
-func (g *Codegen) genStructMethodCall(structName, method string, ce *CallExpression, recv Expression) string {
-	sym := g.sema.structMethods[structName][method]
+func (g *Codegen) genTypeMethodCall(typeName, method string, methods map[string]*Symbol, ce *CallExpression, recv Expression) string {
+	sym := methods[method]
 	if sym == nil {
-		g.errorAt(ce.Token.Line, ce.Token.Column, "codegen: no resolved signature for %s.%s", structName, method)
+		g.errorAt(ce.Token.Line, ce.Token.Column, "codegen: no resolved signature for %s.%s", typeName, method)
 		return "/* unsupported call */ 0"
 	}
 
-	cName := "tnc_" + sanitizeCIdent(structName) + "_" + sanitizeCIdent(method)
+	cName := "tnc_" + sanitizeCIdent(typeName) + "_" + sanitizeCIdent(method)
 
 	var args []string
 	if recv != nil {

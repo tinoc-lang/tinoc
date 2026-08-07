@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Enums**: `enum Name { Variant, Other(type), ... }` — fieldless
+  variants compile to plain C enums; variants with payloads become
+  tagged unions (tag + per-variant anonymous struct), so multi-field
+  payloads never overlap. Enums support instance methods (`self
+  ^Name`), static methods, equality, and being passed/returned like any
+  other type.
+- **Enum `switch`**: exhaustive enum switches (all variants listed, no
+  `_` arm needed) with pattern binding — `Shape.Rect(w, h) => { ... }`
+  binds the payload fields directly; `_` wildcards discard a payload
+  slot. Missing-return analysis understands exhaustive enum switches.
+- **Samples**: `samples/14_enum_basics.tnc` through
+  `samples/17_str_strings.tnc` covering fieldless enums, tagged unions
+  with pattern matching, enum methods, and `str` semantics.
+
 - **Installers**: `install.sh` / `install.ps1` fetch the latest GitHub release,
   verify it against the release `SHA256SUMS` manifest, and extract it into
   `~/.tinoc/` — with `VERSION` tracking, update checks that ask before
@@ -26,6 +40,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **str**: `<`, `>`, `<=`, `>=` on `str` are now rejected with a clear
+  diagnostic (only `==`/`!=` are defined, via content comparison) instead
+  of emitting invalid C. Switching on a `str` is likewise a proper
+  semantic error. `str ==`/`!=` compare by content through the
+  `tinoc_str_eq` runtime helper.
 - **Installers**: `--local` no longer prompts to "update" when the built
   version equals the installed version — the fresh source build is installed
   directly. Re-running the installer with the latest version already

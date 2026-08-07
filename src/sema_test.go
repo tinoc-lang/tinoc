@@ -790,3 +790,225 @@ fn main() void {
 }
 `)
 }
+
+// === Enums ===
+
+func TestEnumFieldlessVariants(t *testing.T) {
+	checkNoErrors(t, `
+enum Direction {
+	North, East, South, West,
+}
+
+fn main() void {
+	var d Direction = Direction.East;
+	if d == Direction.East {
+		return;
+	}
+}
+`)
+}
+
+func TestEnumPayloadConstruction(t *testing.T) {
+	checkNoErrors(t, `
+enum Shape {
+	Circle(f32),
+	Rect(f32, f32),
+	Point,
+}
+
+fn main() void {
+	var c Shape = Shape.Circle(5.0);
+	var r Shape = Shape.Rect(1.0, 2.0);
+	var p Shape = Shape.Point;
+	return;
+}
+`)
+}
+
+func TestEnumConstructorWrongArity(t *testing.T) {
+	checkHasError(t, `
+enum Shape { Rect(f32, f32) }
+fn main() void {
+	var s Shape = Shape.Rect(1.0);
+}
+`, "not enough arguments")
+}
+
+func TestEnumConstructorWrongArgType(t *testing.T) {
+	checkHasError(t, `
+enum Shape { Circle(f32) }
+fn main() void {
+	var s Shape = Shape.Circle("nope");
+}
+`, "argument 1 to Shape.Circle")
+}
+
+func TestEnumUnknownVariant(t *testing.T) {
+	checkHasError(t, `
+enum Color { Red, Green }
+fn main() void {
+	var c Color = Color.Purple;
+}
+`, "no variant or method")
+}
+
+func TestEnumDuplicateVariant(t *testing.T) {
+	checkHasError(t, `
+enum Color { Red, Red }
+fn main() void { }
+`, "duplicate variant")
+}
+
+func TestEnumExhaustiveSwitchNoMissingReturn(t *testing.T) {
+	checkNoErrors(t, `
+enum Color { Red, Green, Blue }
+fn name(c Color) str {
+	switch c {
+		Color.Red => { return "red"; }
+		Color.Green => { return "green"; }
+		Color.Blue => { return "blue"; }
+	}
+}
+fn main() void { }
+`)
+}
+
+func TestEnumSwitchNonExhaustiveMissingReturn(t *testing.T) {
+	checkHasError(t, `
+enum Color { Red, Green, Blue }
+fn name(c Color) str {
+	switch c {
+		Color.Red => { return "red"; }
+		Color.Green => { return "green"; }
+	}
+}
+fn main() void { }
+`, "missing return")
+}
+
+func TestEnumSwitchWrongEnumRejected(t *testing.T) {
+	checkHasError(t, `
+enum A { X }
+enum B { Y }
+fn main() void {
+	var a A = A.X;
+	switch a {
+		B.Y => { }
+	}
+}
+`, "mismatched types in switch")
+}
+
+func TestEnumSwitchPatternBinding(t *testing.T) {
+	checkNoErrors(t, `
+enum Shape {
+	Circle(f32),
+	Rect(f32, f32),
+	Point,
+}
+
+fn area(s Shape) f32 {
+	switch s {
+		Shape.Rect(w, h) => { return w * h; }
+		Shape.Circle(r) => { return 3.0 * r; }
+		Shape.Point => { return 0.0; }
+	}
+}
+fn main() void { }
+`)
+}
+
+func TestEnumSwitchPatternBindingCount(t *testing.T) {
+	checkHasError(t, `
+enum Shape { Rect(f32, f32) }
+fn main() void {
+	var s Shape = Shape.Rect(1.0, 2.0);
+	switch s {
+		Shape.Rect(w) => { }
+	}
+}
+`, "pattern Shape.Rect expects 2 binding(s)")
+}
+
+func TestEnumInstanceMethod(t *testing.T) {
+	checkNoErrors(t, `
+enum Shape {
+	Circle(f32),
+	Point,
+
+	fn isRound(self ^Shape) bool {
+		switch self^ {
+			Shape.Circle(r) => { return r > 0.0; }
+			Shape.Point => { return false; }
+		}
+	}
+}
+
+fn main() void {
+	var c Shape = Shape.Circle(5.0);
+	if c.isRound() {
+		return;
+	}
+}
+`)
+}
+
+func TestEnumStaticMethod(t *testing.T) {
+	checkNoErrors(t, `
+enum Color {
+	Red, Green,
+
+	static fn count() i32 {
+		return 2;
+	}
+}
+
+fn main() void {
+	var n i32 = Color.count();
+	return;
+}
+`)
+}
+
+// === str type ===
+
+func TestStrEqualityValid(t *testing.T) {
+	checkNoErrors(t, `
+fn main() void {
+	var a str = "hello";
+	var b str = "hello";
+	if a == b { return; }
+	if a != "world" { return; }
+}
+`)
+}
+
+func TestStrOrderingRejected(t *testing.T) {
+	checkHasError(t, `
+fn main() void {
+	var a str = "apple";
+	if a < "banana" { return; }
+}
+`, "not defined on str (str supports only == and !=)")
+}
+
+func TestStrArithmeticRejected(t *testing.T) {
+	checkHasError(t, `
+fn main() void {
+	var a str = "a";
+	var b str = a + "b";
+}
+`, "operator + not defined on a (type str)")
+}
+
+func TestSwitchOnStrRejected(t *testing.T) {
+	checkHasError(t, `
+fn main() void {
+	var a str = "apple";
+	switch a {
+		"apple" => { }
+		_ => { }
+	}
+}
+`, "cannot switch on value of type str")
+}
