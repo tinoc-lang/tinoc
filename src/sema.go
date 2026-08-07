@@ -129,6 +129,8 @@ type Sema struct {
 	structMethods map[string]map[string]*Symbol
 	enumTypes     map[string]*Type
 	enumMethods   map[string]map[string]*Symbol
+	unionTypes    map[string]*Type
+	unionMethods  map[string]map[string]*Symbol
 
 	// currentFn tracks the function being checked, for `return` type
 	// checking. nil at top level.
@@ -175,6 +177,8 @@ func NewSema(diags *Diagnostics) *Sema {
 		structMethods:  make(map[string]map[string]*Symbol),
 		enumTypes:      make(map[string]*Type),
 		enumMethods:    make(map[string]map[string]*Symbol),
+		unionTypes:     make(map[string]*Type),
+		unionMethods:   make(map[string]map[string]*Symbol),
 		cStrArgs:       make(map[Expression]bool),
 	}
 }
@@ -206,25 +210,30 @@ func (s *Sema) Check(prog *Program) {
 		}
 	}
 
-	// Pass 1: register every struct's and enum's type name first, so
-	// fields and payloads can reference their own type via pointers
-	// (struct Node { next ^Node; }) and methods' `self ^Node` parameters
-	// resolve during signature registration.
+	// Pass 1: register every struct's, enum's and union's type name
+	// first, so fields and payloads can reference their own type via
+	// pointers (struct Node { next ^Node; }) and methods' `self ^Node`
+	// parameters resolve during signature registration.
 	for _, stmt := range prog.Statements {
 		if st, ok := stmt.(*StructStatement); ok {
 			s.registerStructName(st)
 		} else if es, ok := stmt.(*EnumStatement); ok {
 			s.registerEnumName(es)
+		} else if us, ok := stmt.(*UnionStatement); ok {
+			s.registerUnionName(us)
 		}
 	}
 
-	// Pass 2: resolve struct fields/enum variants and register method
-	// signatures, now that every struct/enum name is visible.
+	// Pass 2: resolve struct fields/enum variants/union fields and
+	// register method signatures, now that every struct/enum/union name
+	// is visible.
 	for _, stmt := range prog.Statements {
 		if st, ok := stmt.(*StructStatement); ok {
 			s.resolveStruct(st)
 		} else if es, ok := stmt.(*EnumStatement); ok {
 			s.resolveEnum(es)
+		} else if us, ok := stmt.(*UnionStatement); ok {
+			s.resolveUnion(us)
 		}
 	}
 
@@ -455,6 +464,73 @@ func (s *Sema) resolveStruct(st *StructStatement) {
 	}
 }
 
+// registerUnionName creates the interned KindUnion *Type for a union
+// declaration (empty fields for now) so later passes can resolve the name
+// from anywhere -- including inside the union's own field types and its
+// methods' `self ^Name` parameters. Fields and FieldIndex reuse the same
+// storage as structs, since field access checking is identical; the only
+// difference is semantics: union fields share one memory location at
+// runtime, which is purely a codegen concern.
+func (s *Sema) registerUnionName(us *UnionStatement) {
+	if us.Name == nil {
+		return
+	}
+	name := us.Name.Value
+	line, col := us.Token.Line, us.Token.Column
+
+	if _, dup := s.unionTypes[name]; dup {
+		s.errorAt(line, col, "%s redeclared in this block", name)
+		return
+	}
+
+	t := &Type{Kind: KindUnion, Name: name, FieldIndex: make(map[string]int)}
+	s.unionTypes[name] = t
+	s.unionMethods[name] = make(map[string]*Symbol)
+}
+
+// resolveUnion resolves a union's field types and registers its method
+// signatures. Runs after every union name is registered, so fields and
+// self params can reference any type (including the union itself via a
+// pointer, e.g. `next ^Data`).
+func (s *Sema) resolveUnion(us *UnionStatement) {
+	if us.Name == nil {
+		return
+	}
+	t := s.unionTypes[us.Name.Value]
+	if t == nil {
+		return // duplicate/error already reported during name registration
+	}
+
+	seen := make(map[string]bool)
+	for _, f := range us.Fields {
+		if f == nil || f.Name == nil {
+			continue
+		}
+		name := f.Name.Value
+		if seen[name] {
+			s.errorAt(f.Name.Token.Line, f.Name.Token.Column, "duplicate field %s in union %s", name, us.Name.Value)
+			continue
+		}
+		seen[name] = true
+
+		var ft *Type
+		if f.Type != nil {
+			ft = s.resolveTypeExpr(f.Type)
+		}
+		if ft == nil {
+			s.errorAt(f.Name.Token.Line, f.Name.Token.Column, "field %s has an unsupported or unknown type", name)
+			ft = &Type{Kind: KindInvalid}
+		}
+
+		t.Fields = append(t.Fields, &StructFieldInfo{Name: name, Type: ft})
+		t.FieldIndex[name] = len(t.Fields) - 1
+	}
+
+	for _, m := range us.Methods {
+		s.registerUnionMethod(us.Name.Value, m)
+	}
+}
+
 // === Enums ===
 
 // registerEnumName creates the interned KindEnum *Type for an enum
@@ -541,6 +617,13 @@ func (s *Sema) registerStructMethod(structName string, fn *FunctionStatement) {
 // struct methods.
 func (s *Sema) registerEnumMethod(enumName string, fn *FunctionStatement) {
 	s.registerTypeMethod(enumName, s.enumMethods, fn, KindEnum)
+}
+
+// registerUnionMethod registers one method (instance or static) of a
+// union into that union's method table, with the same self-parameter
+// rules as struct methods (`self ^Name` / `self Name`).
+func (s *Sema) registerUnionMethod(unionName string, fn *FunctionStatement) {
+	s.registerTypeMethod(unionName, s.unionMethods, fn, KindUnion)
 }
 
 // registerTypeMethod is the shared method-registration core for structs
@@ -652,6 +735,8 @@ func (s *Sema) checkStatement(stmt Statement) {
 		s.checkStructStatement(st)
 	case *EnumStatement:
 		s.checkEnumStatement(st)
+	case *UnionStatement:
+		s.checkUnionStatement(st)
 	case *SwitchStatement:
 		s.checkSwitchStatement(st)
 	case *BreakStatement, *ContinueStatement, *ImportStatement, *ImportCStatement, *ExternCFuncStatement:
@@ -660,8 +745,8 @@ func (s *Sema) checkStatement(stmt Statement) {
 	case nil:
 		// Stray/skipped statement (e.g. parser recovered from an error).
 	default:
-		// Union bodies aren't checked by this pass yet; intentionally
-		// silent so partial programs using them don't spam unrelated
+		// Anything else (e.g. test blocks) isn't checked by this pass;
+		// intentionally silent so partial programs don't spam unrelated
 		// diagnostics for constructs Sema doesn't cover.
 	}
 }
@@ -845,6 +930,24 @@ func (s *Sema) checkEnumStatement(es *EnumStatement) {
 			continue
 		}
 		s.checkFunctionBody(es.Name.Value+"."+m.Name.Value, sym, m.Params, m.Body, m.Token, true)
+	}
+}
+
+// checkUnionStatement checks a union declaration's method bodies (its
+// fields and signatures were resolved during registration).
+func (s *Sema) checkUnionStatement(us *UnionStatement) {
+	if us.Name == nil {
+		return
+	}
+	for _, m := range us.Methods {
+		if m == nil || m.Name == nil {
+			continue
+		}
+		sym := s.unionMethods[us.Name.Value][m.Name.Value]
+		if sym == nil {
+			continue
+		}
+		s.checkFunctionBody(us.Name.Value+"."+m.Name.Value, sym, m.Params, m.Body, m.Token, true)
 	}
 }
 
@@ -1375,6 +1478,16 @@ func (s *Sema) checkFieldAccess(fa *FieldAccessExpression) *Type {
 			s.errorAt(fa.Token.Line, fa.Token.Column, "enum %s has no variant or method %s", et.Name, fa.Field.Value)
 			return &Type{Kind: KindInvalid}
 		}
+		// 2c. Union static member reference: `Data.fromBits` (a static
+		// method). Unions have no variant constants, so only static
+		// methods live on the type name.
+		if ut, ok := s.unionTypes[id.Value]; ok {
+			if m, ok := s.unionMethods[ut.Name][fa.Field.Value]; ok {
+				return m.ReturnType // call sites check the full signature
+			}
+			s.errorAt(fa.Token.Line, fa.Token.Column, "type %s has no static member %s", ut.Name, fa.Field.Value)
+			return &Type{Kind: KindInvalid}
+		}
 	}
 
 	// 3. Field/method access on a struct-typed value: `p.x`, `self^.x`,
@@ -1386,6 +1499,20 @@ func (s *Sema) checkFieldAccess(fa *FieldAccessExpression) *Type {
 				return recvType.Fields[idx].Type
 			}
 			if m, ok := s.structMethods[recvType.Name][fa.Field.Value]; ok {
+				return m.ReturnType // bare method reference; call sites check the full signature
+			}
+			s.errorAt(fa.Token.Line, fa.Token.Column, "type %s has no field or method %s", recvType.Name, fa.Field.Value)
+			return &Type{Kind: KindInvalid}
+		}
+		// Union-typed values expose their shared-memory fields and
+		// methods: `d.as_int`, `self^.as_int`, `d.zero()`. Field access
+		// is identical to structs -- only the storage semantics differ
+		// (fields overlap at runtime, enforced in codegen).
+		if recvType != nil && recvType.Kind == KindUnion {
+			if idx, ok := recvType.FieldIndex[fa.Field.Value]; ok {
+				return recvType.Fields[idx].Type
+			}
+			if m, ok := s.unionMethods[recvType.Name][fa.Field.Value]; ok {
 				return m.ReturnType // bare method reference; call sites check the full signature
 			}
 			s.errorAt(fa.Token.Line, fa.Token.Column, "type %s has no field or method %s", recvType.Name, fa.Field.Value)
@@ -1610,6 +1737,39 @@ func (s *Sema) checkStructMethodCall(ce *CallExpression, st *Type, method string
 	return m.ReturnType
 }
 
+// checkUnionMethodCall type-checks `d.method(args)` (isStatic=false,
+// receiver is a value/pointer of union type) and `Type.method(args)`
+// (isStatic=true, receiver is the type name), mirroring
+// checkStructMethodCall for structs.
+func (s *Sema) checkUnionMethodCall(ce *CallExpression, ut *Type, method string, isStatic bool) *Type {
+	methods := s.unionMethods[ut.Name]
+	m, ok := methods[method]
+	if !ok {
+		s.errorAt(ce.Token.Line, ce.Token.Column, "type %s has no %smethod %s", ut.Name, map[bool]string{true: "static ", false: ""}[isStatic], method)
+		return &Type{Kind: KindInvalid}
+	}
+	if m.IsStatic != isStatic {
+		if isStatic {
+			s.errorAt(ce.Token.Line, ce.Token.Column, "method %s.%s is not static; call it on a value of type %s", ut.Name, method, ut.Name)
+		} else {
+			s.errorAt(ce.Token.Line, ce.Token.Column, "static method %s.%s must be called on the type name %s, not on a value", ut.Name, method, ut.Name)
+		}
+		return m.ReturnType
+	}
+
+	if len(ce.GenericArgs) > 0 {
+		s.errorAt(ce.Token.Line, ce.Token.Column, "generic method calls are not yet supported (%s.%s)", ut.Name, method)
+	}
+
+	offset := 0
+	if !isStatic {
+		offset = 1 // skip the implicit self parameter
+	}
+	s.checkCallArgs(ce, m, ut.Name+"."+method, offset)
+
+	return m.ReturnType
+}
+
 // checkCallArgs checks a call's arguments against a function/method
 // symbol, starting at param offset (0 for plain functions and static
 // methods, 1 for instance methods whose self slot is implicit). It
@@ -1617,6 +1777,12 @@ func (s *Sema) checkStructMethodCall(ce *CallExpression, st *Type, method string
 // C-string-pointer unwrap for #importc/extern "C" calls.
 func (s *Sema) checkCallArgs(ce *CallExpression, sym *Symbol, calleeName string, offset int) {
 	fixed := len(sym.Params) - offset
+	if fixed < 0 {
+		// An instance method whose registration already failed (e.g. it
+		// was declared without a self parameter) has no params to check
+		// against; clamp so the loops below never index out of range.
+		fixed = 0
+	}
 
 	if sym.Variadic {
 		if len(ce.Arguments) < fixed {
@@ -1763,9 +1929,9 @@ func (s *Sema) checkInfixExpression(ie *InfixExpression) *Type {
 			s.resolvedTypes[ie.Right] = lt
 		}
 		s.checkOperandsCompatible(ie, lt, rt)
-		// C has no equality operator for structs, so comparing them is
-		// rejected outright rather than miscompiled.
-		if (lt != nil && lt.Kind == KindStruct) || (rt != nil && rt.Kind == KindStruct) {
+		// C has no equality operator for structs or unions, so comparing
+		// them is rejected outright rather than miscompiled.
+		if (lt != nil && (lt.Kind == KindStruct || lt.Kind == KindUnion)) || (rt != nil && (rt.Kind == KindStruct || rt.Kind == KindUnion)) {
 			s.errorAt(ie.Token.Line, ie.Token.Column, "invalid operation: cannot compare values of type %s with %s", typeStringOrInvalid(lt), typeStringOrInvalid(rt))
 			return typeBool
 		}
@@ -1783,7 +1949,7 @@ func (s *Sema) checkInfixExpression(ie *InfixExpression) *Type {
 		return typeBool
 
 	default: // arithmetic / bitwise
-		if (lt != nil && lt.Kind == KindStruct) || (rt != nil && rt.Kind == KindStruct) {
+		if (lt != nil && (lt.Kind == KindStruct || lt.Kind == KindUnion)) || (rt != nil && (rt.Kind == KindStruct || rt.Kind == KindUnion)) {
 			s.errorAt(ie.Token.Line, ie.Token.Column, "invalid operation: operator %s not defined on %s (type %s)", ie.Operator, ie.Left.String(), typeStringOrInvalid(lt))
 			return &Type{Kind: KindInvalid}
 		}
@@ -1907,6 +2073,9 @@ func (s *Sema) checkCallExpression(ce *CallExpression) *Type {
 					}
 					return s.checkEnumMethodCall(ce, et, fa.Field.Value, true)
 				}
+				if ut, ok := s.unionTypes[id.Value]; ok {
+					return s.checkUnionMethodCall(ce, ut, fa.Field.Value, true)
+				}
 			}
 			// Instance method call: `p.translate(...)` on a struct-typed
 			// (or pointer-to-struct/enum) receiver.
@@ -1920,6 +2089,10 @@ func (s *Sema) checkCallExpression(ce *CallExpression) *Type {
 				return s.checkEnumMethodCall(ce, recvType, fa.Field.Value, false)
 			case recvType != nil && recvType.Kind == KindPointer && recvType.Elem != nil && recvType.Elem.Kind == KindEnum:
 				return s.checkEnumMethodCall(ce, recvType.Elem, fa.Field.Value, false)
+			case recvType != nil && recvType.Kind == KindUnion:
+				return s.checkUnionMethodCall(ce, recvType, fa.Field.Value, false)
+			case recvType != nil && recvType.Kind == KindPointer && recvType.Elem != nil && recvType.Elem.Kind == KindUnion:
+				return s.checkUnionMethodCall(ce, recvType.Elem, fa.Field.Value, false)
 			default:
 				for _, a := range ce.Arguments {
 					s.checkExpression(a)

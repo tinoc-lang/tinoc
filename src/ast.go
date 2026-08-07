@@ -475,6 +475,62 @@ func (ss *StructStatement) String() string {
 	return out.String()
 }
 
+// UnionStatement represents a union declaration:
+//
+//	union <identifier> {
+//	    <field> <type>;
+//	    ...
+//	    fn <identifier>(self ^<type-of-union>, ...) <type> {...}
+//	    static fn <identifier>(<param> <type>, ...) <type> {...}
+//	}
+//
+// Fields follow the same `name type;` shape as struct fields (they share
+// memory at runtime, per C union semantics); methods mirror struct
+// methods exactly, including `static fn`. Generic union headers
+// (`union Pair:T { ... }`) are rejected during parsing with a clear
+// "not yet supported" diagnostic, matching structs/enums.
+type UnionStatement struct {
+	Token   Token // TOKEN_UNION
+	Name    *Identifier
+	Fields  []*StructField
+	Methods []*FunctionStatement
+	IsPub   bool
+}
+
+func (us *UnionStatement) statementNode()       {}
+func (us *UnionStatement) TokenLiteral() string { return us.Token.Literal }
+func (us *UnionStatement) String() string {
+	var out bytes.Buffer
+	if us.IsPub {
+		out.WriteString("pub ")
+	}
+	out.WriteString("union ")
+	if us.Name != nil {
+		out.WriteString(us.Name.String())
+	}
+	out.WriteString(" {\n")
+	for _, f := range us.Fields {
+		out.WriteString("\t")
+		if f != nil {
+			out.WriteString(f.String())
+		}
+		out.WriteString(";\n")
+	}
+	for _, m := range us.Methods {
+		if m == nil {
+			continue
+		}
+		if m.IsStatic {
+			out.WriteString("\tstatic ")
+		}
+		out.WriteString("\t")
+		out.WriteString(m.String())
+		out.WriteString("\n")
+	}
+	out.WriteString("}")
+	return out.String()
+}
+
 // === Type Expressions ===
 
 // NamedType represents a plain named type, e.g. `i32`, `str`, `bool`,

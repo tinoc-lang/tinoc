@@ -134,6 +134,11 @@ func (g *Codegen) Generate(prog *Program) string {
 			g.genStructTypeDef(st)
 		}
 	}
+	for _, stmt := range prog.Statements {
+		if us, ok := stmt.(*UnionStatement); ok {
+			g.genUnionTypeDef(us)
+		}
+	}
 	types = g.out
 	g.out = *main
 
@@ -194,6 +199,8 @@ func (g *Codegen) genTopLevelStatement(stmt Statement) {
 		g.genStructMethods(st)
 	case *EnumStatement:
 		g.genEnumMethods(st)
+	case *UnionStatement:
+		g.genUnionMethods(st)
 	case *ImportStatement:
 		// #import is Sema-level module resolution, not a C construct;
 		// nothing to emit. (std.io's io.println etc are not yet backed
@@ -361,6 +368,49 @@ func (g *Codegen) genStructMethods(st *StructStatement) {
 	for _, m := range st.Methods {
 		if m != nil {
 			g.genTypeMethod(st.Name.Value, g.sema.structMethods[st.Name.Value], m)
+		}
+	}
+}
+
+// genUnionTypeDef emits one union's C type: a tag forward declaration
+// (`union Data;`) followed by the typedef (`typedef union Data { ... }
+// Data;`). All fields share one memory location at runtime, exactly as
+// in C -- the declared field types simply overlap, so writing one field
+// and reading another reinterprets the same bytes. Field types reuse the
+// struct field C-type rendering so struct-typed fields still compile
+// regardless of declaration order.
+func (g *Codegen) genUnionTypeDef(us *UnionStatement) {
+	if us.Name == nil {
+		return
+	}
+	name := sanitizeCIdent(us.Name.Value)
+
+	g.writeln("union %s;", name)
+	g.writeln("typedef union %s {", name)
+	g.indent++
+	if resolved, ok := g.sema.unionTypes[us.Name.Value]; ok {
+		for _, f := range resolved.Fields {
+			if f == nil {
+				continue
+			}
+			g.writeln("%s %s;", structFieldCType(f.Type), sanitizeCIdent(f.Name))
+		}
+	}
+	g.indent--
+	g.writeln("} %s;", name)
+	g.out.WriteString("\n")
+}
+
+// genUnionMethods emits every method of a union, mirroring
+// genStructMethods: C prototypes go into the shared forward-decl block
+// and definitions follow the union's typedef.
+func (g *Codegen) genUnionMethods(us *UnionStatement) {
+	if us.Name == nil {
+		return
+	}
+	for _, m := range us.Methods {
+		if m != nil {
+			g.genTypeMethod(us.Name.Value, g.sema.unionMethods[us.Name.Value], m)
 		}
 	}
 }
@@ -666,7 +716,7 @@ func zeroValue(t *Type) string {
 		return "tinoc_str_lit(\"\", 0)"
 	case KindPointer:
 		return "NULL"
-	case KindStruct, KindEnum:
+	case KindStruct, KindEnum, KindUnion:
 		// Aggregate zero-initializer: every member gets zeroed, matching
 		// Tinoc's decl-only `var p Point;` semantics.
 		return "{0}"
@@ -1481,6 +1531,9 @@ func (g *Codegen) genCall(ce *CallExpression) string {
 				}
 				return g.genEnumMethodCall(id.Value, fa.Field.Value, ce, nil)
 			}
+			if _, isUnion := g.sema.unionTypes[id.Value]; isUnion {
+				return g.genUnionMethodCall(id.Value, fa.Field.Value, ce, nil)
+			}
 		}
 		// Instance method call: `p.translate(...)` / `pp.method(...)` ->
 		// tnc_Point_translate((&p), ...) / tnc_Point_method(pp, ...);
@@ -1496,6 +1549,10 @@ func (g *Codegen) genCall(ce *CallExpression) string {
 				return g.genEnumMethodCall(recvType.Name, fa.Field.Value, ce, fa.Left)
 			case recvType != nil && recvType.Kind == KindPointer && recvType.Elem != nil && recvType.Elem.Kind == KindEnum:
 				return g.genEnumMethodCall(recvType.Elem.Name, fa.Field.Value, ce, fa.Left)
+			case recvType != nil && recvType.Kind == KindUnion:
+				return g.genUnionMethodCall(recvType.Name, fa.Field.Value, ce, fa.Left)
+			case recvType != nil && recvType.Kind == KindPointer && recvType.Elem != nil && recvType.Elem.Kind == KindUnion:
+				return g.genUnionMethodCall(recvType.Elem.Name, fa.Field.Value, ce, fa.Left)
 			}
 		}
 		g.errorAt(ce.Token.Line, ce.Token.Column, "codegen: unsupported call target (module/method calls are not yet implemented)")
@@ -1612,6 +1669,12 @@ func (g *Codegen) genEnumMethodCall(enumName, method string, ce *CallExpression,
 // shared genTypeMethodCall.
 func (g *Codegen) genStructMethodCall(structName, method string, ce *CallExpression, recv Expression) string {
 	return g.genTypeMethodCall(structName, method, g.sema.structMethods[structName], ce, recv)
+}
+
+// genUnionMethodCall renders a call to a union method, delegating to the
+// shared genTypeMethodCall (recv is nil for static methods).
+func (g *Codegen) genUnionMethodCall(unionName, method string, ce *CallExpression, recv Expression) string {
+	return g.genTypeMethodCall(unionName, method, g.sema.unionMethods[unionName], ce, recv)
 }
 
 // genTypeMethodCall renders a call to a struct/enum method. recv is nil

@@ -1,0 +1,117 @@
+// 18_combo.tnc — the everything sample.
+//
+// Exercises every implemented feature in one program:
+//   - structs with instance + static methods
+//   - enums as tagged unions with pattern-matching switch
+//   - unions (C-style: fields share one memory location)
+//   - str with content equality (== / !=)
+//   - switch with an explicit default arm
+//   - functions with explicit types, if/else, and extern "C" printf
+
+extern "C" fn printf(fmt *const char, ...) i32;
+
+// --- struct with instance and static methods ---
+
+struct Rectangle {
+	width  f32;
+	height f32;
+
+	fn area(self ^Rectangle) f32 {
+		return self^.width * self^.height;
+	}
+
+	fn isSquare(self ^Rectangle) bool {
+		return self^.width == self^.height;
+	}
+
+	static fn square(side f32) Rectangle {
+		var r Rectangle;
+		r.width = side;
+		r.height = side;
+		return r;
+	}
+}
+
+// --- enum as a tagged union, pattern-matched with switch ---
+
+enum Shape {
+	Circle(f32),
+	Rect(f32, f32),
+	Point,
+
+	fn area(self ^Shape) f32 {
+		switch self^ {
+			Shape.Circle(r)   => { return 3.0 * r; }
+			Shape.Rect(w, h)  => { return w * h; }
+			Shape.Point       => { return 0.0; }
+		}
+	}
+
+	fn isPoint(self ^Shape) bool {
+		switch self^ {
+			Shape.Point => { return true; }
+			_ => { return false; }
+		}
+	}
+}
+
+fn describe(s Shape) str {
+	switch s {
+		// `_` binds nothing: we only care which variant we matched.
+		Shape.Circle(_) => { return "circle"; }
+		Shape.Rect(_, _) => { return "rectangle"; }
+		Shape.Point => { return "point"; }
+	}
+}
+
+// --- union: every field shares the same bytes ---
+
+union Value {
+	as_int   i32;
+	as_float f32;
+
+	fn setInt(self ^Value, v i32) void {
+		self^.as_int = v;
+	}
+
+	fn setFloat(self ^Value, v f32) void {
+		self^.as_float = v;
+	}
+}
+
+fn main() void {
+	// Union type punning: write the integer bits of 1.0f, read them back
+	// as a float. 1065353216 == 0x3F800000 (IEEE-754 for 1.0).
+	var v Value;
+	v.setInt(1065353216);
+	var one f32 = v.as_float;
+	if one > 0.99 and one < 1.01 {
+		printf("union punning ok: %f\n", one);
+	} else {
+		printf("union punning FAILED: %f\n", one);
+	}
+	v.setFloat(2.5);
+	printf("union bits of 2.5: %d\n", v.as_int); // 1075838976 == 0x40200000
+
+	// Struct static + instance methods.
+	var sq Rectangle = Rectangle.square(4.0);
+	printf("square area=%f isSquare=%d\n", sq.area(), sq.isSquare());
+
+	// Enum pattern matching: same function, three shapes.
+	var c Shape = Shape.Circle(2.0);
+	var r Shape = Shape.Rect(3.0, 4.0);
+	var p Shape = Shape.Point;
+	printf("circle area=%f (%s)\n", c.area(), describe(c));
+	printf("rect   area=%f (%s)\n", r.area(), describe(r));
+	printf("point  area=%f (%s) isPoint=%d\n", p.area(), describe(p), p.isPoint());
+
+	// str content equality.
+	var a str = "hello";
+	var b str = "hello";
+	var c2 str = "world";
+	if a == b and a != c2 and describe(r) == "rectangle" {
+		printf("str equality ok\n");
+	} else {
+		printf("str equality FAILED\n");
+	}
+}

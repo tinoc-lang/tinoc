@@ -1012,3 +1012,124 @@ fn main() void {
 }
 `, "cannot switch on value of type str")
 }
+
+// === Unions ===
+
+func TestUnionFieldAccess(t *testing.T) {
+	checkNoErrors(t, `
+union Data {
+	as_int i32;
+	as_float f32;
+}
+
+fn main() void {
+	var d Data;
+	d.as_int = 42;
+	var f f32 = d.as_float;
+	if d.as_int == 42 {
+		return;
+	}
+}
+`)
+}
+
+func TestUnionUnknownField(t *testing.T) {
+	checkHasError(t, `
+union Data { as_int i32; as_float f32; }
+fn main() void {
+	var d Data;
+	d.as_str = 1;
+}
+`, "no field or method")
+}
+
+func TestUnionUnknownMethod(t *testing.T) {
+	checkHasError(t, `
+union Data { as_int i32; }
+fn main() void {
+	var d Data;
+	d.nope();
+}
+`, "no method")
+}
+
+func TestUnionMethods(t *testing.T) {
+	checkNoErrors(t, `
+union Data {
+	as_int i32;
+
+	fn zero(self ^Data) void {
+		self^.as_int = 0;
+	}
+
+	static fn make(v i32) Data {
+		var d Data;
+		d.as_int = v;
+		return d;
+	}
+}
+
+fn main() void {
+	var d Data = Data.make(7);
+	d.zero();
+	return;
+}
+`)
+}
+
+func TestUnionStaticMethodCalledOnValue(t *testing.T) {
+	checkHasError(t, `
+union Data { as_int i32; static fn make() Data { var d Data; return d; } }
+fn main() void {
+	var d Data;
+	d.make();
+}
+`, "must be called on the type name")
+}
+
+func TestUnionInstanceMethodWithoutSelf(t *testing.T) {
+	checkHasError(t, `
+union Data { as_int i32; fn make() Data { var d Data; return d; } }
+fn main() void {
+	var d Data;
+	d.make();
+}
+`, "needs a self parameter")
+}
+
+func TestUnionCannotCompare(t *testing.T) {
+	checkHasError(t, `
+union Data { as_int i32; }
+fn main() void {
+	var a Data;
+	var b Data;
+	if a == b {
+		return;
+	}
+}
+`, "cannot compare")
+}
+
+func TestUnionCannotAdd(t *testing.T) {
+	checkHasError(t, `
+union Data { as_int i32; }
+fn main() void {
+	var a Data;
+	var b = a + a;
+}
+`, "not defined")
+}
+
+func TestUnionDuplicateField(t *testing.T) {
+	checkHasError(t, `
+union Data { as_int i32; as_int f32; }
+fn main() void { }
+`, "duplicate field")
+}
+
+func TestUnionGenericRejected(t *testing.T) {
+	checkHasError(t, `
+union Pair:T { first T; }
+fn main() void { }
+`, "generic unions")
+}

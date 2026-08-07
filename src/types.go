@@ -37,7 +37,8 @@ const (
 	KindPointer
 	KindStruct
 	KindEnum
-	KindUnknown // valid but not yet resolvable by this pass (union/array/etc)
+	KindUnion
+	KindUnknown // valid but not yet resolvable by this pass (array/etc)
 )
 
 // StructFieldInfo is a resolved struct field: its name and resolved type,
@@ -140,7 +141,7 @@ func (t *Type) CType() string {
 		return t.Name // tinoc.h defines u8/i32/f32/usize/... 1:1 with Tinoc's own names
 	case KindPointer:
 		return t.Elem.CType() + "*"
-	case KindStruct, KindEnum:
+	case KindStruct, KindEnum, KindUnion:
 		// Emitted as a typedef named after the type; sanitize so a name
 		// that collides with a C keyword still yields valid C.
 		return sanitizeCIdent(t.Name)
@@ -230,7 +231,7 @@ func typesEqual(a, b *Type) bool {
 		return a.Name == b.Name
 	case KindFloat:
 		return a.Name == b.Name
-	case KindStruct, KindEnum:
+	case KindStruct, KindEnum, KindUnion:
 		return a.Name == b.Name
 	default:
 		return a.Kind == b.Kind
@@ -276,12 +277,16 @@ func (s *Sema) resolveTypeExpr(te TypeExpr) *Type {
 		if et, ok := s.enumTypes[t.Name]; ok {
 			return et
 		}
-		// Not a known primitive, C type, struct, or enum: likely a union
-		// name (or an unknown name), which this pass doesn't resolve yet.
-		// Treated as KindUnknown (valid, opaque) rather than an error so
-		// var/const/fn involving user-defined types don't hard-fail sema
-		// wholesale -- codegen will surface a clear "unsupported"
-		// diagnostic if it's actually asked to generate code for one.
+		// A user-declared union: return its registered, resolved type.
+		if ut, ok := s.unionTypes[t.Name]; ok {
+			return ut
+		}
+		// Not a known primitive, C type, struct, enum, or union: an
+		// unknown name. Treated as KindUnknown (valid, opaque) rather
+		// than an error so var/const/fn involving user-defined types
+		// don't hard-fail sema wholesale -- codegen will surface a clear
+		// "unsupported" diagnostic if it's actually asked to generate
+		// code for one.
 		return &Type{Kind: KindUnknown, Name: t.Name}
 
 	case *CQualType:
