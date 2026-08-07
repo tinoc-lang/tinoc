@@ -1,0 +1,41 @@
+// Enums can have methods just like structs: instance methods receive
+// `self ^Enum`, and static methods are called on the type name.
+
+enum HttpStatus {
+	Ok(i32),
+	NotFound(i32),
+	ServerError(i32),
+
+	// Instance method: pattern-match the payload off self.
+	fn code(self ^HttpStatus) i32 {
+		switch self^ {
+			HttpStatus.Ok(c)         => { return c; }
+			HttpStatus.NotFound(c)   => { return c; }
+			HttpStatus.ServerError(c) => { return c; }
+		}
+	}
+
+	// `_` wildcards discard the payload when only the variant matters.
+	fn isError(self ^HttpStatus) bool {
+		switch self^ {
+			HttpStatus.Ok(_) => { return false; }
+			HttpStatus.NotFound(_) => { return true; }
+			HttpStatus.ServerError(_) => { return true; }
+		}
+	}
+
+	// Static method: no self, called as HttpStatus.label().
+	static fn label() str {
+		return "http";
+	}
+}
+
+extern "C" fn printf(fmt *const char, ...) i32;
+
+fn main() void {
+	var ok HttpStatus = HttpStatus.Ok(200);
+	var missing HttpStatus = HttpStatus.NotFound(404);
+
+	printf("%s: ok=%d isError=%d\n", HttpStatus.label(), ok.code(), ok.isError());
+	printf("%s: missing=%d isError=%d\n", HttpStatus.label(), missing.code(), missing.isError());
+}

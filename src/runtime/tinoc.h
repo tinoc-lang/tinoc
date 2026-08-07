@@ -4,6 +4,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <stddef.h>
+#include <string.h>
 #include <limits.h>
 #include <math.h>
 
@@ -46,6 +47,12 @@ typedef struct {
 static inline str tinoc_str_lit(const char* s, size_t len) {
     str result = { s, len };
     return result;
+}
+
+/* Content-based str equality (C cannot compare structs with ==). */
+static inline bool tinoc_str_eq(str a, str b) {
+    if (a.len != b.len) return false;
+    return a.len == 0 || (memcmp(a.data, b.data, a.len) == 0);
 }
 
 /* Slice Macro & Typedefs */

@@ -36,7 +36,8 @@ const (
 	KindStr
 	KindPointer
 	KindStruct
-	KindUnknown // valid but not yet resolvable by this pass (enum/union/array/etc)
+	KindEnum
+	KindUnknown // valid but not yet resolvable by this pass (union/array/etc)
 )
 
 // StructFieldInfo is a resolved struct field: its name and resolved type,
@@ -52,6 +53,29 @@ func (sf *StructFieldInfo) String() string {
 		return ""
 	}
 	return sf.Name + " " + sf.Type.String()
+}
+
+// EnumVariantInfo is a resolved enum variant: its name and, for tagged-
+// union enums, the resolved payload types in declaration order. Stored on
+// a KindEnum *Type for lookup by both Sema (variant access, constructor
+// arg checking) and Codegen (C typedef / tag-constant emission).
+type EnumVariantInfo struct {
+	Name  string
+	Types []*Type // payload types; nil for fieldless variants
+}
+
+func (ev *EnumVariantInfo) String() string {
+	if ev == nil {
+		return ""
+	}
+	if len(ev.Types) == 0 {
+		return ev.Name
+	}
+	types := make([]string, 0, len(ev.Types))
+	for _, t := range ev.Types {
+		types = append(types, t.String())
+	}
+	return ev.Name + "(" + strings.Join(types, ", ") + ")"
 }
 
 // Type is Sema's resolved representation of a Tinoc type.
@@ -74,6 +98,15 @@ type Type struct {
 	// by Sema when the struct declaration is resolved.
 	Fields     []*StructFieldInfo
 	FieldIndex map[string]int
+
+	// Enum-specific: ordered variants and a name -> index map, populated
+	// by Sema when the enum declaration is resolved. HasPayload marks
+	// tagged-union enums (at least one variant carries payload data),
+	// which codegen represents as a tag + union struct rather than a
+	// plain C enum.
+	EnumVariants   []*EnumVariantInfo
+	EnumVariantIdx map[string]int
+	HasPayload     bool
 }
 
 func (t *Type) String() string {
@@ -107,9 +140,9 @@ func (t *Type) CType() string {
 		return t.Name // tinoc.h defines u8/i32/f32/usize/... 1:1 with Tinoc's own names
 	case KindPointer:
 		return t.Elem.CType() + "*"
-	case KindStruct:
-		// Emitted as a typedef named after the struct; sanitize so a
-		// struct whose name collides with a C keyword still yields valid C.
+	case KindStruct, KindEnum:
+		// Emitted as a typedef named after the type; sanitize so a name
+		// that collides with a C keyword still yields valid C.
 		return sanitizeCIdent(t.Name)
 	default:
 		return t.Name
@@ -197,7 +230,7 @@ func typesEqual(a, b *Type) bool {
 		return a.Name == b.Name
 	case KindFloat:
 		return a.Name == b.Name
-	case KindStruct:
+	case KindStruct, KindEnum:
 		return a.Name == b.Name
 	default:
 		return a.Kind == b.Kind
@@ -239,7 +272,11 @@ func (s *Sema) resolveTypeExpr(te TypeExpr) *Type {
 		if st, ok := s.structTypes[t.Name]; ok {
 			return st
 		}
-		// Not a known primitive, C type, or struct: likely an enum/union
+		// A user-declared enum: return its registered, resolved type.
+		if et, ok := s.enumTypes[t.Name]; ok {
+			return et
+		}
+		// Not a known primitive, C type, struct, or enum: likely a union
 		// name (or an unknown name), which this pass doesn't resolve yet.
 		// Treated as KindUnknown (valid, opaque) rather than an error so
 		// var/const/fn involving user-defined types don't hard-fail sema

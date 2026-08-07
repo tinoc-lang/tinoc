@@ -265,6 +265,10 @@ func (p *Parser) parseStatement() Statement {
 		return p.parseFunctionStatement(false)
 	case TOKEN_STRUCT:
 		return p.parseStructStatement()
+	case TOKEN_ENUM:
+		return p.parseEnumStatement()
+	case TOKEN_SWITCH:
+		return p.parseSwitchStatement()
 	case TOKEN_PUB:
 		return p.parsePubStatement()
 	case TOKEN_STATIC:
@@ -542,6 +546,14 @@ func (p *Parser) parsePubStatement() Statement {
 		}
 		return stmt
 	}
+	if p.peekTokenIs(TOKEN_ENUM) {
+		p.nextToken()
+		stmt := p.parseEnumStatement()
+		if e, ok := stmt.(*EnumStatement); ok {
+			e.IsPub = true
+		}
+		return stmt
+	}
 	// `pub const` / `pub var` / `pub struct` etc. reuse the same
 	// declaration parsers; the pub-ness itself isn't tracked on those
 	// nodes yet since this is a partial AST.
@@ -648,6 +660,141 @@ func (p *Parser) parseStructStatement() Statement {
 			}
 		}
 		p.nextToken()
+	}
+
+	return stmt
+}
+
+// parseEnumStatement handles an enum declaration:
+//
+//	enum <Name> {
+//	    <Variant>,
+//	    <Variant>(<type>, ...),
+//	    ...
+//	    fn <method>(self ^<Name>, ...) <type> {...}
+//	    static fn <method>(...) <type> {...}
+//	}
+//
+// Variants are comma-separated identifiers with an optional parenthesized
+// payload type list (`Circle(f32)`); method lines start with `fn` (or
+// `static fn`), mirroring struct bodies. Generic enum headers
+// (`enum Something:T {`) are recognized and rejected with a clear
+// "not yet supported" diagnostic, but the generic args are still
+// consumed so parsing can continue past them.
+func (p *Parser) parseEnumStatement() Statement {
+	stmt := &EnumStatement{Token: p.curToken}
+
+	if !p.expectPeek(TOKEN_IDENT) {
+		return nil
+	}
+	stmt.Name = &Identifier{Token: p.curToken, Value: p.curToken.Literal}
+
+	// Reject generic enum headers: `enum Something:T {` / `enum Map:(K, V) {`.
+	if p.peekTokenIs(TOKEN_COLON) {
+		p.nextToken() // consume ':'
+		if p.peekTokenIs(TOKEN_LPAREN) {
+			p.nextToken() // consume '('
+			p.parseIdentList(TOKEN_RPAREN)
+		} else if p.peekTokenIs(TOKEN_IDENT) {
+			p.nextToken()
+		}
+		p.addError("generic enums are not yet supported (%s)", stmt.Name.Value)
+	}
+
+	if !p.expectPeek(TOKEN_LBRACE) {
+		return nil
+	}
+	p.nextToken() // consume '{'
+
+	for !p.curTokenIs(TOKEN_RBRACE) && !p.curTokenIs(TOKEN_EOF) {
+		switch p.curToken.Type {
+		case TOKEN_FN:
+			if m, ok := p.parseFunctionStatement(false).(*FunctionStatement); ok {
+				stmt.Methods = append(stmt.Methods, m)
+			}
+		case TOKEN_STATIC:
+			p.nextToken() // consume 'static'
+			if p.curTokenIs(TOKEN_FN) {
+				if m, ok := p.parseFunctionStatement(true).(*FunctionStatement); ok {
+					stmt.Methods = append(stmt.Methods, m)
+				}
+			} else {
+				p.addError("expected 'fn' after 'static' inside enum body, got %s (%q)", p.curToken.Type, p.curToken.Literal)
+			}
+		case TOKEN_COMMA, TOKEN_SEMICOLON:
+			// Variant separators; skip silently (trailing commas allowed).
+		default:
+			if v := p.parseEnumVariant(); v != nil {
+				stmt.Variants = append(stmt.Variants, v)
+			}
+		}
+		p.nextToken()
+	}
+
+	return stmt
+}
+
+// parseEnumVariant parses a single variant, starting at curToken (the
+// variant name): `North` or `Circle(f32, f32)`.
+func (p *Parser) parseEnumVariant() *EnumVariant {
+	if !p.curTokenIs(TOKEN_IDENT) {
+		p.addError("expected variant name inside enum body, got %s (%q)", p.curToken.Type, p.curToken.Literal)
+		return nil
+	}
+	v := &EnumVariant{Name: &Identifier{Token: p.curToken, Value: p.curToken.Literal}}
+
+	if p.peekTokenIs(TOKEN_LPAREN) {
+		p.nextToken() // consume '('
+		v.Types = p.parseTypeList(TOKEN_RPAREN)
+	}
+
+	return v
+}
+
+// parseSwitchStatement handles Tinoc's switch statement:
+//
+//	switch <expression> {
+//	    <value> => { ... }
+//	    _       => { ... }
+//	}
+//
+// Arm values are parsed at LOWEST precedence (the `=>` arrow has no
+// registered precedence, so the Pratt loop stops there naturally); the
+// `_` identifier denotes the default arm. noStructLiterals is set while
+// parsing the switch value so a following `{` is the arm block, never a
+// struct literal.
+func (p *Parser) parseSwitchStatement() Statement {
+	stmt := &SwitchStatement{Token: p.curToken}
+
+	p.nextToken() // move past 'switch'
+	p.noStructLiterals = true
+	stmt.Value = p.parseExpression(LOWEST)
+	p.noStructLiterals = false
+
+	if !p.expectPeek(TOKEN_LBRACE) {
+		return nil
+	}
+	p.nextToken() // consume '{'
+
+	for !p.curTokenIs(TOKEN_RBRACE) && !p.curTokenIs(TOKEN_EOF) {
+		arm := &SwitchArm{}
+
+		if p.curTokenIs(TOKEN_IDENT) && p.curToken.Literal == "_" {
+			// `_` is the default arm; Value stays nil.
+		} else {
+			arm.Value = p.parseExpression(LOWEST)
+		}
+
+		if !p.expectPeek(TOKEN_ARROW) {
+			return stmt
+		}
+		if !p.expectPeek(TOKEN_LBRACE) {
+			return stmt
+		}
+		arm.Body = p.parseBlockStatement()
+
+		stmt.Arms = append(stmt.Arms, arm)
+		p.nextToken() // move past the arm body's closing '}'
 	}
 
 	return stmt
@@ -1432,6 +1579,21 @@ func printASTNode(n Node, depth int, useColor bool) {
 		for _, m := range v.Methods {
 			printASTNode(m, depth+1, useColor)
 		}
+	case *EnumStatement:
+		for _, m := range v.Methods {
+			printASTNode(m, depth+1, useColor)
+		}
+	case *SwitchStatement:
+		for _, arm := range v.Arms {
+			if arm == nil {
+				continue
+			}
+			if arm.Body != nil {
+				for _, s := range arm.Body.Statements {
+					printASTNode(s, depth+1, useColor)
+				}
+			}
+		}
 	case *BlockStatement:
 		for _, s := range v.Statements {
 			printASTNode(s, depth+1, useColor)
@@ -1482,6 +1644,10 @@ func nodeLabel(n Node) string {
 		return "ImportCStatement"
 	case *StructStatement:
 		return "StructStatement"
+	case *EnumStatement:
+		return "EnumStatement"
+	case *SwitchStatement:
+		return "SwitchStatement"
 	case *ExternCFuncStatement:
 		return "ExternCFuncStatement"
 	default:
@@ -1496,12 +1662,15 @@ func nodeSummary(n Node) string {
 	switch v := n.(type) {
 	case *FunctionStatement:
 		return " " + v.Name.String() + "(...)"
-	case *StructStatement:
-		if v.Name != nil {
-			return " " + v.Name.String()
+	case *StructStatement, *EnumStatement:
+		if st, ok := v.(*StructStatement); ok && st.Name != nil {
+			return " " + st.Name.String()
+		}
+		if en, ok := v.(*EnumStatement); ok && en.Name != nil {
+			return " " + en.Name.String()
 		}
 		return ""
-	case *IfStatement, *WhileStatement, *ForStatement, *BlockStatement:
+	case *IfStatement, *WhileStatement, *ForStatement, *BlockStatement, *SwitchStatement:
 		return ""
 	default:
 		return " " + n.String()

@@ -994,3 +994,146 @@ func (ecs *ExternCFuncStatement) String() string {
 	out.WriteString(";")
 	return out.String()
 }
+
+// === Enums ===
+
+// EnumVariant is a single variant of an enum declaration, e.g. `North`
+// (fieldless) or `Circle(f32)` (with a payload type list).
+type EnumVariant struct {
+	Name  *Identifier
+	Types []TypeExpr // payload types, e.g. [f32] for `Circle(f32)`; nil for fieldless
+}
+
+func (ev *EnumVariant) String() string {
+	if ev == nil || ev.Name == nil {
+		return ""
+	}
+	if len(ev.Types) == 0 {
+		return ev.Name.String()
+	}
+	types := make([]string, 0, len(ev.Types))
+	for _, t := range ev.Types {
+		types = append(types, t.String())
+	}
+	return ev.Name.String() + "(" + strings.Join(types, ", ") + ")"
+}
+
+// EnumStatement represents an enum declaration:
+//
+//	enum <identifier> {
+//	    <Variant>,
+//	    <Variant>(<type>, ...),
+//	    ...
+//	    fn <identifier>(self ^<type-of-enum>, ...) <type> {...}
+//	    static fn <identifier>(...) <type> {...}
+//	}
+//
+// Variants with payload types (e.g. `Circle(f32)`) become tagged-union
+// values in C; fieldless variants are plain C enum constants. Methods
+// (including `static fn` ones, distinguished via
+// FunctionStatement.IsStatic) are collected into Methods. Generics
+// (`enum Something:T { ... }`) are rejected during parsing with a clear
+// "not yet supported" diagnostic.
+type EnumStatement struct {
+	Token    Token // TOKEN_ENUM
+	Name     *Identifier
+	Variants []*EnumVariant
+	Methods  []*FunctionStatement
+	IsPub    bool
+}
+
+func (es *EnumStatement) statementNode()       {}
+func (es *EnumStatement) TokenLiteral() string { return es.Token.Literal }
+func (es *EnumStatement) String() string {
+	var out bytes.Buffer
+	if es.IsPub {
+		out.WriteString("pub ")
+	}
+	out.WriteString("enum ")
+	if es.Name != nil {
+		out.WriteString(es.Name.String())
+	}
+	out.WriteString(" {\n")
+	for _, v := range es.Variants {
+		if v == nil {
+			continue
+		}
+		out.WriteString("\t")
+		out.WriteString(v.String())
+		out.WriteString(",\n")
+	}
+	for _, m := range es.Methods {
+		if m == nil {
+			continue
+		}
+		if m.IsStatic {
+			out.WriteString("\tstatic ")
+		}
+		out.WriteString("\t")
+		out.WriteString(m.String())
+		out.WriteString("\n")
+	}
+	out.WriteString("}")
+	return out.String()
+}
+
+// === Switch ===
+
+// SwitchArm is one `=> { ... }` arm of a switch statement. Value is nil
+// for the default arm (`_ => { ... }`).
+type SwitchArm struct {
+	Value Expression // nil for the `_` default arm
+	Body  *BlockStatement
+}
+
+func (sa *SwitchArm) String() string {
+	var out bytes.Buffer
+	if sa.Value != nil {
+		out.WriteString(sa.Value.String())
+	} else {
+		out.WriteString("_")
+	}
+	out.WriteString(" => ")
+	if sa.Body != nil {
+		out.WriteString(sa.Body.String())
+	}
+	return out.String()
+}
+
+// SwitchStatement represents Tinoc's switch statement:
+//
+//	switch <expression> {
+//	    <value> => { ... }
+//	    <value> => { ... }
+//	    _       => { ... }
+//	}
+//
+// Values are integer/char literals or enum variant references
+// (`Direction.North`); `_` is the default arm. No fallthrough: each arm
+// is independent, matching syntax.md's notes.
+type SwitchStatement struct {
+	Token Token // TOKEN_SWITCH
+	Value Expression
+	Arms  []*SwitchArm
+}
+
+func (ss *SwitchStatement) statementNode()       {}
+func (ss *SwitchStatement) TokenLiteral() string { return ss.Token.Literal }
+func (ss *SwitchStatement) String() string {
+	var out bytes.Buffer
+	out.WriteString("switch ")
+	if ss.Value != nil {
+		out.WriteString(ss.Value.String())
+	}
+	out.WriteString(" {\n")
+	for _, arm := range ss.Arms {
+		if arm == nil {
+			continue
+		}
+		out.WriteString("\t")
+		out.WriteString(arm.String())
+		out.WriteString("\n")
+	}
+	out.WriteString("}")
+	return out.String()
+}
