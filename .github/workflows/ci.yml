@@ -52,3 +52,14 @@ jobs:
           if [ -f "$bin/tinoc.exe" ]; then "$bin/tinoc.exe" version; else "$bin/tinoc" version; fi
           echo "VERSION file: $(cat "$dir/VERSION")"
           echo "Installer smoke test passed"
+
+      - name: Smoke-test the PowerShell installer (-Local) on unix
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          dir="$RUNNER_TEMP/tinoc-smoke-ps1"
+          pwsh -NoProfile -Command "./install.ps1 -Local -Yes -Dir '$dir'"
+          "$dir/bin/tinoc" version
+          echo "VERSION file: $(cat "$dir/VERSION")"
+          echo "PowerShell installer smoke test passed"

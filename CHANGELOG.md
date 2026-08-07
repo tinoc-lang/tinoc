@@ -47,6 +47,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   interactive terminal (CI, piped input, cron) instead of aborting the whole
   install with an error — the binary still installs and manual PATH
   instructions are printed.
+- **Installers**: the update prompt now appears *before* the download starts,
+  so a declined update never wastes bandwidth on a full release download.
+- **install.ps1** now detects the real OS and architecture (linux/darwin/
+  windows × amd64/arm64) and installs the matching binary name, making it
+  fully cross-platform under PowerShell 7+ — matching `install.sh`. It also
+  prefers the repo's `build.sh` when running `-Local` on macOS/Linux.
+- **build.ps1**: OS/architecture detection now matches `build.sh`, so
+  `install.ps1 -Local` on macOS/Linux cross-targets correctly.
+- **install.sh**: archive binary discovery no longer relies on the GNU-only
+  `find -maxdepth`, which errored on macOS's BSD find; it also offers to
+  create a missing shell rc file when adding `~/.tinoc/bin` to PATH.
 
 ## [0.1.0] - 2026-08-05
 

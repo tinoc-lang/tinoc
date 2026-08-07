@@ -64,7 +64,11 @@ detect_arch() {
 # --- small helpers ---------------------------------------------------------
 has() { command -v "$1" >/dev/null 2>&1; }
 
-norm_version() { printf '%s\n' "$1" | sed 's/^[vV]//'; }
+norm_version() {
+    # Normalize to bare x.y.z and trim surrounding whitespace, so VERSION
+    # files written by hand or by older installers always compare cleanly.
+    printf '%s\n' "$1" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e 's/^[vV]//'
+}
 
 installed_version() {
     # Normalized to a bare x.y.z so comparisons stay correct even if an
@@ -200,25 +204,21 @@ install_binary() { # src_binary version [cleanup_dir] [local]
     exe="$(binary_name "$(detect_os)")"
     mkdir -p "$TINOC_HOME" "$TINOC_HOME/bin"
 
+    # Remote mode has already asked about updates before downloading (see
+    # cmd_remote); this block is a safety net for the same-version path, and
+    # local mode stays free of prompts entirely.
     local prev
     prev="$(installed_version)"
-    if [ "$mode" != "local" ] && [ -n "$prev" ]; then
-        if [ "$prev" = "$version" ]; then
-            if [ "$FORCE" != "1" ]; then
-                rm -rf "${3:-}"
-                ok "tinoc v${version} is already installed (${TINOC_HOME}/bin/${exe})"
-                info "Nothing to do — run './install.sh --force' to reinstall"
-                exit 0
-            fi
-            step "Reinstalling tinoc v${version}"
-        else
-            warn "New version available: v${version} (installed v${prev})"
-            if ! confirm "Update tinoc from v${prev} to v${version}?"; then
-                rm -rf "${3:-}"
-                info "Aborted — keeping v${prev}"
-                exit 0
-            fi
-        fi
+    if [ "$mode" != "local" ] && [ -n "$prev" ] && [ "$prev" = "$version" ] && [ "$FORCE" != "1" ]; then
+        rm -rf "${3:-}"
+        ok "tinoc v${version} is already installed (${TINOC_HOME}/bin/${exe})"
+        info "Nothing to do — run './install.sh --force' to reinstall"
+        exit 0
+    fi
+    if [ -n "$prev" ] && [ "$prev" != "$version" ]; then
+        step "Updating tinoc v${prev} -> v${version}"
+    elif [ "$FORCE" = "1" ] && [ -n "$prev" ] && [ "$prev" = "$version" ]; then
+        step "Reinstalling tinoc v${version}"
     fi
 
     info "Installing tinoc v${version}"
@@ -241,6 +241,7 @@ install_binary() { # src_binary version [cleanup_dir] [local]
     if "${TINOC_HOME}/bin/${exe}" version >/dev/null 2>&1; then
         ok "Installed tinoc v${version} -> ${TINOC_HOME}/bin/${exe}"
     else
+        rm -rf "${3:-}"
         error "Installed binary failed to run — the release may be corrupt"
         exit 1
     fi
@@ -252,14 +253,24 @@ maybe_setup_path() {
     if path_has "$bin_dir"; then return; fi
 
     step "${bin_dir} is not on your PATH"
-    local rc=""
+    local rc="" rc_dir="" writable=0
     case "${SHELL:-}" in
         *fish) rc="$HOME/.config/fish/config.fish" ;;
         *zsh)  rc="$HOME/.zshrc" ;;
         *)     rc="$HOME/.bashrc" ;;
     esac
+    rc_dir="$(dirname "$rc")"
 
-    if [ -w "$rc" ] && confirm "Add '${bin_dir}' to your PATH in ${rc}?"; then
+    # Offer to write the rc file even when it does not exist yet (fresh
+    # shells), as long as its directory is writable.
+    if [ -f "$rc" ]; then
+        [ -w "$rc" ] && writable=1
+    elif [ -d "$rc_dir" ]; then
+        [ -w "$rc_dir" ] && writable=1
+    fi
+
+    if [ "$writable" = "1" ] && confirm "Add '${bin_dir}' to your PATH in ${rc}?"; then
+        if [[ "$rc" == *fish ]]; then mkdir -p "$rc_dir"; fi
         {
             printf '\n# tinoc\n'
             if [[ "$rc" == *fish ]]; then
@@ -320,13 +331,23 @@ cmd_remote() {
     asset="$(asset_name "$os" "$arch")"
     base="${TINOC_DOWNLOAD_BASE%/}/${TINOC_REPO}/releases/download/${tag}"
 
-    # If the requested version is already installed, skip the download.
+    # Version resolution: if the requested version is already installed we
+    # exit before downloading anything; if a *different* version is
+    # installed, ask before downloading so a declined update never wastes
+    # bandwidth.
     local prev
     prev="$(installed_version)"
-    if [ "$FORCE" != "1" ] && [ -n "$prev" ] && [ "$prev" = "$version" ]; then
-        ok "tinoc v${version} is already installed (${TINOC_HOME}/bin/$(binary_name "$os"))"
-        info "Nothing to do — run './install.sh --force' to reinstall"
-        exit 0
+    if [ "$FORCE" != "1" ] && [ -n "$prev" ]; then
+        if [ "$prev" = "$version" ]; then
+            ok "tinoc v${version} is already installed (${TINOC_HOME}/bin/$(binary_name "$os"))"
+            info "Nothing to do — run './install.sh --force' to reinstall"
+            exit 0
+        fi
+        warn "Update available: v${version} (installed v${prev})"
+        if ! confirm "Update tinoc from v${prev} to v${version}?"; then
+            info "Aborted — keeping v${prev}"
+            exit 0
+        fi
     fi
 
     info "Fetching tinoc v${version} from GitHub"
@@ -373,10 +394,17 @@ cmd_remote() {
     esac
 
     # The archive contains a binary named tinoc-<os>-<arch>[.exe]; installed
-    # as a plain tinoc/tinoc.exe under $TINOC_HOME/bin.
-    bin_dir="$(find "${tmp}/x" -maxdepth 1 -type f -name 'tinoc-*' 2>/dev/null | head -n 1)"
+    # as a plain tinoc/tinoc.exe under $TINOC_HOME/bin. Globs are used here
+    # instead of `find -maxdepth`, which is a GNU extension and errors out
+    # on the BSD find shipped with macOS.
+    bin_dir=""
+    for c in "${tmp}"/x/tinoc-* "${tmp}"/x/*/tinoc-*; do
+        [ -f "$c" ] && bin_dir="$c" && break
+    done
     if [ -z "$bin_dir" ]; then
-        bin_dir="$(find "${tmp}/x" -maxdepth 2 -type f -name 'tinoc*' 2>/dev/null | head -n 1)"
+        for c in "${tmp}"/x/tinoc* "${tmp}"/x/*/tinoc*; do
+            [ -f "$c" ] && bin_dir="$c" && break
+        done
     fi
     if [ -z "$bin_dir" ]; then
         rm -rf "$tmp"

@@ -70,6 +70,9 @@ The installers (`install.sh` / `install.ps1`) are companions to
   for updates and **asks before upgrading**.
 - `--local` builds from source with `./build.sh build` (or `./build.ps1 build`)
   and installs the local binary instead of downloading.
+- `install.ps1` is fully cross-platform too: it detects the OS/architecture
+  just like `install.sh`, so it works on macOS/Linux with PowerShell 7+ as
+  well as on Windows.
 - Offer to add `~/.tinoc/bin` to your `PATH` after installing.
 
 Common flags: `--check` (compare installed vs latest), `--uninstall`,

@@ -46,18 +46,32 @@ function Write-Kv   ($k, $v) { if ($UseColor) { Write-Host ("  {0,-10}" -f $k) -
 
 function Get-TargetOS {
     if ($env:GOOS) { return $env:GOOS }
+    if ($IsLinux)  { return "linux" }
+    if ($IsMacOS)  { return "darwin" }
     return "windows"
 }
 
 function Get-TargetArch {
     if ($env:GOARCH) { return $env:GOARCH }
-    $arch = $env:PROCESSOR_ARCHITECTURE
-    if ($arch -eq "ARM64") { return "arm64" }
-    if ([Environment]::Is64BitOperatingSystem) { return "amd64" }
-    return "386"
+    # Windows: PROCESSOR_ARCHITECTURE reflects the machine (AMD64/ARM64/ARM).
+    if ($env:PROCESSOR_ARCHITECTURE) {
+        if ($env:PROCESSOR_ARCHITECTURE -eq "ARM64") { return "arm64" }
+        if ($env:PROCESSOR_ARCHITECTURE -eq "ARM")   { return "arm" }
+        return "amd64"
+    }
+    # Unix (PowerShell 7+): ask the runtime directly.
+    switch ([System.Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture.ToString()) {
+        "Arm64" { return "arm64" }
+        "Arm"   { return "arm" }
+        "X86"   { return "386" }
+        default { return "amd64" }
+    }
 }
 
-function Get-BinaryName { return "tinoc.exe" } # PowerShell flow targets Windows
+function Get-BinaryName($os) {
+    if ($os -eq "windows") { return "tinoc.exe" }
+    return "tinoc"
+}
 
 function Get-AssetName($os, $arch) {
     if ($os -eq "windows") { return "tinoc-$os-$arch.zip" }
@@ -144,27 +158,24 @@ function Update-PathMaybe {
 # $localMode for -Local builds: the fresh binary is always installed (no
 # version comparison, no prompt).
 function Install-TinocBinary($src, $version, $cleanupDir, $localMode = $false) {
+    $exe = Get-BinaryName (Get-TargetOS)
     $binDir = Join-Path $script:TinocHome "bin"
     New-Item -ItemType Directory -Force -Path $binDir | Out-Null
 
+    # Remote mode has already asked about updates before downloading (see
+    # Invoke-Remote); this block is a safety net for the same-version path,
+    # and -Local stays free of prompts entirely.
     $prev = Get-InstalledVersion
-    if (-not $localMode -and $prev) {
-        if ($prev -eq $version) {
-            if (-not $script:Force) {
-                if ($cleanupDir) { Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $cleanupDir }
-                Write-Ok "tinoc v$version is already installed ($binDir\tinoc.exe)"
-                Write-Info "Nothing to do - run './install.ps1 -Force' to reinstall"
-                exit 0
-            }
-            Write-Step "Reinstalling tinoc v$version"
-        } else {
-            Write-Warn "New version available: v$version (installed v$prev)"
-            if (-not (Confirm-Tinoc "Update tinoc from v$prev to v$version?")) {
-                if ($cleanupDir) { Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $cleanupDir }
-                Write-Info "Aborted - keeping v$prev"
-                exit 0
-            }
-        }
+    if (-not $localMode -and $prev -and ($prev -eq $version) -and (-not $script:Force)) {
+        if ($cleanupDir) { Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $cleanupDir }
+        Write-Ok "tinoc v$version is already installed ($(Join-Path $binDir $exe))"
+        Write-Info "Nothing to do - run './install.ps1 -Force' to reinstall"
+        exit 0
+    }
+    if ($prev -and ($prev -ne $version)) {
+        Write-Step "Updating tinoc v$prev -> v$version"
+    } elseif ($script:Force -and $prev -and ($prev -eq $version)) {
+        Write-Step "Reinstalling tinoc v$version"
     }
 
     Write-Info "Installing tinoc v$version"
@@ -172,21 +183,22 @@ function Install-TinocBinary($src, $version, $cleanupDir, $localMode = $false) {
     New-Item -ItemType Directory -Force -Path $tmp | Out-Null
 
     try {
-        Copy-Item -Path $src -Destination (Join-Path $tmp "tinoc.exe") -Force
-        Move-Item -Path (Join-Path $tmp "tinoc.exe") -Destination (Join-Path $binDir "tinoc.exe") -Force
+        Copy-Item -Path $src -Destination (Join-Path $tmp $exe) -Force
+        Move-Item -Path (Join-Path $tmp $exe) -Destination (Join-Path $binDir $exe) -Force
         Set-Content -Path (Join-Path $script:TinocHome "VERSION") -Value $version -NoNewline
     } catch {
-        Write-ErrLine "Failed to install binary to $binDir\tinoc.exe"
+        Write-ErrLine "Failed to install binary to $(Join-Path $binDir $exe)"
         exit 1
     } finally {
         Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $tmp
     }
 
-    $installed = Join-Path $binDir "tinoc.exe"
+    $installed = Join-Path $binDir $exe
     & $installed version *> $null
     if ($LASTEXITCODE -eq 0) {
         Write-Ok "Installed tinoc v$version -> $installed"
     } else {
+        if ($cleanupDir) { Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $cleanupDir }
         Write-ErrLine "Installed binary failed to run - the release may be corrupt"
         exit 1
     }
@@ -216,12 +228,21 @@ function Invoke-Remote {
     $asset = Get-AssetName $os $arch
     $base = "$($script:DownloadBase.TrimEnd('/'))/$($script:TinocRepo)/releases/download/$tag"
 
-    # If the requested version is already installed, skip the download.
+    # Version resolution: if the requested version is already installed we
+    # exit before downloading anything; if a *different* version is
+    # installed we ask first, so a declined update never wastes bandwidth.
     $prev = Get-InstalledVersion
-    if (-not $script:Force -and $prev -and ($prev -eq $version)) {
-        Write-Ok "tinoc v$version is already installed ($(Join-Path $script:TinocHome 'bin\tinoc.exe'))"
-        Write-Info "Nothing to do - run './install.ps1 -Force' to reinstall"
-        exit 0
+    if (-not $script:Force -and $prev) {
+        if ($prev -eq $version) {
+            Write-Ok "tinoc v$version is already installed ($(Join-Path $script:TinocHome (Join-Path 'bin' (Get-BinaryName $os))))"
+            Write-Info "Nothing to do - run './install.ps1 -Force' to reinstall"
+            exit 0
+        }
+        Write-Warn "Update available: v$version (installed v$prev)"
+        if (-not (Confirm-Tinoc "Update tinoc from v$prev to v$version?")) {
+            Write-Info "Aborted - keeping v$prev"
+            exit 0
+        }
     }
 
     Write-Info "Fetching tinoc v$version from GitHub"
@@ -297,14 +318,13 @@ function Invoke-Local {
     }
 
     Write-Info "Building tinoc from source"
-    if (Test-Path "build.ps1") {
-        ./build.ps1 build
+    if ($IsLinux -or $IsMacOS) {
+        if (Test-Path "build.sh") { & bash ./build.sh build } else { ./build.ps1 build }
     } else {
-        Write-Warn "Windows: run './install.ps1 -Local' for the PowerShell flow"
-        ./build.sh build
+        if (Test-Path "build.ps1") { ./build.ps1 build } else { & bash ./build.sh build }
     }
 
-    $bin = Join-Path "build" "tinoc.exe"
+    $bin = Join-Path "build" (Get-BinaryName (Get-TargetOS))
     if (-not (Test-Path $bin)) {
         Write-ErrLine "Build did not produce $bin"
         exit 1
@@ -365,7 +385,7 @@ function Show-Help {
     Write-Host "  ./install.ps1 [flags]"
     Write-Host ""
     Write-Host "Flags:"
-    Write-Host "  -Local         Build with ./build.ps1 build and install the local binary"
+    Write-Host "  -Local         Build from source (build.ps1/build.sh) and install the local binary"
     Write-Host "  -Check         Compare installed version with the latest release, make no changes"
     Write-Host "  -Uninstall     Remove the entire TINOC_HOME install"
     Write-Host "  -Version       Install a specific release version (e.g. -Version 0.1.0)"
