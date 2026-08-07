@@ -267,6 +267,8 @@ func (p *Parser) parseStatement() Statement {
 		return p.parseStructStatement()
 	case TOKEN_ENUM:
 		return p.parseEnumStatement()
+	case TOKEN_UNION:
+		return p.parseUnionStatement()
 	case TOKEN_SWITCH:
 		return p.parseSwitchStatement()
 	case TOKEN_PUB:
@@ -554,6 +556,14 @@ func (p *Parser) parsePubStatement() Statement {
 		}
 		return stmt
 	}
+	if p.peekTokenIs(TOKEN_UNION) {
+		p.nextToken()
+		stmt := p.parseUnionStatement()
+		if u, ok := stmt.(*UnionStatement); ok {
+			u.IsPub = true
+		}
+		return stmt
+	}
 	// `pub const` / `pub var` / `pub struct` etc. reuse the same
 	// declaration parsers; the pub-ness itself isn't tracked on those
 	// nodes yet since this is a partial AST.
@@ -656,6 +666,74 @@ func (p *Parser) parseStructStatement() Statement {
 			// Stray semicolon inside a struct body; skip silently.
 		default:
 			if field := p.parseStructField(); field != nil {
+				stmt.Fields = append(stmt.Fields, field)
+			}
+		}
+		p.nextToken()
+	}
+
+	return stmt
+}
+
+// parseUnionStatement handles a union declaration:
+//
+//	union <Name> {
+//	    <field> <type>;
+//	    ...
+//	    fn <method>(self ^<Name>, ...) <type> {...}
+//	    static fn <method>(...) <type> {...}
+//	}
+//
+// Fields are `name type;` lines (all sharing one memory location at
+// runtime, per C union semantics); method lines start with `fn` (or
+// `static fn`), mirroring struct bodies exactly. Generic union headers
+// (`union Pair:T {` and `union Map:(K, V) {`) are recognized and
+// rejected with a clear "not yet supported" diagnostic, but the generic
+// args are still consumed so parsing can continue past them.
+func (p *Parser) parseUnionStatement() Statement {
+	stmt := &UnionStatement{Token: p.curToken}
+
+	if !p.expectPeek(TOKEN_IDENT) {
+		return nil
+	}
+	stmt.Name = &Identifier{Token: p.curToken, Value: p.curToken.Literal}
+
+	// Reject generic union headers: `union Pair:T {` / `union Map:(K, V) {`.
+	if p.peekTokenIs(TOKEN_COLON) {
+		p.nextToken() // consume ':'
+		if p.peekTokenIs(TOKEN_LPAREN) {
+			p.nextToken() // consume '('
+			p.parseIdentList(TOKEN_RPAREN)
+		} else if p.peekTokenIs(TOKEN_IDENT) {
+			p.nextToken()
+		}
+		p.addError("generic unions are not yet supported (%s)", stmt.Name.Value)
+	}
+
+	if !p.expectPeek(TOKEN_LBRACE) {
+		return nil
+	}
+	p.nextToken() // consume '{'
+
+	for !p.curTokenIs(TOKEN_RBRACE) && !p.curTokenIs(TOKEN_EOF) {
+		switch p.curToken.Type {
+		case TOKEN_FN:
+			if m, ok := p.parseFunctionStatement(false).(*FunctionStatement); ok {
+				stmt.Methods = append(stmt.Methods, m)
+			}
+		case TOKEN_STATIC:
+			p.nextToken() // consume 'static'
+			if p.curTokenIs(TOKEN_FN) {
+				if m, ok := p.parseFunctionStatement(true).(*FunctionStatement); ok {
+					stmt.Methods = append(stmt.Methods, m)
+				}
+			} else {
+				p.addError("expected 'fn' after 'static' inside union body, got %s (%q)", p.curToken.Type, p.curToken.Literal)
+			}
+		case TOKEN_SEMICOLON:
+			// Stray semicolon inside a union body; skip silently.
+		default:
+			if field := p.parseUnionField(); field != nil {
 				stmt.Fields = append(stmt.Fields, field)
 			}
 		}
@@ -803,8 +881,21 @@ func (p *Parser) parseSwitchStatement() Statement {
 // parseStructField parses a single `<name> <type>;` field line, starting
 // at curToken (the field name).
 func (p *Parser) parseStructField() *StructField {
+	return p.parseTypedField("struct")
+}
+
+// parseUnionField is parseStructField for union bodies; fields share the
+// same `name type;` shape (only the diagnostic wording differs).
+func (p *Parser) parseUnionField() *StructField {
+	return p.parseTypedField("union")
+}
+
+// parseTypedField is the shared implementation behind parseStructField /
+// parseUnionField: one `name type;` field line. body is the owning type
+// keyword ("struct"/"union") used in diagnostics.
+func (p *Parser) parseTypedField(body string) *StructField {
 	if !p.curTokenIs(TOKEN_IDENT) {
-		p.addError("expected field name inside struct body, got %s (%q)", p.curToken.Type, p.curToken.Literal)
+		p.addError("expected field name inside %s body, got %s (%q)", body, p.curToken.Type, p.curToken.Literal)
 		return nil
 	}
 	field := &StructField{Name: &Identifier{Token: p.curToken, Value: p.curToken.Literal}}

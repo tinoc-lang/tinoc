@@ -706,3 +706,91 @@ fn main() void {
 		t.Fatalf("expected exit 11 (content-based str equality), got %d", code)
 	}
 }
+
+func TestCodegen_UnionTypePunning(t *testing.T) {
+	_, code := runMainWithExit(t, `
+union Data {
+	as_int i32;
+	as_float f32;
+}
+
+fn main() void {
+	var d Data;
+	// 0x3F800000 is the IEEE-754 single-precision bits of 1.0f; the
+	// union shares one memory location, so as_float reads 1.0.
+	d.as_int = 1065353216;
+	var f f32 = d.as_float;
+	if f > 0.99 and f < 1.01 {
+		tinoc_exit(11);
+	} else {
+		tinoc_exit(1);
+	}
+}
+`)
+	if code != 11 {
+		t.Fatalf("expected exit 11 (union type punning int->float), got %d", code)
+	}
+}
+
+func TestCodegen_UnionStaticMethod(t *testing.T) {
+	_, code := runMainWithExit(t, `
+union Data {
+	as_int i32;
+	as_float f32;
+
+	static fn make(v f32) Data {
+		var d Data;
+		d.as_float = v;
+		return d;
+	}
+}
+
+fn main() void {
+	var d Data = Data.make(2.5);
+	// 0x40200000 is the IEEE-754 bits of 2.5f.
+	if d.as_int == 1075838976 {
+		tinoc_exit(12);
+	} else {
+		tinoc_exit(1);
+	}
+}
+`)
+	if code != 12 {
+		t.Fatalf("expected exit 12 (union static method + bit check), got %d", code)
+	}
+}
+
+func TestCodegen_UnionInstanceMethod(t *testing.T) {
+	_, code := runMainWithExit(t, `
+union Data {
+	as_int i32;
+
+	fn bump(self ^Data) void {
+		self^.as_int = self^.as_int + 1;
+	}
+
+	fn zero(self ^Data) void {
+		self^.as_int = 0;
+	}
+}
+
+fn main() void {
+	var d Data;
+	d.as_int = 5;
+	d.bump();
+	if d.as_int == 6 {
+		d.zero();
+		if d.as_int == 0 {
+			tinoc_exit(13);
+		} else {
+			tinoc_exit(1);
+		}
+	} else {
+		tinoc_exit(1);
+	}
+}
+`)
+	if code != 13 {
+		t.Fatalf("expected exit 13 (union instance methods), got %d", code)
+	}
+}

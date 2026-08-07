@@ -19,9 +19,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `_` arm needed) with pattern binding — `Shape.Rect(w, h) => { ... }`
   binds the payload fields directly; `_` wildcards discard a payload
   slot. Missing-return analysis understands exhaustive enum switches.
+- **Unions**: `union Name { field type; ... }` with C-style shared-memory
+  fields — writing `as_int` and reading `as_float` reinterprets the same
+  bytes (IEEE-754 punning works end-to-end). Unions reuse struct field
+  syntax, support instance methods (`self ^Name`) and static methods,
+  and reject comparisons/arithmetic with clear diagnostics. Generic
+  unions (`union Pair:T`) are rejected with a "not yet supported"
+  diagnostic, matching structs/enums.
 - **Samples**: `samples/14_enum_basics.tnc` through
   `samples/17_str_strings.tnc` covering fieldless enums, tagged unions
-  with pattern matching, enum methods, and `str` semantics.
+  with pattern matching, enum methods, and `str` semantics, plus
+  `samples/18_combo.tnc`, which exercises structs, enums (pattern
+  matching), unions (type punning), `str`, `switch`, and methods all in
+  one program.
 
 - **Installers**: `install.sh` / `install.ps1` fetch the latest GitHub release,
   verify it against the release `SHA256SUMS` manifest, and extract it into
@@ -40,6 +50,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Compiler**: calling an instance method that was declared without a
+  `self` parameter (e.g. `fn make() Data { ... }` inside a struct/union
+  body, invoked as `d.make()`) previously panicked with an
+  index-out-of-range error; it now reports a proper "needs a self
+  parameter" diagnostic.
 - **str**: `<`, `>`, `<=`, `>=` on `str` are now rejected with a clear
   diagnostic (only `==`/`!=` are defined, via content comparison) instead
   of emitting invalid C. Switching on a `str` is likewise a proper

@@ -92,12 +92,12 @@ What the compiler supports end-to-end in the current release:
 | `struct` + methods | ✅ | Fields, struct literals (`Point { .x = 1.0 }`), instance methods (`self ^Point`), static methods, by-value copy/params/returns |
 | `enum` + methods | ✅ | Fieldless variants (`Direction.North`) and tagged unions with payloads (`Shape.Circle(r)`); instance/static methods; exhaustive `switch` with pattern binding (`Shape.Rect(w, h) =>`) |
 | `switch` | ✅ | Enum variants (exhaustive, no `_` needed), integer/char literals, `_` default arm; pattern-binding arms for tagged-union payloads |
-| Pointers | ✅ | `^T`, `&x`, `x^` deref, pointers to structs/enums, `self^.x` → `self->x` |
+| Pointers | ✅ | `^T`, `&x`, `x^` deref, pointers to structs/enums/unions, `self^.x` → `self->x` |
 | Control flow | ✅ | `if` / `else if` / `else`, `while`, `for 0..10 |i|`, `break`, `continue` |
 | Literals & operators | ✅ | Integer (all bases, `_` separators), float, string, char, bool; arithmetic/comparison/logical/bitwise; content-based `str ==`/`!=` |
 | C interop | ✅ | `#importc "header.h" as alias;` (clang/gcc parsing) and `extern "C" fn` declarations |
 | Generic functions / structs | ❌ | `fn foo:T(...)`, `struct Pair:T` — rejected with a clear "not yet supported" diagnostic |
-| `union` | ❌ | Planned |
+| `union` + methods | ✅ | C-style shared-memory fields (`as_int`/`as_float` reinterpret the same bytes); instance methods (`self ^Name`), static methods |
 | Arrays / slices | ❌ | `[N]T`, `[]T`, `for coll |x|` — planned |
 | Optionals / error unions | ❌ | `?T`, `!T`, `orelse`, `catch` — planned |
 | Standard library (`std.io`, ...) | ❌ | Module system is next after the type system |
