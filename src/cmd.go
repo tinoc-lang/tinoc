@@ -11,6 +11,13 @@ import (
 
 const (
 	CompilerName = "tinoc"
+
+	// Project metadata shown by `tinoc version` and `tinoc help` so the
+	// CLI itself points at the repository, creator, website, and license.
+	RepoURL       = "https://github.com/tinoc-lang/tinoc"
+	CreatorGitHub = "https://github.com/pbarot2009"
+	Website       = "https://tinoc-lang.vercel.app"
+	LicenseName   = "Apache-2.0"
 )
 
 // Version is the compiler version. build.sh / build.ps1 override it at link
@@ -415,6 +422,14 @@ func runCompilerPipeline(mode string, config PipelineConfig) {
 	}
 
 	outName := determineOutputName(config)
+
+	// `tinoc run` without an explicit -o is throwaway by design: the
+	// binary is written inside the scratch work directory and removed as
+	// soon as the program finishes, so nothing is left in the user's
+	// working directory. `tinoc build` (and `run -o <path>`) keep the
+	// binary at the requested location.
+	ephemeral := mode == "run" && config.OutputPath == ""
+
 	stage(useColor, "BUILD", "compiling generated C -> %s", outName)
 	if useColor {
 		fmt.Printf("  %susing%s %s%s%s %s(%s)%s\n", colorDim, colorReset, colorCyan, cc.Name, colorReset, colorDim, cc.Path, colorReset)
@@ -425,7 +440,7 @@ func runCompilerPipeline(mode string, config PipelineConfig) {
 		fmt.Printf("  %s\n", cc.Version)
 	}
 
-	binPath, err := compileGeneratedC(cc, config.FilePath, cCode, outName, config.Verbose, useColor)
+	binPath, workDir, err := compileGeneratedC(cc, config.FilePath, cCode, outName, ephemeral, config.Verbose, useColor)
 	if err != nil {
 		fail(useColor, "%v", err)
 		os.Exit(1)
@@ -436,36 +451,59 @@ func runCompilerPipeline(mode string, config PipelineConfig) {
 		stage(useColor, "EXECUTE", "running %s", binPath)
 		fmt.Println()
 		exitCode := runBinary(binPath)
+		// The scratch dir holds the generated C and (in run mode) the
+		// binary itself; drop it now that the program has finished.
+		os.RemoveAll(workDir)
 		if exitCode != 0 {
 			fmt.Println()
 			fail(useColor, "program exited with status %d", exitCode)
 			os.Exit(exitCode)
 		}
+		return
 	}
+
+	// build mode keeps the binary at binPath; only the scratch C work
+	// directory is temporary.
+	os.RemoveAll(workDir)
 }
 
 // compileGeneratedC writes the generated C source and the embedded
 // tinoc.h runtime header into a temporary work directory, then invokes
 // the discovered C compiler to produce outName. Returns the path to the
 // compiled binary (made absolute so `run` can exec it regardless of the
-// working directory).
-func compileGeneratedC(cc *CCompiler, sourcePath, cCode, outName string, verbose, useColor bool) (string, error) {
-	workDir, err := os.MkdirTemp("", "tinoc-build-*")
+// working directory) together with the scratch work directory, which the
+// caller is responsible for removing once the binary is no longer needed.
+//
+// When ephemeral is true (`tinoc run` without -o) the binary itself is
+// written inside the scratch directory so nothing remains after the
+// program finishes; otherwise it is written to outName and kept. On any
+// failure the scratch directory is removed here before the error returns.
+func compileGeneratedC(cc *CCompiler, sourcePath, cCode, outName string, ephemeral, verbose, useColor bool) (binPath, workDir string, err error) {
+	workDir, err = os.MkdirTemp("", "tinoc-build-*")
 	if err != nil {
-		return "", fmt.Errorf("cannot create build work directory: %w", err)
+		return "", "", fmt.Errorf("cannot create build work directory: %w", err)
 	}
+	defer func() {
+		if err != nil {
+			os.RemoveAll(workDir)
+		}
+	}()
 
 	base := strings.TrimSuffix(filepath.Base(sourcePath), filepath.Ext(sourcePath))
 	cFile := filepath.Join(workDir, base+".c")
-	if err := os.WriteFile(cFile, []byte(cCode), 0o644); err != nil {
-		return "", fmt.Errorf("cannot write generated C to %s: %w", cFile, err)
+	if err = os.WriteFile(cFile, []byte(cCode), 0o644); err != nil {
+		return "", "", fmt.Errorf("cannot write generated C to %s: %w", cFile, err)
 	}
-	if err := os.WriteFile(filepath.Join(workDir, "tinoc.h"), []byte(RuntimeHeader), 0o644); err != nil {
-		return "", fmt.Errorf("cannot write tinoc.h runtime header: %w", err)
+	if err = os.WriteFile(filepath.Join(workDir, "tinoc.h"), []byte(RuntimeHeader), 0o644); err != nil {
+		return "", "", fmt.Errorf("cannot write tinoc.h runtime header: %w", err)
 	}
 
 	outPath := outName
-	if !filepath.IsAbs(outPath) {
+	if ephemeral {
+		// run mode without -o: keep the binary inside the scratch dir so
+		// nothing lands in the user's working directory.
+		outPath = filepath.Join(workDir, filepath.Base(outName))
+	} else if !filepath.IsAbs(outPath) {
 		if abs, err := filepath.Abs(outPath); err == nil {
 			outPath = abs
 		}
@@ -487,11 +525,11 @@ func compileGeneratedC(cc *CCompiler, sourcePath, cCode, outName string, verbose
 	cmd := exec.Command(cc.Path, args...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	if err := cmd.Run(); err != nil {
-		return "", fmt.Errorf("%s failed to compile generated C: %w", cc.Name, err)
+	if err = cmd.Run(); err != nil {
+		return "", "", fmt.Errorf("%s failed to compile generated C: %w", cc.Name, err)
 	}
 
-	return outPath, nil
+	return outPath, workDir, nil
 }
 
 // runBinary executes the compiled program, forwarding stdio directly so
@@ -525,12 +563,26 @@ func determineOutputName(config PipelineConfig) string {
 // Help Screens & Version Info
 //
 
+// printVersion prints the compiler name/version plus project metadata
+// (repository, creator, website, license) so `tinoc version` doubles as a
+// quick reference for where the project lives and who maintains it.
 func printVersion() {
 	if !supportsColor() {
 		fmt.Printf("%s version %s\n", CompilerName, Version)
-		return
+	} else {
+		fmt.Printf("\033[1m%s%s%s version %s%s%s\n", colorCyan, CompilerName, colorReset, colorGreen, Version, colorReset)
 	}
-	fmt.Printf("\033[1m%s%s%s version %s%s%s\n", colorCyan, CompilerName, colorReset, colorGreen, Version, colorReset)
+	printVersionMeta()
+}
+
+// printVersionMeta prints the shared project-metadata block (repository,
+// creator GitHub, website, license) used by `tinoc version` and the help
+// screens.
+func printVersionMeta() {
+	fmt.Printf("  repo:     %s\n", RepoURL)
+	fmt.Printf("  creator:  %s\n", CreatorGitHub)
+	fmt.Printf("  website:  %s\n", Website)
+	fmt.Printf("  license:  %s\n", LicenseName)
 }
 
 func printGlobalHelp() {
@@ -553,6 +605,12 @@ Global flags:
   -h, --help  Display CLI help information
 
 Run 'tinoc help <command>' for detailed flag usage on specific subcommands.
+
+Links:
+  Repository:  https://github.com/tinoc-lang/tinoc
+  Creator:     https://github.com/pbarot2009
+  Website:     https://tinoc-lang.vercel.app
+  License:     Apache-2.0
 `)
 		return
 	}
@@ -575,7 +633,13 @@ Run 'tinoc help <command>' for detailed flag usage on specific subcommands.
 	printFlagLine("-h, --help", "Display CLI help information")
 	fmt.Println()
 
-	fmt.Printf("%sRun 'tinoc help <command>' for detailed flag usage on specific subcommands.%s\n", colorDim, colorReset)
+	fmt.Printf("%sRun 'tinoc help <command>' for detailed flag usage on specific subcommands.%s\n\n", colorDim, colorReset)
+
+	fmt.Printf("%sLinks:%s\n", bold, colorReset)
+	printCommandLine(RepoURL, "GitHub repository")
+	printCommandLine(CreatorGitHub, "Creator's GitHub")
+	printCommandLine(Website, "Official website")
+	printCommandLine("Apache-2.0", "License")
 }
 
 func printCommandLine(name, desc string) {
@@ -625,6 +689,8 @@ Options:
 			fmt.Print(`Usage: tinoc run <file.tnc> [flags]
 
 Transpiles and compiles Tinoc code, then executes the binary immediately.
+The binary is written to a temporary directory and removed after execution,
+so no build artifacts are left behind. Pass -o to keep the binary.
 
 Options:
   -l, --lex       Stop after lexer stage
@@ -636,6 +702,8 @@ Options:
 		}
 		fmt.Printf("%sUsage:%s tinoc %srun%s <file.tnc> [flags]\n\n", bold, colorReset, colorCyan, colorReset)
 		fmt.Println("Transpiles and compiles Tinoc code, then executes the binary immediately.")
+		fmt.Println("The binary is written to a temporary directory and removed after execution,")
+		fmt.Println("so no build artifacts are left behind. Pass -o to keep the binary.")
 		fmt.Println()
 		fmt.Printf("%sOptions:%s\n", bold, colorReset)
 		printFlagLine("-l, --lex", "Stop after lexer stage")
@@ -653,6 +721,12 @@ Scans and type-checks the Tinoc source file without generating C or binary outpu
 		}
 		fmt.Printf("%sUsage:%s tinoc %scheck%s <file.tnc>\n\n", bold, colorReset, colorCyan, colorReset)
 		fmt.Println("Scans and type-checks the Tinoc source file without generating C or binary output.")
+
+	case "version":
+		fmt.Printf("%sUsage:%s tinoc %sversion%s\n\n", bold, colorReset, colorCyan, colorReset)
+		fmt.Println("Prints the compiler version and project information.")
+		fmt.Println()
+		printVersion()
 
 	default:
 		fail(useColor, "unknown command %q for 'tinoc help'", command)

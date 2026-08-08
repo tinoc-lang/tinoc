@@ -33,6 +33,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Docs**: `syntax.md`'s Array section (previously a placeholder) now
   documents arrays, slices, multidimensional arrays, and
   sentinel-terminated arrays with working examples.
+- **`tinoc version` / `tinoc help`**: the CLI now reports project
+  metadata — the GitHub repository (`tinoc-lang/tinoc`), the creator's
+  GitHub (`pbarot2009`), the official website, and the license — in
+  `tinoc version`, the `Links` section of `tinoc help`, and the new
+  `tinoc help version` screen.
 
 - **Enums**: `enum Name { Variant, Other(type), ... }` — fieldless
   variants compile to plain C enums; variants with payloads become
@@ -74,6 +79,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (where git used to check out CRLF).
 
 ### Fixed
+
+- **`tinoc run` no longer leaves binaries behind**: the compiled binary is
+  written to a temporary work directory and removed as soon as the
+  program finishes, so `tinoc run` leaves no artifacts in the working
+  directory (pass `-o <path>` to keep one). The generated-C scratch
+  directory is also cleaned up after both `build` and `run` — it
+  previously leaked in the system temp dir on every invocation.
 
 - **Float literals**: underscore digit separators (e.g. `1_000.5`) are now
   stripped before emission into C, so float literals with separators no
