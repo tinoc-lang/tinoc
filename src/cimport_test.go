@@ -72,6 +72,19 @@ func compileAndRunWithExitDecl(t *testing.T, source string) (string, int) {
 	return stdout.String(), exitCode
 }
 
+// requireHeaderDumper skips the test when no clang or gcc is available to
+// parse C headers, mirroring how requireCC skips the compile-and-run tests.
+// The #importc error tests below drive sema through a real header dump, so
+// without a working clang/gcc the expected diagnostic can never be produced
+// — failing hard there would break `ci` on machines without a C toolchain
+// (e.g. the Windows CI runner).
+func requireHeaderDumper(t *testing.T) {
+	t.Helper()
+	if _, err := findHeaderDumper(); err != nil {
+		t.Skipf("skipping: %v", err)
+	}
+}
+
 // === #importc ===
 
 func TestCImport_PrintfStringLiteral(t *testing.T) {
@@ -285,6 +298,7 @@ fn main() void {
 }
 
 func TestCImport_UndefinedMember(t *testing.T) {
+	requireHeaderDumper(t)
 	checkHasError(t, `
 #importc "stdio.h" as cio;
 
@@ -295,6 +309,7 @@ fn main() void {
 }
 
 func TestCImport_WrongArgCount(t *testing.T) {
+	requireHeaderDumper(t)
 	checkHasError(t, `
 #importc "stdio.h" as cio;
 
@@ -305,6 +320,7 @@ fn main() void {
 }
 
 func TestCImport_WrongArgType(t *testing.T) {
+	requireHeaderDumper(t)
 	// cio.stdout is a macro on macOS (the extern is __stdoutp), so it is
 	// not portable; the wrong-arg-type check works with fprintf instead.
 	checkHasError(t, `
@@ -318,6 +334,7 @@ fn main() void {
 }
 
 func TestCImport_DuplicateAlias(t *testing.T) {
+	requireHeaderDumper(t)
 	checkHasError(t, `
 #importc "stdio.h" as c;
 #importc "stdlib.h" as c;

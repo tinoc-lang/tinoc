@@ -91,6 +91,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **CI / C-interop tests**: the `#importc` error-checking tests
+  (`TestCImport_UndefinedMember`, `TestCImport_WrongArgCount`,
+  `TestCImport_WrongArgType`, `TestCImport_DuplicateAlias`) now skip when no
+  clang or gcc is available to parse C headers, matching the rest of the
+  suite (`requireCC`, `TestCImport_ExternVars`). Previously they hard-failed
+  on runners without a C toolchain — e.g. the Windows CI runner — which
+  broke `build.sh ci` / `build.ps1 ci` on both push and pull-request events.
+
 - **`tinoc run` no longer leaves binaries behind**: the compiled binary is
   written to a temporary work directory and removed as soon as the
   program finishes, so `tinoc run` leaves no artifacts in the working
