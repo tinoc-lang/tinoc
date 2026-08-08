@@ -69,6 +69,7 @@ var precedences = map[TokenType]precedence{
 	TOKEN_CARET: POSTFIX, // `^` binds as the pointer-dereference postfix (x^),
 	// so `a * self^.x` parses as `a * ((self^).x)`; binary xor (`^` as an
 	// infix) is reserved but never registered, so nothing is lost.
+	TOKEN_QUESTION: POSTFIX, // `?` binds as the optional-unwrap postfix (x?)
 
 	TOKEN_LSHIFT: SHIFT,
 	TOKEN_RSHIFT: SHIFT,

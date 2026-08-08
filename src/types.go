@@ -18,10 +18,11 @@ import (
 // fields, methods, and static methods), arrays (`[N]T` / `[_]T` /
 // `[N:x]T`), and slices (`[]T`) — everything var/const/static
 // var/static const/fn/struct need end-to-end. The remaining compound
-// types (enum/union), optionals, error unions, and generics are
-// recognized syntactically elsewhere in the AST but are not yet
-// resolved by Sema; referencing them here produces a clear "not yet
-// supported" diagnostic rather than a silent wrong answer.
+// types (enum/union), error unions, and generics are recognized
+// syntactically elsewhere in the AST but are not yet resolved by Sema;
+// referencing them here produces a clear "not yet supported"
+// diagnostic rather than a silent wrong answer. Optionals (`?T`) are
+// fully resolved and supported end-to-end.
 
 // TypeKind categorizes a resolved Type.
 type TypeKind int
@@ -40,7 +41,8 @@ const (
 	KindUnion
 	KindArray
 	KindSlice
-	KindUnknown // valid but not yet resolvable by this pass (optionals/etc)
+	KindOptional
+	KindUnknown // valid but not yet resolvable by this pass (error unions/etc)
 )
 
 // StructFieldInfo is a resolved struct field: its name and resolved type,
@@ -94,7 +96,8 @@ type Type struct {
 	// Float-specific.
 	FloatBits int // 32, 64, 128
 
-	// Pointer-specific.
+	// Pointer-/optional-specific: Elem is the pointed-to or payload type
+	// (^T -> Elem == T; ?T -> Elem == T).
 	Elem *Type
 
 	// Array-specific: ArraySize is the declared element count (0 means
@@ -125,10 +128,17 @@ func (t *Type) String() string {
 	if t == nil {
 		return "<nil>"
 	}
-	if t.Kind == KindPointer {
+	switch t.Kind {
+	case KindPointer:
 		return "^" + t.Elem.String()
+	case KindOptional:
+		if t.Elem == nil {
+			return "?"
+		}
+		return "?" + t.Elem.String()
+	default:
+		return t.Name
 	}
-	return t.Name
 }
 
 // CType returns the C11 type spelling to emit for this Type, per the
@@ -163,8 +173,15 @@ func (t *Type) CType() string {
 		// tinoc.h's tinoc_slice(T) macro expands to the fat-pointer
 		// struct `{ T* ptr; size_t len; }` from syntax.md. Codegen emits
 		// a named typedef per distinct slice type so function prototypes
-		// and definitions share one C type (see collectSliceTypes).
+		// and definitions share one C type (see collectAggregateTypeDefs).
 		return sliceTypeName(t)
+	case KindOptional:
+		// Codegen emits a named typedef per distinct optional type
+		// (`?i32` -> tnc_opt_i32) so every declaration of the same
+		// optional type shares one C struct type (see
+		// collectAggregateTypeDefs), matching the `{ T value; bool
+		// has_value; }` representation from syntax.md.
+		return optionalTypeName(t)
 	case KindStruct, KindEnum, KindUnion:
 		// Emitted as a typedef named after the type; sanitize so a name
 		// that collides with a C keyword still yields valid C.
@@ -240,7 +257,7 @@ func intRankForBits(bits int) *Type {
 }
 
 // typesEqual reports whether two resolved types are identical. Pointers
-// compare structurally (element types must also be equal).
+// and optionals compare structurally (element types must also be equal).
 func typesEqual(a, b *Type) bool {
 	if a == nil || b == nil {
 		return a == b
@@ -264,6 +281,8 @@ func typesEqual(a, b *Type) bool {
 		return a.HasSentinel == b.HasSentinel &&
 			(!a.HasSentinel || a.SentinelValue == b.SentinelValue)
 	case KindSlice:
+		return typesEqual(a.Elem, b.Elem)
+	case KindOptional:
 		return typesEqual(a.Elem, b.Elem)
 	case KindInt:
 		return a.Name == b.Name
@@ -293,6 +312,21 @@ func assignable(dst, src *Type) bool {
 	// (pointer-to-array) the tinoc_slice macro cannot express.
 	if dst.Kind == KindSlice && src.Kind == KindArray && src.Elem != nil && src.Elem.Kind != KindArray {
 		return typesEqual(dst.Elem, src.Elem)
+	}
+	// A payload value implicitly coerces to an optional of that type:
+	// `var x ?i32 = 42;`, `takes(42)` for `fn takes(o ?i32)`, `return 5;`
+	// from a `?i64` function. Sema marks the expression for codegen
+	// (optWraps) so the value is wrapped in a some-value optional.
+	// Optional-to-optional falls through to the structural equality
+	// check below (an existing optional passes through unchanged).
+	if dst.Kind == KindOptional && src.Kind != KindOptional && src.Kind != KindUnknown && src.Kind != KindInvalid {
+		return dst.Elem != nil && typesEqual(dst.Elem, src)
+	}
+	// The null literal initializes any optional: `var x ?i32 = null;`.
+	// Sema retypes the literal to the optional type so codegen emits an
+	// empty optional rather than C's NULL.
+	if dst.Kind == KindOptional && src.Kind == KindUnknown && src.Name == "null" {
+		return true
 	}
 	return typesEqual(dst, src)
 }
@@ -351,8 +385,24 @@ func (s *Sema) resolveTypeExpr(te TypeExpr) *Type {
 		s.diags.Error("sema", 0, 0, "generic types are not yet supported (%s)", t.String())
 		return nil
 	case *OptionalType:
-		s.diags.Error("sema", 0, 0, "optional types are not yet supported (%s)", t.String())
-		return nil
+		elem := s.resolveTypeExpr(t.Elem)
+		if elem == nil {
+			return nil
+		}
+		// An optional of a fixed-size array has no C representation in the
+		// `{ T value; bool has_value; }` wrapper (arrays cannot be struct
+		// members initialized by assignment); an optional view of
+		// collection data uses a slice, mirroring how arrays themselves
+		// are passed around.
+		if elem.Kind == KindArray {
+			s.diags.Error("sema", 0, 0, "optional of an array is not supported (%s) — use a slice (?[]%s) instead", t.String(), typeStringOrInvalid(elem.Elem))
+			return nil
+		}
+		if elem.Kind == KindVoid {
+			s.diags.Error("sema", 0, 0, "optional of void is not allowed (%s)", t.String())
+			return nil
+		}
+		return &Type{Kind: KindOptional, Elem: elem, Name: "?" + elem.Name}
 	case *ErrorUnionType:
 		s.diags.Error("sema", 0, 0, "error union types are not yet supported (%s)", t.String())
 		return nil
@@ -441,6 +491,45 @@ func sliceTypeName(t *Type) string {
 		return "tnc_slice_void"
 	}
 	return "tnc_slice_" + sanitizeCIdent(t.Elem.CType())
+}
+
+// optionalTypeName returns the C typedef name codegen emits for an
+// optional type, e.g. `?i32` -> "tnc_opt_i32", `?^i32` -> "tnc_opt_i32p",
+// `?[]i32` -> "tnc_opt_tnc_slice_i32". A named typedef (rather than an
+// anonymous struct) keeps every declaration of the same optional type
+// identical in C, which C requires for prototype/definition
+// compatibility, exactly as slices are handled.
+func optionalTypeName(t *Type) string {
+	if t == nil || t.Elem == nil {
+		return "tnc_opt_void"
+	}
+	return "tnc_opt_" + cTypeIdentSpelling(t.Elem.CType())
+}
+
+// cTypeIdentSpelling converts an arbitrary C type spelling into a valid C
+// identifier fragment for use inside generated typedef names. Unlike
+// sanitizeCIdent (which only guards C keywords), this handles C-type
+// punctuation: `i32*` -> "i32p", `str` -> "str", `struct Point` ->
+// "struct_Point".
+func cTypeIdentSpelling(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '_':
+			b.WriteRune(r)
+		case r == '*':
+			b.WriteString("p")
+		default:
+			b.WriteByte('_')
+		}
+	}
+	return b.String()
+}
+
+// isNullLiteral reports whether e is the `null` literal expression.
+func isNullLiteral(e Expression) bool {
+	_, ok := e.(*NullLiteral)
+	return ok
 }
 
 // cArrayTypeSpelling renders an array's *type-only* C spelling (element

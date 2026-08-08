@@ -63,6 +63,13 @@ type Codegen struct {
 	// anonymous struct at each use, which C treats as distinct types.
 	sliceTypeDefs []string
 
+	// optionalTypeDefs holds the named typedefs codegen emits for every
+	// optional type used in the program (`?i32` -> tnc_opt_i32). Same
+	// rationale as sliceTypeDefs: a named typedef keeps every
+	// prototype, definition and declaration of the same optional type
+	// identical in C (see collectOptionalTypes).
+	optionalTypeDefs []string
+
 	// sourceDir is the directory of the .tnc file, used to decide whether
 	// a #importc header is a local file (quote include) or a system header
 	// (angle include).
@@ -121,17 +128,20 @@ func (g *Codegen) Generate(prog *Program) string {
 		}
 	}
 
-	// Type pre-pass: emit every slice typedef, enum's, struct's and
-	// union's C type first (in source order), so function/method
-	// prototypes that mention them -- emitted later in the
-	// forward-decl block -- and every use in bodies sees a complete
-	// type. Slice typedefs come before enums/structs because struct
-	// fields and signatures commonly reference them. Enums are emitted
-	// before structs because struct fields commonly reference enum
-	// types; by-value struct payloads on enums still require the struct
-	// to be declared first, same as in C itself, and surface at C
-	// compile time.
+	// Type pre-pass: emit every slice and optional typedef, then enum's,
+	// struct's and union's C types first (in source order), so
+	// function/method prototypes that mention them -- emitted later in
+	// the forward-decl block -- and every use in bodies sees a complete
+	// type. Slice typedefs come first because struct fields and
+	// signatures commonly reference them and optional payloads can be
+	// slices; optional typedefs come next because struct and enum
+	// fields can themselves be optional. Enums are emitted before
+	// structs because struct fields commonly reference enum types;
+	// by-value struct payloads on enums still require the struct to be
+	// declared first, same as in C itself, and surface at C compile
+	// time.
 	g.collectSliceTypes(prog)
+	g.collectOptionalTypes(prog)
 	var types bytes.Buffer
 	main := &g.out
 	g.out = types
@@ -139,6 +149,12 @@ func (g *Codegen) Generate(prog *Program) string {
 		g.writeln("%s", td)
 	}
 	if len(g.sliceTypeDefs) > 0 {
+		g.writeln("")
+	}
+	for _, td := range g.optionalTypeDefs {
+		g.writeln("%s", td)
+	}
+	if len(g.optionalTypeDefs) > 0 {
 		g.writeln("")
 	}
 	for _, stmt := range prog.Statements {
@@ -730,7 +746,7 @@ func (g *Codegen) checkEmittable(t *Type, line, col int, what string) bool {
 		return true
 	}
 	if t.Kind == KindUnknown {
-		g.errorAt(line, col, "codegen: %s has an unsupported type (%s) — optional/error-union/generic codegen is not implemented yet", what, t.Name)
+		g.errorAt(line, col, "codegen: %s has an unsupported type (%s) — error-union/generic codegen is not implemented yet", what, t.Name)
 		return false
 	}
 	return true
@@ -1242,9 +1258,18 @@ func (g *Codegen) genSwitchPatternArm(arm *SwitchArm, value string) bool {
 
 // genExpr renders an expression as C. Expressions Sema accepted as an
 // implicit array -> slice conversion (sliceConvs) render as a
-// fat-pointer compound literal wrapping the array storage; everything
-// else goes through genExprNoConv.
+// fat-pointer compound literal wrapping the array storage; expressions
+// accepted as an implicit payload -> optional coercion (optWraps) render
+// wrapped in a some-value optional compound literal (or, for the null
+// literal, an empty optional); everything else goes through
+// genExprNoConv.
 func (g *Codegen) genExpr(e Expression) string {
+	if opt, ok := g.sema.optWraps[e]; ok && opt != nil && opt.Kind == KindOptional {
+		if _, isNull := e.(*NullLiteral); isNull {
+			return fmt.Sprintf("((%s){ .has_value = false })", optionalTypeName(opt))
+		}
+		return fmt.Sprintf("((%s){ .value = (%s), .has_value = true })", optionalTypeName(opt), g.genExprNoConv(e))
+	}
 	if g.sema.sliceConvs[e] {
 		return g.genAsSlice(e)
 	}
@@ -1471,7 +1496,7 @@ func (g *Codegen) collectSliceTypes(prog *Program) {
 			return
 		}
 		switch t.Kind {
-		case KindArray:
+		case KindArray, KindOptional:
 			register(t.Elem)
 		case KindSlice:
 			register(t.Elem) // nested slice elements first
@@ -1486,6 +1511,16 @@ func (g *Codegen) collectSliceTypes(prog *Program) {
 			}
 			g.sliceTypeDefs = append(g.sliceTypeDefs, fmt.Sprintf("typedef tinoc_slice(%s) %s;", elemC, name))
 		}
+	}
+	// Every var/const declaration — top-level and local — contributes
+	// its declared type, so a type used only in a local declaration
+	// still gets its typedef (e.g. `var s []i32` or `var o ?str` in a
+	// function body with no signature mention).
+	for _, t := range g.sema.declVarTypes {
+		register(t)
+	}
+	for _, t := range g.sema.declConstTypes {
+		register(t)
 	}
 	for _, stmt := range prog.Statements {
 		switch s := stmt.(type) {
@@ -1531,7 +1566,97 @@ func (g *Codegen) collectSliceTypes(prog *Program) {
 	}
 }
 
+func (g *Codegen) collectOptionalTypes(prog *Program) {
+	g.optionalTypeDefs = nil
+	seen := make(map[string]bool)
+	var register func(t *Type)
+	register = func(t *Type) {
+		if t == nil {
+			return
+		}
+		switch t.Kind {
+		case KindArray, KindSlice, KindOptional:
+			register(t.Elem) // nested element types first
+		}
+		if t.Kind != KindOptional {
+			return
+		}
+		name := optionalTypeName(t)
+		if seen[name] {
+			return
+		}
+		seen[name] = true
+		elemC := "void"
+		if t.Elem != nil {
+			elemC = t.Elem.CType()
+		}
+		g.optionalTypeDefs = append(g.optionalTypeDefs, fmt.Sprintf("typedef struct { %s value; bool has_value; } %s;", elemC, name))
+	}
+	// Every var/const declaration — top-level and local — contributes
+	// its declared type, so a type used only in a local declaration
+	// still gets its typedef (e.g. `var s []i32` or `var o ?str` in a
+	// function body with no signature mention).
+	for _, t := range g.sema.declVarTypes {
+		register(t)
+	}
+	for _, t := range g.sema.declConstTypes {
+		register(t)
+	}
+	for _, stmt := range prog.Statements {
+		switch s := stmt.(type) {
+		case *FunctionStatement:
+			if s.Name != nil {
+				if sym := g.sema.funcs[s.Name.Value]; sym != nil {
+					for _, p := range sym.Params {
+						register(p)
+					}
+					register(sym.ReturnType)
+				}
+			}
+		case *ExternCFuncStatement:
+			if s.Name != nil {
+				if sym := g.sema.externCFuncs[s.Name.Value]; sym != nil {
+					for _, p := range sym.Params {
+						register(p)
+					}
+					register(sym.ReturnType)
+				}
+			}
+		case *VarStatement:
+			register(g.sema.TypeOfVarDecl(s))
+		case *ConstStatement:
+			register(g.sema.TypeOfConstDecl(s))
+		case *StructStatement:
+			if s.Name != nil {
+				if st := g.sema.structTypes[s.Name.Value]; st != nil {
+					for _, f := range st.Fields {
+						register(f.Type)
+					}
+				}
+			}
+		case *UnionStatement:
+			if s.Name != nil {
+				if ut := g.sema.unionTypes[s.Name.Value]; ut != nil {
+					for _, f := range ut.Fields {
+						register(f.Type)
+					}
+				}
+			}
+		}
+	}
+}
+
+// collectOptionalTypes walks the same declarations as collectSliceTypes
+// and registers a named typedef for every distinct optional type used in
+// the program (`?i32` -> tnc_opt_i32, `?[]i32` -> tnc_opt_tnc_slice_i32,
+// `?^str` -> tnc_opt_strp). Typedefs are emitted after slice typedefs
+// (an optional payload can itself be a slice) and before enums/structs
+// (struct and enum fields can be optional), mirroring the slice typedef
+// pattern: a named typedef keeps every declaration of the same optional
+// type identical in C.
+
 // genIntegerLiteral re-emits an integer literal's original base/notation
+
 // (decimal, 0x, 0o -> converted to C's 0 octal form, 0b -> converted since
 // C99 has no binary literal syntax) with underscores stripped, since C
 // doesn't allow underscore digit separators.
@@ -1699,9 +1824,8 @@ func (g *Codegen) genPostfix(pe *PostfixExpression) string {
 	switch pe.Operator {
 	case "^": // pointer dereference
 		return "(*" + left + ")"
-	case "?": // optional unwrap — not yet backed by real optional codegen
-		g.errorAt(pe.Token.Line, pe.Token.Column, "codegen: optional unwrap is not yet supported")
-		return left
+	case "?": // optional unwrap — the optional is a C struct, so the payload is its `value` member
+		return "(" + left + ").value"
 	default:
 		g.errorAt(pe.Token.Line, pe.Token.Column, "codegen: unsupported postfix operator %q", pe.Operator)
 		return left
@@ -1735,11 +1859,32 @@ func (g *Codegen) genInfix(ie *InfixExpression) string {
 		right = g.genExpr(ie.Right)
 	}
 
-	// str is a struct in C, which cannot be compared with ==/!=; both
-	// sides compare by content through the tinoc_str_eq runtime helper.
+	// `a orelse b` — defaulting optional unwrap: a's payload when a has
+	// one, otherwise the fallback b (C's ternary evaluates only the
+	// taken branch, so the fallback is not evaluated when a is some).
+	if ie.Operator == "orelse" {
+		return "((" + left + ").has_value ? (" + left + ").value : (" + right + "))"
+	}
+
+	// `a == null` / `a != null` on an optional become has_value checks:
+	// the optional is a C struct, not a pointer, so comparing it with
+	// NULL would not compile.
 	if ie.Operator == "==" || ie.Operator == "!=" {
 		lt := g.sema.TypeOf(ie.Left)
 		rt := g.sema.TypeOf(ie.Right)
+		if (lt != nil && lt.Kind == KindOptional && isNullLiteral(ie.Right)) ||
+			(rt != nil && rt.Kind == KindOptional && isNullLiteral(ie.Left)) {
+			optExpr := left
+			if rt != nil && rt.Kind == KindOptional {
+				optExpr = right
+			}
+			if ie.Operator == "==" {
+				return "(!(" + optExpr + ").has_value)"
+			}
+			return "((" + optExpr + ").has_value)"
+		}
+		// str is a struct in C, which cannot be compared with ==/!=; both
+		// sides compare by content through the tinoc_str_eq runtime helper.
 		if (lt != nil && lt.Kind == KindStr) || (rt != nil && rt.Kind == KindStr) {
 			eq := fmt.Sprintf("tinoc_str_eq(%s, %s)", left, right)
 			if ie.Operator == "!=" {

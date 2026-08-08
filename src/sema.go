@@ -161,6 +161,14 @@ type Sema struct {
 	// assignment). Codegen wraps these in a fat-pointer compound
 	// literal `((tinoc_slice(T)){ .ptr = ..., .len = N })`.
 	sliceConvs map[Expression]bool
+
+	// optWraps marks expressions Sema accepted as an implicit
+	// payload -> optional coercion (a `T` value or `null` used where a
+	// `?T` is expected: var/const initializer, call argument, return
+	// value, or assignment). The value is the target optional type;
+	// codegen wraps a value in a some-optional and `null` in an empty
+	// optional compound literal.
+	optWraps map[Expression]*Type
 }
 
 // NewSema constructs a Sema instance bound to the given diagnostics
@@ -188,6 +196,7 @@ func NewSema(diags *Diagnostics) *Sema {
 		unionMethods:   make(map[string]map[string]*Symbol),
 		cStrArgs:       make(map[Expression]bool),
 		sliceConvs:     make(map[Expression]bool),
+		optWraps:       make(map[Expression]*Type),
 	}
 }
 
@@ -904,6 +913,23 @@ func (s *Sema) reconcileDeclType(name string, declaredType, valueType *Type, val
 			s.errorAt(line, col, "cannot initialize array %s from another array (type %s) — use a slice ([]%s) or copy element-wise", name, valueType.String(), typeStringOrInvalid(declaredType.Elem))
 			return declaredType
 		}
+		// A payload value (or `null`) initializes an optional: `var x
+		// ?i32 = 42;`, `var y ?i32 = null;`. The initializer is marked
+		// (optWraps) so codegen wraps it — a value into a some-optional,
+		// null into an empty optional. Untyped numeric literals adapt to
+		// the payload type first (`var x ?f64 = 5;`).
+		if declaredType.Kind == KindOptional && valueType != nil && valueType.Kind != KindOptional {
+			if isUntypedLiteral(valueExpr) && valueType.isNumeric() && declaredType.Elem != nil && declaredType.Elem.isNumeric() {
+				s.resolvedTypes[valueExpr] = declaredType.Elem
+				valueType = declaredType.Elem
+			}
+			if !assignable(declaredType, valueType) {
+				s.errorAt(line, col, "%s", describeMismatch(fmt.Sprintf("initializer for %s", name), valueType, declaredType))
+			} else {
+				s.optWraps[valueExpr] = declaredType
+			}
+			return declaredType
+		}
 		if isUntypedLiteral(valueExpr) && valueType.isNumeric() && declaredType.isNumeric() {
 			// Untyped numeric literal adapts to the declared type,
 			// e.g. `var big i64 = 5;` -- 5 defaults to i32 but widens to
@@ -1319,6 +1345,23 @@ func (s *Sema) checkReturnStatement(r *ReturnStatement) {
 	if want.Kind == KindSlice && got != nil && got.Kind == KindArray &&
 		got.Elem != nil && got.Elem.Kind != KindArray && typesEqual(want.Elem, got.Elem) {
 		s.sliceConvs[r.ReturnValue] = true
+		return
+	}
+
+	// A payload value (or `null`) returned from a `?T` function wraps
+	// into an optional: `return 5;` from a `?i32` function, `return null;`
+	// from a `?str` function. Untyped literals adapt to the payload type
+	// first (`return 5;` from a `?f64` function).
+	if want.Kind == KindOptional && got != nil && got.Kind != KindOptional {
+		if isUntypedLiteral(r.ReturnValue) && got.isNumeric() && want.Elem != nil && want.Elem.isNumeric() {
+			s.resolvedTypes[r.ReturnValue] = want.Elem
+			got = want.Elem
+		}
+		if !assignable(want, got) {
+			s.errorAt(r.Token.Line, r.Token.Column, "%s", describeMismatch("return value", got, want))
+		} else {
+			s.optWraps[r.ReturnValue] = want
+		}
 		return
 	}
 
@@ -2018,6 +2061,20 @@ func (s *Sema) checkCallArgs(ce *CallExpression, sym *Symbol, calleeName string,
 			s.sliceConvs[ce.Arguments[i]] = true
 			continue
 		}
+		// A payload value (or `null`) coerces to an optional parameter:
+		// `takes(42)` with `fn takes(o ?i32)`, `takes(null)` with
+		// `fn takes(o ?str)`. Untyped literals adapt to the payload type
+		// first (`takes(5)` for a `?f64` parameter).
+		if want.Kind == KindOptional && argType.Kind != KindOptional {
+			if want.Elem != nil && isUntypedLiteral(ce.Arguments[i]) && argType.isNumeric() && want.Elem.isNumeric() {
+				s.resolvedTypes[ce.Arguments[i]] = want.Elem
+				argType = want.Elem
+			}
+			if assignable(want, argType) {
+				s.optWraps[ce.Arguments[i]] = want
+				continue
+			}
+		}
 		if want.Kind == KindUnknown || argType.Kind == KindUnknown || argType.Kind == KindInvalid {
 			continue
 		}
@@ -2087,7 +2144,16 @@ func (s *Sema) checkPostfixExpression(pe *PostfixExpression) *Type {
 		}
 		return &Type{Kind: KindUnknown}
 	case "?": // optional unwrap
-		return lt
+		if lt != nil && lt.Kind == KindOptional {
+			if lt.Elem == nil {
+				return &Type{Kind: KindUnknown}
+			}
+			return lt.Elem
+		}
+		if lt != nil && lt.Kind != KindUnknown && lt.Kind != KindInvalid {
+			s.errorAt(pe.Token.Line, pe.Token.Column, "invalid operation: cannot unwrap %s (type %s) with '?' — it is not an optional (?T)", pe.Left.String(), lt.String())
+		}
+		return &Type{Kind: KindUnknown}
 	default:
 		return lt
 	}
@@ -2129,6 +2195,16 @@ func (s *Sema) checkInfixExpression(ie *InfixExpression) *Type {
 			rt = lt
 			s.resolvedTypes[ie.Right] = lt
 		}
+		// Optionals support only null checks (`a == null` / `a != null`).
+		// Comparing an optional against a value, another optional, or a
+		// pointer is rejected instead of miscompiled into a C struct
+		// comparison.
+		if (lt != nil && lt.Kind == KindOptional) || (rt != nil && rt.Kind == KindOptional) {
+			if !isNullLiteral(ie.Left) && !isNullLiteral(ie.Right) {
+				s.errorAt(ie.Token.Line, ie.Token.Column, "invalid operation: cannot compare optional %s with %s — compare against null instead", typeStringOrInvalid(lt), typeStringOrInvalid(rt))
+			}
+			return typeBool
+		}
 		s.checkOperandsCompatible(ie, lt, rt)
 		// C has no equality operator for structs, unions, arrays, or
 		// slices (arrays are not comparable in C at all; slices are
@@ -2149,6 +2225,26 @@ func (s *Sema) checkInfixExpression(ie *InfixExpression) *Type {
 			}
 		}
 		return typeBool
+
+	case ie.Operator == "orelse":
+		// Defaulting optional unwrap: the left operand must be an
+		// optional (`?T`); the right operand is the fallback and must be
+		// the payload type T. The result type is T, so `var x = a orelse
+		// b;` infers the unwrapped payload type.
+		if lt != nil && lt.Kind == KindOptional && lt.Elem != nil {
+			if isUntypedLiteral(ie.Right) && rt != nil && rt.isNumeric() && lt.Elem.isNumeric() {
+				s.resolvedTypes[ie.Right] = lt.Elem
+				rt = lt.Elem
+			}
+			if rt != nil && rt.Kind != KindUnknown && rt.Kind != KindInvalid && !typesEqual(lt.Elem, rt) {
+				s.errorAt(ie.Token.Line, ie.Token.Column, "%s", describeMismatch("orelse fallback", rt, lt.Elem))
+			}
+			return lt.Elem
+		}
+		if lt != nil && lt.Kind != KindUnknown && lt.Kind != KindInvalid {
+			s.errorAt(ie.Token.Line, ie.Token.Column, "invalid operation: operator orelse not defined on %s (type %s) — orelse requires an optional (?T) on the left", ie.Left.String(), lt.String())
+		}
+		return &Type{Kind: KindUnknown}
 
 	default: // arithmetic / bitwise
 		if (lt != nil && (lt.Kind == KindStruct || lt.Kind == KindUnion || lt.Kind == KindArray || lt.Kind == KindSlice)) || (rt != nil && (rt.Kind == KindStruct || rt.Kind == KindUnion || rt.Kind == KindArray || rt.Kind == KindSlice)) {
@@ -2227,6 +2323,21 @@ func (s *Sema) checkAssignExpression(ae *AssignExpression) *Type {
 		valueType != nil && valueType.Kind == KindArray && valueType.Elem != nil &&
 		valueType.Elem.Kind != KindArray && typesEqual(targetType.Elem, valueType.Elem) {
 		s.sliceConvs[ae.Value] = true
+		return targetType
+	}
+	// Assigning a payload value (or `null`) to an optional variable wraps
+	// it into the optional: `x = 42;` / `x = null;` for `var x ?i32;`.
+	if ae.Operator == "=" && targetType != nil && targetType.Kind == KindOptional &&
+		valueType != nil && valueType.Kind != KindOptional {
+		if isUntypedLiteral(ae.Value) && valueType.isNumeric() && targetType.Elem != nil && targetType.Elem.isNumeric() {
+			s.resolvedTypes[ae.Value] = targetType.Elem
+			valueType = targetType.Elem
+		}
+		if !assignable(targetType, valueType) {
+			s.errorAt(ae.Token.Line, ae.Token.Column, "%s", describeMismatch("assignment", valueType, targetType))
+		} else {
+			s.optWraps[ae.Value] = targetType
+		}
 		return targetType
 	}
 
