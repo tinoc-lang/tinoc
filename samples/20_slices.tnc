@@ -1,0 +1,80 @@
+// 20_slices.tnc — slices (fat pointers).
+//
+// A slice []T is a { ptr: ^T, len: usize } pair that views a contiguous
+// region of memory. Arrays convert implicitly to slices, which is what
+// makes it possible to pass arrays to functions:
+//   - slice variables: var s []i32 = nums;
+//   - implicit array -> slice conversion at call sites and assignments
+//   - slice parameters (array parameters are rejected by the compiler;
+//     use a slice instead)
+//   - indexing through a slice, including element assignment (writes
+//     through to the backing array)
+//   - the .len property (runtime value for slices)
+//   - for-over-collection iteration over a slice
+
+extern "C" fn printf(fmt *const char, ...) i32;
+
+// Slices are the idiomatic way to pass collections to functions.
+fn sum(s []i32) i32 {
+	var total i32 = 0;
+	for s |v| {
+		total += v;
+	}
+	return total;
+}
+
+fn average(s []f32) f32 {
+	var total f32 = 0.0;
+	var count f32 = 0.0;
+	for s |v| {
+		total += v;
+		count += 1.0;
+	}
+	if count == 0.0 {
+		return 0.0;
+	}
+	return total / count;
+}
+
+fn main() void {
+	var nums [5]i32 = [1, 2, 3, 4, 5];
+
+	// An array converts implicitly to a slice view.
+	var s []i32 = nums;
+	if s.len != 5 or s[0] != 1 or s[4] != 5 {
+		printf("bad slice view\n");
+		return;
+	}
+
+	// Passing an array where a slice is expected.
+	if sum(nums) != 15 {
+		printf("bad sum\n");
+		return;
+	}
+
+	// Mutating through a slice writes to the backing array.
+	s[2] = 30;
+	if nums[2] != 30 {
+		printf("bad slice write-through\n");
+		return;
+	}
+
+	var temps [_]f32 = [20.5, 21.0, 22.5, 19.0];
+	if average(temps) != 20.75 {
+		printf("bad average\n");
+		return;
+	}
+
+	// Slices of str work like any other element type.
+	var words [3]str = ["tinoc", "slices", "arrays"];
+	var total_chars i32 = 0;
+	for words |w| {
+		total_chars += w.len;
+	}
+	if total_chars != 5 + 6 + 6 {
+		printf("bad word lengths\n");
+		return;
+	}
+
+	printf("slices OK: sum %d, avg %.1f\n", sum(nums), average(temps));
+}

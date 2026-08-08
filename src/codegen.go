@@ -56,6 +56,13 @@ type Codegen struct {
 	// allows a function to call one defined later in the file).
 	forwardDecls []string
 
+	// sliceTypeDefs holds the named typedefs codegen emits for every
+	// slice type used in the program (`[]i32` -> tnc_slice_i32). Named
+	// typedefs keep prototypes and definitions of the same slice type
+	// identical in C; the tinoc_slice(T) macro alone expands to a fresh
+	// anonymous struct at each use, which C treats as distinct types.
+	sliceTypeDefs []string
+
 	// sourceDir is the directory of the .tnc file, used to decide whether
 	// a #importc header is a local file (quote include) or a system header
 	// (angle include).
@@ -114,16 +121,26 @@ func (g *Codegen) Generate(prog *Program) string {
 		}
 	}
 
-	// Type pre-pass: emit every enum's and struct's C type first (in
-	// source order), so function/method prototypes that mention them --
-	// emitted later in the forward-decl block -- and every use in bodies
-	// sees a complete type. Enums are emitted before structs because
-	// struct fields commonly reference enum types; by-value struct
-	// payloads on enums still require the struct to be declared first,
-	// same as in C itself, and surface at C compile time.
+	// Type pre-pass: emit every slice typedef, enum's, struct's and
+	// union's C type first (in source order), so function/method
+	// prototypes that mention them -- emitted later in the
+	// forward-decl block -- and every use in bodies sees a complete
+	// type. Slice typedefs come before enums/structs because struct
+	// fields and signatures commonly reference them. Enums are emitted
+	// before structs because struct fields commonly reference enum
+	// types; by-value struct payloads on enums still require the struct
+	// to be declared first, same as in C itself, and surface at C
+	// compile time.
+	g.collectSliceTypes(prog)
 	var types bytes.Buffer
 	main := &g.out
 	g.out = types
+	for _, td := range g.sliceTypeDefs {
+		g.writeln("%s", td)
+	}
+	if len(g.sliceTypeDefs) > 0 {
+		g.writeln("")
+	}
 	for _, stmt := range prog.Statements {
 		if es, ok := stmt.(*EnumStatement); ok {
 			g.genEnumTypeDef(es)
@@ -346,7 +363,7 @@ func (g *Codegen) genStructTypeDef(st *StructStatement) {
 			if f == nil {
 				continue
 			}
-			g.writeln("%s %s;", structFieldCType(f.Type), sanitizeCIdent(f.Name))
+			g.writeln("%s;", cDeclarator(f.Type, sanitizeCIdent(f.Name)))
 		}
 	}
 	g.indent--
@@ -393,7 +410,7 @@ func (g *Codegen) genUnionTypeDef(us *UnionStatement) {
 			if f == nil {
 				continue
 			}
-			g.writeln("%s %s;", structFieldCType(f.Type), sanitizeCIdent(f.Name))
+			g.writeln("%s;", cDeclarator(f.Type, sanitizeCIdent(f.Name)))
 		}
 	}
 	g.indent--
@@ -444,7 +461,7 @@ func (g *Codegen) genTypeMethod(typeName string, methods map[string]*Symbol, fn 
 		if i < len(sym.Params) {
 			pt = sym.Params[i]
 		}
-		params = append(params, fmt.Sprintf("%s %s", cTypeOrFallback(pt), sanitizeCIdent(sym.ParamNames[i])))
+		params = append(params, cDeclarator(pt, sanitizeCIdent(sym.ParamNames[i])))
 	}
 	if len(params) == 0 {
 		params = []string{"void"}
@@ -507,6 +524,22 @@ func structFieldCType(t *Type) string {
 	return t.CType()
 }
 
+// cDeclarator renders a full C declaration for a value, placing array
+// dimensions after the identifier per C's declarator grammar:
+// `[5][3]f32` x -> "f32 x[5][3]". Sentinel arrays allocate N+1 slots
+// (see arrayDimSuffix). Struct-typed values use the tag form (`struct
+// Point`) so forward declarations suffice regardless of declaration
+// order, matching structFieldCType.
+func cDeclarator(t *Type, name string) string {
+	if t == nil || t.Kind == KindInvalid || t.Kind == KindUnknown {
+		return "void* " + name
+	}
+	if t.Kind == KindArray {
+		return cDeclarator(t.Elem, name+arrayDimSuffix(t))
+	}
+	return structFieldCType(t) + " " + name
+}
+
 // === Functions ===
 
 func (g *Codegen) genFunction(fn *FunctionStatement) {
@@ -532,7 +565,7 @@ func (g *Codegen) genFunction(fn *FunctionStatement) {
 		if i < len(sym.Params) {
 			pt = sym.Params[i]
 		}
-		params = append(params, fmt.Sprintf("%s %s", cTypeOrFallback(pt), sanitizeCIdent(pname)))
+		params = append(params, cDeclarator(pt, sanitizeCIdent(pname)))
 	}
 	if len(params) == 0 {
 		params = []string{"void"}
@@ -646,11 +679,11 @@ func (g *Codegen) genTopLevelVar(v *VarStatement) {
 	}
 	init := ""
 	if v.Value != nil {
-		init = " = " + g.genExpr(v.Value)
+		init = " = " + g.genInit(v.Value, t)
 	} else {
 		init = " = " + zeroValue(t)
 	}
-	g.writeln("%s%s %s%s;", storage, t.CType(), sanitizeCIdent(v.Name.Value), init)
+	g.writeln("%s%s%s;", storage, cDeclarator(t, sanitizeCIdent(v.Name.Value)), init)
 }
 
 func (g *Codegen) genTopLevelConst(c *ConstStatement) {
@@ -660,13 +693,13 @@ func (g *Codegen) genTopLevelConst(c *ConstStatement) {
 	}
 	init := ""
 	if c.Value != nil {
-		init = " = " + g.genExpr(c.Value)
+		init = " = " + g.genInit(c.Value, t)
 	}
 	// `static` is applied regardless of IsStatic for top-level const,
 	// since C requires internal linkage for a header-free single
 	// translation unit and Tinoc const at file scope has no external
 	// visibility story yet (no `pub` propagation to codegen in this pass).
-	g.writeln("static const %s %s%s;", t.CType(), sanitizeCIdent(c.Name.Value), init)
+	g.writeln("static const %s%s;", cDeclarator(t, sanitizeCIdent(c.Name.Value)), init)
 }
 
 func identName(id *Identifier) string {
@@ -689,8 +722,15 @@ func (g *Codegen) checkEmittable(t *Type, line, col int, what string) bool {
 		g.errorAt(line, col, "codegen: %s has an invalid type", what)
 		return false
 	}
+	if t.Kind == KindArray || t.Kind == KindSlice {
+		if t.Elem == nil {
+			g.errorAt(line, col, "codegen: %s has an unresolved element type", what)
+			return false
+		}
+		return true
+	}
 	if t.Kind == KindUnknown {
-		g.errorAt(line, col, "codegen: %s has an unsupported type (%s) — enum/union/array/optional/error-union/generic codegen is not implemented yet", what, t.Name)
+		g.errorAt(line, col, "codegen: %s has an unsupported type (%s) — optional/error-union/generic codegen is not implemented yet", what, t.Name)
 		return false
 	}
 	return true
@@ -785,9 +825,9 @@ func (g *Codegen) genLocalVar(v *VarStatement) {
 		storage = "static "
 	}
 	if v.Value != nil {
-		g.writeln("%s%s %s = %s;", storage, t.CType(), sanitizeCIdent(v.Name.Value), g.genExpr(v.Value))
+		g.writeln("%s%s = %s;", storage, cDeclarator(t, sanitizeCIdent(v.Name.Value)), g.genInit(v.Value, t))
 	} else {
-		g.writeln("%s%s %s = %s;", storage, t.CType(), sanitizeCIdent(v.Name.Value), zeroValue(t))
+		g.writeln("%s%s = %s;", storage, cDeclarator(t, sanitizeCIdent(v.Name.Value)), zeroValue(t))
 	}
 }
 
@@ -802,9 +842,9 @@ func (g *Codegen) genLocalConst(c *ConstStatement) {
 	}
 	init := ""
 	if c.Value != nil {
-		init = " = " + g.genExpr(c.Value)
+		init = " = " + g.genInit(c.Value, t)
 	}
-	g.writeln("%s%s %s%s;", storage, t.CType(), sanitizeCIdent(c.Name.Value), init)
+	g.writeln("%s%s%s;", storage, cDeclarator(t, sanitizeCIdent(c.Name.Value)), init)
 }
 
 func (g *Codegen) genReturn(r *ReturnStatement) {
@@ -930,7 +970,7 @@ func (g *Codegen) genWhile(w *WhileStatement) {
 // won't compile.
 func (g *Codegen) genFor(f *ForStatement) {
 	if f.Collection != nil {
-		g.errorAt(f.Token.Line, f.Token.Column, "codegen: for-over-collection is not yet supported (array/slice types aren't resolved yet)")
+		g.genForCollection(f)
 		return
 	}
 
@@ -951,6 +991,52 @@ func (g *Codegen) genFor(f *ForStatement) {
 	g.indent++
 	g.loopDepth++
 	if f.Body != nil {
+		for _, s := range f.Body.Statements {
+			g.genStatement(s)
+		}
+	}
+	g.loopDepth--
+	g.indent--
+	g.writeln("}")
+}
+
+// genForCollection lowers `for coll |x| { ... }` to an indexed C loop
+// over the collection's storage: arrays iterate by their constant
+// length, slices by their runtime len field. The collection is bound to
+// a local first so it is evaluated only once, and the capture variable
+// is declared inside the loop with the element type.
+func (g *Codegen) genForCollection(f *ForStatement) {
+	collType := g.sema.TypeOf(f.Collection)
+	if collType == nil || (collType.Kind != KindArray && collType.Kind != KindSlice) || collType.Elem == nil {
+		g.errorAt(f.Token.Line, f.Token.Column, "codegen: cannot iterate over a value of type %s", typeStringOrInvalid(collType))
+		return
+	}
+	capture := "x"
+	if f.Capture != nil {
+		capture = sanitizeCIdent(f.Capture.Value)
+	}
+	coll := g.genExpr(f.Collection)
+	temp := "__tnoc_coll"
+	idx := "__tnoc_i"
+	bound := ""
+	access := ""
+	if collType.Kind == KindArray {
+		// Iteration only reads elements (the capture is a by-value copy),
+		// so a const pointer is always valid and keeps const arrays from
+		// warning about discarded qualifiers.
+		g.writeln("const %s* %s = %s;", collType.Elem.CType(), temp, coll)
+		bound = fmt.Sprintf("%d", collType.ArraySize)
+		access = fmt.Sprintf("%s[%s]", temp, idx)
+	} else {
+		g.writeln("%s = %s;", cDeclarator(collType, temp), coll)
+		bound = fmt.Sprintf("(%s).len", temp)
+		access = fmt.Sprintf("(%s).ptr[%s]", temp, idx)
+	}
+	g.writeln("for (i32 %s = 0; (size_t)%s < %s; %s++) {", idx, idx, bound, idx)
+	g.indent++
+	g.loopDepth++
+	if f.Body != nil {
+		g.writeln("%s = %s;", cDeclarator(collType.Elem, capture), access)
 		for _, s := range f.Body.Statements {
 			g.genStatement(s)
 		}
@@ -1154,14 +1240,30 @@ func (g *Codegen) genSwitchPatternArm(arm *SwitchArm, value string) bool {
 // syntactically, since Tinoc's expression grammar is deliberately
 // C-like.
 
+// genExpr renders an expression as C. Expressions Sema accepted as an
+// implicit array -> slice conversion (sliceConvs) render as a
+// fat-pointer compound literal wrapping the array storage; everything
+// else goes through genExprNoConv.
 func (g *Codegen) genExpr(e Expression) string {
+	if g.sema.sliceConvs[e] {
+		return g.genAsSlice(e)
+	}
+	return g.genExprNoConv(e)
+}
+
+// genExprNoConv is genExpr's main switch: every expression kind except
+// the implicit array -> slice conversion (which genExpr intercepts).
+func (g *Codegen) genExprNoConv(e Expression) string {
 	switch ex := e.(type) {
 	case *Identifier:
 		return sanitizeCIdent(ex.Value)
 	case *IntegerLiteral:
 		return genIntegerLiteral(ex)
 	case *FloatLiteral:
-		return ex.Raw
+		// Strip underscore digit separators: the lexer keeps them
+		// verbatim (1_000.5), but C11 has no underscore separators in
+		// numeric literals.
+		return strings.ReplaceAll(ex.Raw, "_", "")
 	case *StringLiteral:
 		// Unescape once, then re-emit C-escaped: the raw Tinoc text is
 		// already C-valid, but %q-style double escaping would print a
@@ -1197,6 +1299,11 @@ func (g *Codegen) genExpr(e Expression) string {
 		if ex.Index != nil {
 			idx = g.genExpr(ex.Index)
 		}
+		// Slices are fat pointers: `s[i]` lowers to `s.ptr[i]`. Arrays
+		// (and pointers) index directly.
+		if lt := g.sema.TypeOf(ex.Left); lt != nil && lt.Kind == KindSlice {
+			return fmt.Sprintf("(%s).ptr[%s]", left, idx)
+		}
 		return fmt.Sprintf("%s[%s]", left, idx)
 	case *FieldAccessExpression:
 		// #importc member access: cio.EOF / cio.stdin resolve to the C
@@ -1231,6 +1338,18 @@ func (g *Codegen) genExpr(e Expression) string {
 			inner := g.genExpr(pe.Left)
 			return fmt.Sprintf("%s->%s", inner, sanitizeCIdent(ex.Field.Value))
 		}
+		// Array/slice `.len`: arrays report their declared element count
+		// as a compile-time constant; slices read the runtime len field.
+		if lt := g.sema.TypeOf(ex.Left); lt != nil && ex.Field != nil && ex.Field.Value == "len" {
+			if lt.Kind == KindArray {
+				return fmt.Sprintf("(%d)", lt.ArraySize)
+			}
+			if lt.Kind == KindSlice {
+				// The C field is size_t; cast to i32 so user comparisons
+				// like `i < s.len` do not trigger -Wsign-compare.
+				return fmt.Sprintf("((i32)(%s).len)", g.genExpr(ex.Left))
+			}
+		}
 		left := ""
 		if ex.Left != nil {
 			left = g.genExpr(ex.Left)
@@ -1243,14 +1362,172 @@ func (g *Codegen) genExpr(e Expression) string {
 	case *StructLiteral:
 		return g.genStructLiteral(ex)
 	case *ArrayLiteral:
-		var parts []string
-		for _, el := range ex.Elements {
-			parts = append(parts, g.genExpr(el))
-		}
-		return "{" + strings.Join(parts, ", ") + "}"
+		return g.genArrayCompound(ex)
 	default:
 		g.errorAt(0, 0, "codegen: unsupported expression %T", e)
 		return "/* unsupported expression */ 0"
+	}
+}
+
+// genAsSlice renders an implicit array -> slice conversion: the
+// one-dimensional array value is wrapped in a fat-pointer compound
+// literal `((tinoc_slice(T)){ .ptr = <array>, .len = N })`. Array
+// literals wrap their compound-literal storage; other array values
+// decay to a pointer in `.ptr`.
+func (g *Codegen) genAsSlice(e Expression) string {
+	arr := g.sema.TypeOf(e)
+	if arr == nil || arr.Kind != KindArray || arr.Elem == nil || arr.Elem.Kind == KindArray {
+		g.errorAt(0, 0, "codegen: invalid array-to-slice conversion (expected a one-dimensional array)")
+		return "((tinoc_slice(i32)){ .ptr = NULL, .len = 0 })"
+	}
+	var inner string
+	if al, ok := e.(*ArrayLiteral); ok && al != nil {
+		inner = g.genArrayCompound(al)
+	} else {
+		inner = g.genExprNoConv(e)
+	}
+	return fmt.Sprintf("((%s){ .ptr = %s, .len = %d })", sliceTypeName(arr), inner, arr.ArraySize)
+}
+
+// genArrayCompound renders an array literal as a C11 compound literal
+// of its resolved type, e.g. `((i32[3]){1, 2, 3})`, recursing for
+// nested (multidimensional) literals and appending the sentinel element
+// for `[N:x]T` types. Compound literals are used wherever an array must
+// be an *expression* (initializers, call arguments, slice conversions);
+// plain brace lists are only valid in initializer position.
+func (g *Codegen) genArrayCompound(al *ArrayLiteral) string {
+	t := g.sema.TypeOf(al)
+	if t == nil || t.Kind != KindArray || t.Elem == nil {
+		g.errorAt(0, 0, "codegen: array literal has no resolved array type")
+		return "((i32[1]){0})"
+	}
+	size := t.ArraySize
+	var parts []string
+	for _, el := range al.Elements {
+		parts = append(parts, g.genExpr(el))
+	}
+	for len(parts) < size {
+		parts = append(parts, "0")
+	}
+	if t.HasSentinel {
+		size++ // storage holds N+1 elements
+		parts = append(parts, fmt.Sprintf("%d", t.SentinelValue))
+	}
+	return fmt.Sprintf("((%s[%d]){%s})", cArrayTypeSpelling(t.Elem), size, strings.Join(parts, ", "))
+}
+
+// genInit renders a var/const initializer. Array literals bound to an
+// array-typed declaration use the plain brace form (valid in every
+// initializer position, including block-scope const arrays where GCC
+// rejects compound-literal initializers as non-constant); everything
+// else (slice conversions, scalars, ...) uses the ordinary expression
+// form.
+func (g *Codegen) genInit(value Expression, declared *Type) string {
+	if declared != nil && declared.Kind == KindArray {
+		if al, ok := value.(*ArrayLiteral); ok && al != nil {
+			return g.genArrayBraceInit(al)
+		}
+	}
+	return g.genExpr(value)
+}
+
+// genArrayBraceInit renders an array literal as a plain brace
+// initializer, e.g. `{1, 2, 3, 4, 0}`, recursing for nested
+// (multidimensional) literals and appending the sentinel element for
+// `[N:x]T` types.
+func (g *Codegen) genArrayBraceInit(al *ArrayLiteral) string {
+	t := g.sema.TypeOf(al)
+	var parts []string
+	for _, el := range al.Elements {
+		if inner, ok := el.(*ArrayLiteral); ok && inner != nil {
+			parts = append(parts, g.genArrayBraceInit(inner))
+		} else {
+			parts = append(parts, g.genExpr(el))
+		}
+	}
+	if t != nil && t.Kind == KindArray {
+		for len(parts) < t.ArraySize {
+			parts = append(parts, "0")
+		}
+		if t.HasSentinel {
+			parts = append(parts, fmt.Sprintf("%d", t.SentinelValue))
+		}
+	}
+	return "{" + strings.Join(parts, ", ") + "}"
+}
+
+// collectSliceTypes walks every resolved type the generated C can name
+// (function/method signatures, extern "C" declarations, var/const
+// declarations, struct/union fields) and records any slice types so
+// Generate can emit named typedefs for them (sliceTypeDefs). Recursion
+// registers nested slice elements first, so typedef dependencies are
+// always emitted before the typedef that uses them.
+func (g *Codegen) collectSliceTypes(prog *Program) {
+	g.sliceTypeDefs = nil
+	seen := make(map[string]bool)
+	var register func(t *Type)
+	register = func(t *Type) {
+		if t == nil {
+			return
+		}
+		switch t.Kind {
+		case KindArray:
+			register(t.Elem)
+		case KindSlice:
+			register(t.Elem) // nested slice elements first
+			name := sliceTypeName(t)
+			if seen[name] {
+				return
+			}
+			seen[name] = true
+			elemC := "void"
+			if t.Elem != nil {
+				elemC = t.Elem.CType()
+			}
+			g.sliceTypeDefs = append(g.sliceTypeDefs, fmt.Sprintf("typedef tinoc_slice(%s) %s;", elemC, name))
+		}
+	}
+	for _, stmt := range prog.Statements {
+		switch s := stmt.(type) {
+		case *FunctionStatement:
+			if s.Name != nil {
+				if sym := g.sema.funcs[s.Name.Value]; sym != nil {
+					for _, p := range sym.Params {
+						register(p)
+					}
+					register(sym.ReturnType)
+				}
+			}
+		case *ExternCFuncStatement:
+			if s.Name != nil {
+				if sym := g.sema.externCFuncs[s.Name.Value]; sym != nil {
+					for _, p := range sym.Params {
+						register(p)
+					}
+					register(sym.ReturnType)
+				}
+			}
+		case *VarStatement:
+			register(g.sema.TypeOfVarDecl(s))
+		case *ConstStatement:
+			register(g.sema.TypeOfConstDecl(s))
+		case *StructStatement:
+			if s.Name != nil {
+				if st := g.sema.structTypes[s.Name.Value]; st != nil {
+					for _, f := range st.Fields {
+						register(f.Type)
+					}
+				}
+			}
+		case *UnionStatement:
+			if s.Name != nil {
+				if ut := g.sema.unionTypes[s.Name.Value]; ut != nil {
+					for _, f := range ut.Fields {
+						register(f.Type)
+					}
+				}
+			}
+		}
 	}
 }
 

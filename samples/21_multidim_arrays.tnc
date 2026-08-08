@@ -1,0 +1,62 @@
+// 21_multidim_arrays.tnc — multidimensional and sentinel arrays.
+//
+// Demonstrates:
+//   - row-major multidimensional arrays: [3][4]f32
+//   - nested array literals matching the declared shape
+//   - double indexing: mat[i][j]
+//   - .len on a multidimensional array (number of rows)
+//   - iteration over rows with an index range loop (the compiler asks
+//     you to iterate a multidimensional array row-by-row)
+//   - sentinel-terminated arrays: [N:x]T puts sentinel x at index N
+//     (array storage holds N+1 elements; .len is still N)
+
+extern "C" fn printf(fmt *const char, ...) i32;
+
+fn main() void {
+	// A 3x4 matrix: 3 rows of 4 f32 each.
+	const mat [3][4]f32 = [
+		[1.0, 0.0, 0.0, 1.0],
+		[0.0, 1.0, 0.0, 2.0],
+		[0.0, 0.0, 1.0, 3.0],
+	];
+	if mat.len != 3 {
+		printf("bad row count\n");
+		return;
+	}
+
+	// Double indexing reads any element.
+	if mat[0][0] != 1.0 or mat[2][3] != 3.0 {
+		printf("bad double index\n");
+		return;
+	}
+
+	// Iterate row by row, summing every element.
+	var total f32 = 0.0;
+	for 0..mat.len |i| {
+		for mat[i] |cell| {
+			total += cell;
+		}
+	}
+	if total != 9.0 {
+		printf("bad nested sum: %f\n", total);
+		return;
+	}
+
+	// Element assignment through nested indexes.
+	var grid [2][2]i32 = [[0, 0], [0, 0]];
+	grid[1][1] = 42;
+	if grid[1][1] != 42 or grid[0][0] != 0 {
+		printf("bad grid assignment\n");
+		return;
+	}
+
+	// Sentinel-terminated array: [_:0]u8 infers size 4 and stores a
+	// trailing 0 at index 4, like a C string.
+	const bytes [_:0]u8 = [1, 2, 3, 4];
+	if bytes.len != 4 or bytes[4] != 0 {
+		printf("bad sentinel\n");
+		return;
+	}
+
+	printf("multidim OK: total %f\n", total);
+}

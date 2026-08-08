@@ -14,14 +14,14 @@ import (
 // to emit.
 //
 // Scope for this pass: primitives (integers, floats, bool, char, void,
-// str), pointer types (`^T`), and user structs (`struct Name { ... }`
-// with fields, methods, and static methods) since those are what
-// var/const/static var/static const/fn/struct need end-to-end. The
-// remaining compound types (enum/union), optionals, error unions,
-// arrays/slices, and generics are recognized syntactically elsewhere in
-// the AST but are not yet resolved by Sema; referencing them here
-// produces a clear "not yet supported" diagnostic rather than a silent
-// wrong answer.
+// str), pointer types (`^T`), user structs (`struct Name { ... }` with
+// fields, methods, and static methods), arrays (`[N]T` / `[_]T` /
+// `[N:x]T`), and slices (`[]T`) — everything var/const/static
+// var/static const/fn/struct need end-to-end. The remaining compound
+// types (enum/union), optionals, error unions, and generics are
+// recognized syntactically elsewhere in the AST but are not yet
+// resolved by Sema; referencing them here produces a clear "not yet
+// supported" diagnostic rather than a silent wrong answer.
 
 // TypeKind categorizes a resolved Type.
 type TypeKind int
@@ -38,7 +38,9 @@ const (
 	KindStruct
 	KindEnum
 	KindUnion
-	KindUnknown // valid but not yet resolvable by this pass (array/etc)
+	KindArray
+	KindSlice
+	KindUnknown // valid but not yet resolvable by this pass (optionals/etc)
 )
 
 // StructFieldInfo is a resolved struct field: its name and resolved type,
@@ -95,6 +97,15 @@ type Type struct {
 	// Pointer-specific.
 	Elem *Type
 
+	// Array-specific: ArraySize is the declared element count (0 means
+	// inferred via `[_]T`, filled in by Sema once the initializer is
+	// known). HasSentinel marks sentinel-terminated arrays `[N:x]T`, whose
+	// underlying C storage holds ArraySize+1 elements with the sentinel
+	// value at index ArraySize.
+	ArraySize     int
+	HasSentinel   bool
+	SentinelValue int64
+
 	// Struct-specific: ordered fields and a name -> index map, populated
 	// by Sema when the struct declaration is resolved.
 	Fields     []*StructFieldInfo
@@ -141,6 +152,19 @@ func (t *Type) CType() string {
 		return t.Name // tinoc.h defines u8/i32/f32/usize/... 1:1 with Tinoc's own names
 	case KindPointer:
 		return t.Elem.CType() + "*"
+	case KindArray:
+		// C declarators split the type from the name (`u8 buf[16]`, never
+		// `u8[16] buf`), so CType alone cannot fully spell an array. This
+		// form (element type plus dimensions) is used only for
+		// diagnostics/fallbacks; real declarations go through
+		// cDeclarator in codegen.go.
+		return cArrayTypeSpelling(t)
+	case KindSlice:
+		// tinoc.h's tinoc_slice(T) macro expands to the fat-pointer
+		// struct `{ T* ptr; size_t len; }` from syntax.md. Codegen emits
+		// a named typedef per distinct slice type so function prototypes
+		// and definitions share one C type (see collectSliceTypes).
+		return sliceTypeName(t)
 	case KindStruct, KindEnum, KindUnion:
 		// Emitted as a typedef named after the type; sanitize so a name
 		// that collides with a C keyword still yields valid C.
@@ -227,6 +251,20 @@ func typesEqual(a, b *Type) bool {
 	switch a.Kind {
 	case KindPointer:
 		return typesEqual(a.Elem, b.Elem)
+	case KindArray:
+		if !typesEqual(a.Elem, b.Elem) {
+			return false
+		}
+		// ArraySize 0 means "inferred, not yet known" and matches any
+		// concrete size (the initializer fills it in before comparisons
+		// that matter).
+		if a.ArraySize != 0 && b.ArraySize != 0 && a.ArraySize != b.ArraySize {
+			return false
+		}
+		return a.HasSentinel == b.HasSentinel &&
+			(!a.HasSentinel || a.SentinelValue == b.SentinelValue)
+	case KindSlice:
+		return typesEqual(a.Elem, b.Elem)
 	case KindInt:
 		return a.Name == b.Name
 	case KindFloat:
@@ -247,6 +285,14 @@ func typesEqual(a, b *Type) bool {
 func assignable(dst, src *Type) bool {
 	if dst == nil || src == nil {
 		return true // avoid cascading errors when one side already failed
+	}
+	// A fixed-size array value implicitly converts to a slice of its
+	// element type: `var s []i32 = nums;` / `f(nums)` with
+	// `fn f(s []i32)`. One-dimensional arrays only — a multidimensional
+	// array would convert to a slice-of-arrays, whose C spelling
+	// (pointer-to-array) the tinoc_slice macro cannot express.
+	if dst.Kind == KindSlice && src.Kind == KindArray && src.Elem != nil && src.Elem.Kind != KindArray {
+		return typesEqual(dst.Elem, src.Elem)
 	}
 	return typesEqual(dst, src)
 }
@@ -311,12 +357,120 @@ func (s *Sema) resolveTypeExpr(te TypeExpr) *Type {
 		s.diags.Error("sema", 0, 0, "error union types are not yet supported (%s)", t.String())
 		return nil
 	case *ArrayType:
-		s.diags.Error("sema", 0, 0, "array/slice types are not yet supported (%s)", t.String())
-		return nil
+		return s.resolveArrayType(t)
 	default:
 		s.diags.Error("sema", 0, 0, "unsupported type expression: %s", te.String())
 		return nil
 	}
+}
+
+// resolveArrayType resolves `[N]T`, `[_]T`, `[N:x]T`, and `[]T` type
+// expressions from the parser into a resolved KindArray / KindSlice
+// *Type. The element type resolves recursively, so multidimensional
+// arrays (`[2][3]f32`), slices of slices, and arrays of slices all
+// compose. Array sizes and sentinel values must be constant integers
+// (syntax.md shows literal forms only).
+func (s *Sema) resolveArrayType(at *ArrayType) *Type {
+	if at.Elem == nil {
+		return nil
+	}
+	elem := s.resolveTypeExpr(at.Elem)
+	if elem == nil {
+		return nil
+	}
+
+	// `[]T` slice: the parser leaves Size nil and Inferred false.
+	if at.Size == nil && !at.Inferred {
+		t := &Type{Kind: KindSlice, Elem: elem}
+		t.Name = "[]" + elem.Name
+		return t
+	}
+
+	size := 0
+	if at.Size != nil {
+		lit, ok := at.Size.(*IntegerLiteral)
+		if !ok {
+			s.diags.Error("sema", 0, 0, "array length must be a constant integer (got %s)", at.Size.String())
+			return nil
+		}
+		if lit.Value <= 0 {
+			s.diags.Error("sema", 0, 0, "array length must be a positive integer (got %d)", lit.Value)
+			return nil
+		}
+		size = int(lit.Value)
+	}
+
+	t := &Type{Kind: KindArray, Elem: elem, ArraySize: size}
+	if at.Sentinel != nil {
+		sent, ok := at.Sentinel.(*IntegerLiteral)
+		if !ok {
+			s.diags.Error("sema", 0, 0, "array sentinel must be a constant integer (got %s)", at.Sentinel.String())
+			return nil
+		}
+		t.HasSentinel = true
+		t.SentinelValue = sent.Value
+	}
+	t.Name = t.arrayTypeName()
+	return t
+}
+
+// arrayTypeName renders the canonical Tinoc spelling of an array type,
+// e.g. `[5]u8`, `[_]f64` (size not yet inferred), or `[4:0]u8`.
+func (t *Type) arrayTypeName() string {
+	sizeStr := "_"
+	if t.ArraySize > 0 {
+		sizeStr = fmt.Sprintf("%d", t.ArraySize)
+	}
+	name := "[" + sizeStr + "]"
+	if t.HasSentinel {
+		name = fmt.Sprintf("[%s:%d]", sizeStr, t.SentinelValue)
+	}
+	if t.Elem != nil {
+		name += t.Elem.Name
+	}
+	return name
+}
+
+// sliceTypeName returns the C typedef name codegen emits for a slice
+// type, e.g. `[]i32` -> "tnc_slice_i32". A named typedef (rather than
+// the tinoc_slice(T) anonymous struct used inline) keeps every
+// declaration of the same slice type identical in C, which C requires
+// for prototype/definition compatibility.
+func sliceTypeName(t *Type) string {
+	if t == nil || t.Elem == nil {
+		return "tnc_slice_void"
+	}
+	return "tnc_slice_" + sanitizeCIdent(t.Elem.CType())
+}
+
+// cArrayTypeSpelling renders an array's *type-only* C spelling (element
+// type plus dimensions, e.g. "f32[2][2]"), for diagnostics and fallback
+// paths. Real declarations must use cDeclarator, which places the
+// dimensions after the identifier per C's declarator grammar.
+func cArrayTypeSpelling(t *Type) string {
+	if t == nil {
+		return "void"
+	}
+	if t.Kind != KindArray {
+		return t.CType()
+	}
+	if t.Elem == nil {
+		return "void"
+	}
+	return cArrayTypeSpelling(t.Elem) + arrayDimSuffix(t)
+}
+
+// arrayDimSuffix renders the bracket dimensions of one array level,
+// accounting for sentinel storage ([N:x]T allocates N+1 slots).
+func arrayDimSuffix(t *Type) string {
+	size := t.ArraySize
+	if t.HasSentinel {
+		size++
+	}
+	if size <= 0 {
+		size = 1 // defensive; unresolved inferred size
+	}
+	return fmt.Sprintf("[%d]", size)
 }
 
 // describeMismatch renders a "cannot use X (type A) as type B" style

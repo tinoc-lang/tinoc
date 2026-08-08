@@ -1,0 +1,61 @@
+// 19_array_basics.tnc — fixed-size arrays.
+//
+// Demonstrates the array support added for the Array & Slice section of
+// syntax.md:
+//   - array literals with inferred element type: [1, 2, 3]
+//   - explicit element type: [5]u8 = [...]
+//   - inferred size with an explicit element type: [_]f32 = [...]
+//   - index access and element assignment: nums[i], nums[i] = v
+//   - the .len property (compile-time constant for arrays)
+//   - for-over-collection iteration over an array
+//   - character arrays for byte strings
+
+extern "C" fn printf(fmt *const char, ...) i32;
+
+fn main() void {
+	// Element type is inferred from the literal.
+	const message = ['h', 'e', 'l', 'l', 'o'];
+	if message.len != 5 or message[0] != 'h' or message[4] != 'o' {
+		printf("bad message\n");
+		return;
+	}
+
+	// Explicit type + explicit size.
+	var nums [5]i32 = [10, 20, 30, 40, 50];
+	nums[0] = 99; // element assignment
+	if nums[0] != 99 {
+		printf("bad element assignment\n");
+		return;
+	}
+
+	// Explicit type, size inferred from the literal.
+	var floats [_]f32 = [1.5, 2.5, 3.5];
+	if floats.len != 3 or floats[1] != 2.5 {
+		printf("bad inferred size\n");
+		return;
+	}
+
+	// .len is available on every array.
+	if nums.len != 5 or floats.len != 3 or message.len != 5 {
+		printf("bad .len\n");
+		return;
+	}
+
+	// Sum via for-over-collection (after nums[0] was set to 99).
+	var total i32 = 0;
+	for nums |n| {
+		total += n;
+	}
+	if total != 99 + 20 + 30 + 40 + 50 {
+		printf("bad sum: %d\n", total);
+		return;
+	}
+
+	// Index access in both directions.
+	if nums[1] != 20 or nums[nums.len - 1] != 50 {
+		printf("bad index access\n");
+		return;
+	}
+
+	printf("array basics OK: %d elements, sum %d\n", nums.len, total);
+}
