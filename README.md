@@ -43,7 +43,7 @@ Tinoc is a short form of **T**his **I**s **No**t **C**, commonly known as **T**i
 
 **NOTE:** Tinoc respects C and its usage. Tinoc is built on the philosophy that programming should be **Meaningful**, **Accurate**, **Robust**, **Maximum Performance**, and **Simple**.
 
-**Tinoc** transpiles to C11 for maximum system support — C11 unlocks features like `_Generic` dispatch in the `tinoc.h` runtime (saturating arithmetic) and gives the compiler room to grow (optionals, error unions, typed enums) without fighting the target language.
+**Tinoc** transpiles to C11 for maximum system support — C11 unlocks features like `_Generic` dispatch in the `tinoc.h` runtime (saturating arithmetic) and gives the compiler room to grow (error unions, typed enums, generics) without fighting the target language.
 
 ---
 
@@ -99,7 +99,8 @@ What the compiler supports end-to-end in the current release:
 | Generic functions / structs | ❌ | `fn foo:T(...)`, `struct Pair:T` — rejected with a clear "not yet supported" diagnostic |
 | `union` + methods | ✅ | C-style shared-memory fields (`as_int`/`as_float` reinterpret the same bytes); instance methods (`self ^Name`), static methods |
 | Arrays / slices | ✅ | `[N]T`, `[_]T` (inferred size), `[]T` slices, `[N:x]T` sentinel arrays, array literals, indexing, `.len`, `for coll |x|`, implicit array→slice conversion at calls/assignments; array params/returns/whole-array assignment rejected with a slice hint |
-| Optionals / error unions | ❌ | `?T`, `!T`, `orelse`, `catch` — planned |
+| Optionals | ✅ | `?T`, `null`, `orelse` defaulting, `x?` unwrap, `== null` / `!= null` checks; plain values (and `null`) auto-wrap where a `?T` is expected |
+| Error unions | ❌ | `!T`, `catch` — planned |
 | Standard library (`std.io`, ...) | ❌ | Module system is next after the type system |
 
 See [`CHANGELOG.md`](CHANGELOG.md) for what landed in each version and [`CHECKLIST.md`](CHECKLIST.md) for the release process.

@@ -1,0 +1,77 @@
+// 23_optionals.tnc — optional types (?T), null, and orelse.
+//
+// An optional wraps a payload of type T with a has_value flag: a ?T is
+// either empty (`null`) or holds a value of type T. Underneath it is the
+// C struct `{ T value; bool has_value; }`, emitted as a named typedef
+// (`?i32` -> tnc_opt_i32). What you can do with an optional:
+//
+//   - declare with a value:   var maybe ?i32 = 42;
+//   - declare as null:        var none  ?i32 = null;
+//   - default with orelse:    maybe orelse 0   (the payload when some,
+//                              else the fallback — the fallback is only
+//                              evaluated when needed)
+//   - unwrap with `?`:        maybe?   (the payload; only valid once you
+//                              know the optional is not null)
+//   - check presence:         maybe == null / maybe != null
+//
+// A plain T value — or null — auto-wraps into a ?T wherever one is
+// expected: variable initializers, call arguments, return values, and
+// assignments. `orelse`'s result type is the payload type, so
+// `var x = maybe orelse 0;` makes x an i32.
+
+extern "C" fn printf(fmt *const char, ...) i32;
+
+// A lookup that can miss: the result is null, or the index.
+fn index_of(hay []i32, needle i32) ?i32 {
+	var i i32 = 0;
+	while i < hay.len {
+		if hay[i] == needle {
+			return i; // plain i32 auto-wraps into ?i32
+		}
+		i += 1;
+	}
+	return null;
+}
+
+// orelse supplies a default when the lookup misses.
+fn find_or_default(hay []i32, needle i32, fallback i32) i32 {
+	return index_of(hay, needle) orelse fallback;
+}
+
+fn main() void {
+	var nums [4]i32 = [10, 20, 30, 40];
+	var s []i32 = nums;
+
+	// Check presence with `== null`, then unwrap with `?`.
+	var hit = index_of(s, 30);
+	if hit == null {
+		printf("miss: expected a hit\n");
+	} else {
+		printf("found 30 at %d\n", hit?);
+	}
+
+	// A miss stays null.
+	var miss = index_of(s, 99);
+	if miss != null {
+		printf("unexpected hit\n");
+	} else {
+		printf("99 not found, miss is null\n");
+	}
+
+	// Defaulting: the fallback wins when the optional is null.
+	var d = find_or_default(s, 99, -1);
+	printf("default for 99: %d\n", d);
+
+	// ?str payloads: wrap, unwrap, default, and re-wrap by assignment.
+	var name ?str = "tinoc";
+	printf("name: %s\n", name?);
+	name = null;
+	var who = name orelse "unknown";
+	printf("after clearing, who: %s\n", who);
+
+	var count i32 = 0;
+	if hit != null {
+		count += hit?;
+	}
+	printf("count = %d\n", count);
+}

@@ -301,8 +301,70 @@ No direct C equivalent. Represented as:
 typedef struct {
     T value;
     bool has_value;
-} optional_T;
+} tnc_opt_T;
 ```
+
+An optional wraps a payload of type `T` with a `has_value` flag: a `?T`
+is either empty (`null`) or holds a `T`. The compiler emits one named
+typedef per optional type used (`?i32` -> `tnc_opt_i32`), so every
+declaration of the same optional type shares one C struct type.
+
+***Syntax:***
+
+```
+var maybe ?i32 = 42;   // wrap a payload
+var none  ?i32 = null; // the empty optional
+
+maybe orelse 0   // payload when some, else the fallback (result type is T)
+maybe?           // unwrap: the payload (only after a != null check)
+maybe == null    // presence checks
+maybe != null
+```
+
+***Example:***
+
+```
+fn index_of(hay []i32, needle i32) ?i32 {
+	var i i32 = 0;
+	while i < hay.len {
+		if hay[i] == needle {
+			return i; // plain i32 auto-wraps into ?i32
+		}
+		i += 1;
+	}
+	return null;
+}
+
+fn main() void {
+	var maybe ?i32 = 42;
+	var none  ?i32 = null;
+
+	if none == null {
+		var v = maybe orelse 0; // 42 — v is an i32
+		var u = maybe?;         // 42
+	}
+	var nums [4]i32 = [10, 20, 30, 40];
+	var s []i32 = nums;
+	var d = index_of(s, 99) orelse -1; // -1
+}
+```
+
+***Notes:***
+
+- A plain `T` value — or `null` — auto-wraps into a `?T` wherever one is
+  expected: `var`/`const` initializers, call arguments, return values,
+  and assignments. Untyped numeric literals adapt to the payload type
+  (`var x ?f64 = 5;`).
+- `orelse` short-circuits: the fallback is only evaluated when the
+  optional is `null`. Its result type is the payload type `T`, so
+  `var x = maybe orelse 0;` infers `x` as `i32`.
+- `maybe?` reads the payload; unwrapping an empty optional reads the
+  wrapped `value` field (garbage, not a crash) — always check
+  `maybe != null` first.
+- Comparing an optional with anything but `null` is rejected — use
+  `== null` / `!= null`. `orelse` requires an optional on the left and
+  `?` unwrap requires an optional. Optionals of arrays or `void` are
+  rejected (use `?[]T` for a nullable collection view).
 
 ## Error Union Types
 

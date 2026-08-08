@@ -1346,3 +1346,119 @@ fn main() void {
 }
 `, "cannot initialize array")
 }
+
+// --- Optionals (?T, null, orelse) ---
+
+func TestOptionalDeclsAndCoercion(t *testing.T) {
+	// ?T declarations, payload/null coercions in initializers, call
+	// arguments, returns and assignments, plus orelse defaulting and
+	// `?` unwrap, all type-check cleanly together.
+	checkNoErrors(t, `
+fn maybe() ?i32 {
+	return 5;
+}
+
+fn none() ?str {
+	return null;
+}
+
+fn take(o ?i32) i32 {
+	return o orelse 0;
+}
+
+fn main() void {
+	var a ?i32 = 42;
+	var b ?i32 = null;
+	var c ?f64 = 5;       // untyped literal adapts to the payload type
+	var d ?str = "hi";
+	var e = a orelse -1;  // orelse result type is the payload type
+	if e != 42 {
+		return;
+	}
+	var u = a?;           // unwrap yields the payload type
+	if u != 42 {
+		return;
+	}
+	var n = none();
+	n = "yo";            // payload auto-wraps on assignment
+	if n == null or n? != "yo" {
+		return;
+	}
+	take(7);
+	take(null);
+	return;
+}
+`)
+}
+
+func TestOptionalInference(t *testing.T) {
+	// var/const without a declared type infer the optional type from
+	// the initializer; null checks, orelse and unwrap all work on it.
+	checkNoErrors(t, `
+fn maybe() ?i32 {
+	return 5;
+}
+
+fn main() void {
+	var a = maybe();
+	const b = a;
+	if a == null {
+		return;
+	}
+	var c = b orelse 9;
+	if c != 5 {
+		return;
+	}
+	if b? != 5 {
+		return;
+	}
+	return;
+}
+`)
+}
+
+func TestOptionalErrors(t *testing.T) {
+	// null only initializes/coerces into optionals.
+	checkHasError(t, `
+fn main() void {
+	var x i32 = null;
+	return;
+}
+`, "cannot use")
+
+	// An optional compares only against null.
+	checkHasError(t, `
+fn main() void {
+	var x ?i32 = 5;
+	if x == 5 {
+		return;
+	}
+}
+`, "compare against null")
+
+	// orelse requires an optional on the left.
+	checkHasError(t, `
+fn main() void {
+	var x i32 = 5;
+	var y = x orelse 0;
+	return;
+}
+`, "orelse")
+
+	// Unwrapping a non-optional with `?` is rejected.
+	checkHasError(t, `
+fn main() void {
+	var x i32 = 5;
+	var y = x?;
+	return;
+}
+`, "cannot unwrap")
+
+	// An optional of an array has no C representation; slices suggested.
+	checkHasError(t, `
+fn main() void {
+	var o ?[3]i32 = null;
+	return;
+}
+`, "use a slice")
+}

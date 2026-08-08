@@ -1037,3 +1037,131 @@ fn main() void {
 		t.Fatalf("expected exit 11 (float underscore separator), got %d", code)
 	}
 }
+
+// --- Optionals (?T, null, orelse) end-to-end ---
+
+func TestCodegen_OptionalOrelseAndUnwrap(t *testing.T) {
+	_, code := runMainWithExit(t, `
+fn maybe_five() ?i32 {
+	return 5;
+}
+
+fn none() ?i32 {
+	return null;
+}
+
+fn take(o ?i32) i32 {
+	return o orelse -1;
+}
+
+fn main() void {
+	var a ?i32 = 42;
+	var b ?i32 = null;
+	if a == null {
+		tinoc_exit(1);
+	}
+	if b != null {
+		tinoc_exit(2);
+	}
+	var five = maybe_five();
+	if five? != 5 {
+		tinoc_exit(3);
+	}
+	var d = none() orelse 7;
+	if d != 7 {
+		tinoc_exit(4);
+	}
+	var u = a orelse 0;
+	if u != 42 {
+		tinoc_exit(5);
+	}
+	if take(null) != -1 {
+		tinoc_exit(6);
+	}
+	if take(a) != 42 {
+		tinoc_exit(7);
+	}
+	b = 99;
+	if b == null {
+		tinoc_exit(8);
+	}
+	if b? != 99 {
+		tinoc_exit(9);
+	}
+	tinoc_exit(11);
+}
+`)
+	if code != 11 {
+		t.Fatalf("expected exit 11 (optional orelse/unwrap/null), got %d", code)
+	}
+}
+
+func TestCodegen_OptionalNullChecks(t *testing.T) {
+	_, code := runMainWithExit(t, `
+fn find(pos i32) ?i32 {
+	if pos < 0 {
+		return null;
+	}
+	return pos;
+}
+
+fn main() void {
+	var a = find(10);
+	if a == null or a? != 10 {
+		tinoc_exit(1);
+	}
+	var b = find(-1);
+	if b != null {
+		tinoc_exit(2);
+	}
+	var wrapped ?i32 = null;
+	if wrapped != null {
+		tinoc_exit(3);
+	}
+	wrapped = find(3);
+	if wrapped == null or wrapped? != 3 {
+		tinoc_exit(4);
+	}
+	tinoc_exit(11);
+}
+`)
+	if code != 11 {
+		t.Fatalf("expected exit 11 (optional null checks), got %d", code)
+	}
+}
+
+func TestCodegen_OptionalStr(t *testing.T) {
+	_, code := runMainWithExit(t, `
+fn nick() ?str {
+	return null;
+}
+
+fn greet(name ?str) str {
+	return name orelse "world";
+}
+
+fn main() void {
+	var s ?str = "tinoc";
+	if s? != "tinoc" {
+		tinoc_exit(1);
+	}
+	var g = greet(s);
+	if g != "tinoc" {
+		tinoc_exit(2);
+	}
+	var h = greet(nick());
+	if h != "world" {
+		tinoc_exit(3);
+	}
+	var m ?str = null;
+	m = "yo";
+	if m == null or m? != "yo" {
+		tinoc_exit(4);
+	}
+	tinoc_exit(11);
+}
+`)
+	if code != 11 {
+		t.Fatalf("expected exit 11 (optional str), got %d", code)
+	}
+}

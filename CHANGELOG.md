@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Optionals**: `?T` — a `{ T value; bool has_value; }` wrapper emitted
+  as a named typedef (`?i32` -> `tnc_opt_i32`), with `null` as the empty
+  value, `x orelse fallback` defaulting (the fallback is only evaluated
+  when the optional is null), `x?` payload unwrap, and `== null` /
+  `!= null` presence checks. A plain `T` value (or `null`) auto-wraps
+  into a `?T` wherever one is expected — initializers, call arguments,
+  return values, assignments — and untyped literals adapt to the payload
+  type (`var x ?f64 = 5;`). Comparing an optional with a non-null value,
+  `orelse` on a non-optional, `?` on a non-optional, and optionals of
+  arrays or `void` are all rejected with clear diagnostics. Sample:
+  `samples/23_optionals.tnc`.
 - **Arrays**: `[N]T`, `[_]T` (size inferred from the literal), and
   `[N:x]T` sentinel-terminated arrays — array literals with inferred or
   explicit element types, index access and element assignment
