@@ -1,0 +1,78 @@
+// 22_array_functions.tnc — functions that operate on collections.
+//
+// Arrays are values that live where they are declared; functions cannot
+// take or return array values (the compiler rejects them with a hint).
+// Instead, functions work over slices, which view any array:
+//   - slice parameters: fn total(s []i32)
+//   - passing arrays (implicit conversion) and passing slices around
+//   - mutation through a slice (writes through to the backing array)
+//   - indexed access with a while loop (Tinoc has range and
+//     collection loops, not C-style for loops)
+
+extern "C" fn printf(fmt *const char, ...) i32;
+
+// Classic reduction: total of a slice.
+fn total(s []i32) i32 {
+	var t i32 = 0;
+	for s |v| {
+		t += v;
+	}
+	return t;
+}
+
+// Scans for the first even value; -1 if none.
+fn first_even(s []i32) i32 {
+	var i i32 = 0;
+	while i < s.len {
+		if s[i] % 2 == 0 {
+			return s[i];
+		}
+		i += 1;
+	}
+	return -1;
+}
+
+// Doubles every element in place (writes through to the backing array).
+fn double_all(s []i32) void {
+	var i i32 = 0;
+	while i < s.len {
+		s[i] = s[i] * 2;
+		i += 1;
+	}
+}
+
+fn main() void {
+	var scores [6]i32 = [3, 7, 2, 9, 4, 6];
+
+	if total(scores) != 31 {
+		printf("bad total\n");
+		return;
+	}
+	if first_even(scores) != 2 {
+		printf("bad first_even\n");
+		return;
+	}
+
+	// Functions mutate the backing array through the slice.
+	double_all(scores);
+	if scores[0] != 6 or scores[3] != 18 {
+		printf("bad double_all\n");
+		return;
+	}
+
+	// Slices compose: a slice view of the array flows through
+	// function calls just like the array itself did.
+	var view []i32 = scores;
+	if total(view) != total(scores) {
+		printf("bad composition\n");
+		return;
+	}
+
+	// The function keeps seeing the same (mutated) storage.
+	if first_even(view) != 6 {
+		printf("bad first_even after mutation\n");
+		return;
+	}
+
+	printf("array functions OK: total %d\n", total(scores));
+}

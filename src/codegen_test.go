@@ -794,3 +794,246 @@ fn main() void {
 		t.Fatalf("expected exit 13 (union instance methods), got %d", code)
 	}
 }
+
+// === Arrays & Slices ===
+
+func TestCodegen_ArrayBasics(t *testing.T) {
+	_, code := runMainWithExit(t, `
+fn main() void {
+	var nums [5]i32 = [10, 20, 30, 40, 50];
+	var total i32 = 0;
+	for nums |n| {
+		total += n;
+	}
+	if total != 150 {
+		tinoc_exit(1);
+	}
+	if nums.len != 5 {
+		tinoc_exit(2);
+	}
+	if nums[0] != 10 or nums[4] != 50 {
+		tinoc_exit(3);
+	}
+	nums[0] = 99;
+	if nums[0] != 99 {
+		tinoc_exit(4);
+	}
+	tinoc_exit(11);
+}
+`)
+	if code != 11 {
+		t.Fatalf("expected exit 11 (array basics), got %d", code)
+	}
+}
+
+func TestCodegen_SliceFromArray(t *testing.T) {
+	_, code := runMainWithExit(t, `
+fn sum(s []i32) i32 {
+	var total i32 = 0;
+	for s |v| {
+		total += v;
+	}
+	return total;
+}
+
+fn main() void {
+	var nums [4]i32 = [1, 2, 3, 4];
+	var s []i32 = nums;
+	if sum(nums) != 10 {
+		tinoc_exit(1);
+	}
+	if s.len != 4 {
+		tinoc_exit(2);
+	}
+	if s[0] != 1 or s[3] != 4 {
+		tinoc_exit(3);
+	}
+	s[1] = 20;
+	if nums[1] != 20 {
+		tinoc_exit(4);
+	}
+	tinoc_exit(11);
+}
+`)
+	if code != 11 {
+		t.Fatalf("expected exit 11 (slice from array), got %d", code)
+	}
+}
+
+func TestCodegen_SliceLiteral(t *testing.T) {
+	_, code := runMainWithExit(t, `
+fn total(s []i32) i32 {
+	var sum i32 = 0;
+	for s |v| {
+		sum += v;
+	}
+	return sum;
+}
+
+fn main() void {
+	var s []i32 = [3, 1, 4, 1, 5];
+	if s.len != 5 {
+		tinoc_exit(1);
+	}
+	if total(s) != 14 {
+		tinoc_exit(2);
+	}
+	tinoc_exit(11);
+}
+`)
+	if code != 11 {
+		t.Fatalf("expected exit 11 (slice literal), got %d", code)
+	}
+}
+
+func TestCodegen_ArrayLiteralToSliceParam(t *testing.T) {
+	_, code := runMainWithExit(t, `
+fn sum(s []i32) i32 {
+	var total i32 = 0;
+	for s |v| {
+		total += v;
+	}
+	return total;
+}
+
+fn main() void {
+	if sum([10, 20, 30]) != 60 {
+		tinoc_exit(1);
+	}
+	tinoc_exit(11);
+}
+`)
+	if code != 11 {
+		t.Fatalf("expected exit 11 (array literal to slice param), got %d", code)
+	}
+}
+
+func TestCodegen_MultidimArray(t *testing.T) {
+	_, code := runMainWithExit(t, `
+fn main() void {
+	const mat [2][2]f32 = [[1.0, 2.0], [3.0, 4.0]];
+	var trace f32 = mat[0][0] + mat[1][1];
+	if trace != 5.0 {
+		tinoc_exit(1);
+	}
+	tinoc_exit(11);
+}
+`)
+	if code != 11 {
+		t.Fatalf("expected exit 11 (multidimensional array), got %d", code)
+	}
+}
+
+func TestCodegen_SentinelArray(t *testing.T) {
+	_, code := runMainWithExit(t, `
+fn main() void {
+	const buf [_:0]u8 = [1, 2, 3, 4];
+	if buf.len != 4 {
+		tinoc_exit(1);
+	}
+	if buf[3] != 4 {
+		tinoc_exit(2);
+	}
+	if buf[4] != 0 {
+		tinoc_exit(3);
+	}
+	tinoc_exit(11);
+}
+`)
+	if code != 11 {
+		t.Fatalf("expected exit 11 (sentinel array), got %d", code)
+	}
+}
+
+func TestCodegen_StructArrayField(t *testing.T) {
+	_, code := runMainWithExit(t, `
+struct Buffer {
+	data [5]i32;
+	size i32;
+}
+
+fn main() void {
+	var b Buffer;
+	b.size = 5;
+	var i i32 = 0;
+	while i < 5 {
+		b.data[i] = i * i;
+		i += 1;
+	}
+	var total i32 = 0;
+	for b.data |v| {
+		total += v;
+	}
+	if total != 30 or b.data.len != 5 {
+		tinoc_exit(1);
+	}
+	if b.data[2] != 4 {
+		tinoc_exit(2);
+	}
+	tinoc_exit(11);
+}
+`)
+	if code != 11 {
+		t.Fatalf("expected exit 11 (struct array field), got %d", code)
+	}
+}
+
+func TestCodegen_SliceParamAndReturn(t *testing.T) {
+	_, code := runMainWithExit(t, `
+var pool [4]i32 = [5, 6, 7, 8];
+
+fn head4() []i32 {
+	return pool;
+}
+
+fn main() void {
+	var s []i32 = head4();
+	if s.len != 4 or s[0] != 5 or s[3] != 8 {
+		tinoc_exit(1);
+	}
+	tinoc_exit(11);
+}
+`)
+	if code != 11 {
+		t.Fatalf("expected exit 11 (slice param and return), got %d", code)
+	}
+}
+
+func TestCodegen_TopLevelArrayConst(t *testing.T) {
+	_, code := runMainWithExit(t, `
+const primes [5]i32 = [2, 3, 5, 7, 11];
+
+fn main() void {
+	if primes.len != 5 or primes[4] != 11 {
+		tinoc_exit(1);
+	}
+	var total i32 = 0;
+	for primes |p| {
+		total += p;
+	}
+	if total != 28 {
+		tinoc_exit(2);
+	}
+	tinoc_exit(11);
+}
+`)
+	if code != 11 {
+		t.Fatalf("expected exit 11 (top-level array const), got %d", code)
+	}
+}
+
+func TestCodegen_FloatUnderscoreSeparator(t *testing.T) {
+	_, code := runMainWithExit(t, `
+fn main() void {
+	var pi f32 = 3.14_15;
+	if pi > 3.14 and pi < 3.15 {
+		tinoc_exit(11);
+	} else {
+		tinoc_exit(1);
+	}
+}
+`)
+	if code != 11 {
+		t.Fatalf("expected exit 11 (float underscore separator), got %d", code)
+	}
+}

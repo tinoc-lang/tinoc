@@ -788,23 +788,87 @@ Other useful Preprocessor may be add in future versions.
 
 ---
 
-# Array 
+# Array
 
-{placeholder}
+**Array** is a fixed-size, contiguous sequence of elements of type `T`.
+Its length is part of the type and known at compile time.
+
+***Syntax:***
+
+```
+[<length>]<T>        // fixed-size array, e.g. [5]u8
+[_]<T>               // size inferred from the initializer, e.g. [_]f32
+[<length>:<sentinel>]<T>  // sentinel-terminated array, e.g. [_:0]u8
+
+[<elem>, <elem>, ...]     // array literal; element type is inferred
+```
 
 ***Example:***
 
 ```
-// array literal
+// array literal with inferred element type
 const message = ['h', 'e', 'l', 'l', 'o'];
 
 // alternative initialization using result location
-const alt_message [5]u8 = [ 'h', 'e', 'l', 'l', 'o'];
+const alt_message [5]u8 = ['h', 'e', 'l', 'l', 'o'];
+
+// explicit element type, size inferred from the literal
+var floats [_]f32 = [1.5, 2.5, 3.5];
+
+// element access and assignment
+if message[0] != 'h' { ... }
+message[4] = 'x';
+
+// .len is the element count (compile-time constant for arrays)
+if message.len != 5 { ... }
+
+// iterate over the elements
+var total i32 = 0;
+for message |ch| {
+    total += ch;
+}
 ```
+
+***Notes:***
+
+- Array literals in a `var`/`const` initializer use plain C brace
+  initialization; the literal must match the declared length exactly.
+- `[N]T` and `[_]T` values store exactly `N` elements; `[N:x]T` stores
+  `N + 1` (the sentinel sits at index `N`), matching C string
+  conventions.
+- Elements are read/write accessible via `arr[i]`; indexing a
+  multidimensional array chains: `mat[i][j]`.
+
+## Slices
+
+A **slice** `[]T` is a fat pointer — a `{ ptr: ^T, len: usize }` pair
+that views a contiguous region of memory, typically an array.
+
+```
+var nums [5]i32 = [1, 2, 3, 4, 5];
+var s []i32 = nums;   // array converts implicitly to a slice view
+
+if s.len != 5 { ... } // runtime length
+s[2] = 30;            // writes through to the backing array
+
+fn total(s []i32) i32 { ... }  // functions take slices, not arrays
+```
+
+***Notes:***
+
+- Arrays convert implicitly to slices at call sites and in
+  assignments; the slice aliases the array's storage.
+- Functions cannot take or return array values (arrays are storage,
+  not handles) — the compiler rejects them and points you to slices:
+  `array parameter a is not supported ([3]i32) — use a slice ([]i32) instead`.
+- Assigning a whole array is rejected for the same reason; copy
+  element-wise instead.
+- Iterate with the collection form: `for s |v| { ... }`.
 
 ## Multidimensional arrays
 
-{Placeholder}
+Nested `[N]T` types build row-major matrices: `[4][5]f32` is 4 rows of
+5 `f32`. A row (`mat[i]`) is itself an array, so iterate row-by-row:
 
 ```
 const mat4x5 [4][5]f32 = [
@@ -813,7 +877,22 @@ const mat4x5 [4][5]f32 = [
     [0.0, 0.0, 1.0, 0.0, 0.0],
     [0.0, 0.0, 0.0, 1.0, 9.9],
 ];
+
+if mat4x5[2][3] != 0.0 { ... }
+
+var total f32 = 0.0;
+for 0..mat4x5.len |i| {
+    for mat4x5[i] |cell| {
+        total += cell;
+    }
+}
 ```
+
+***Notes:***
+
+- `.len` on a multidimensional array is the number of rows.
+- The compiler rejects iterating a multidimensional array directly
+  (its element is itself an array) — iterate a row instead.
 
 ## Sentinel-Terminated Array
 

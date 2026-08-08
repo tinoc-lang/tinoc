@@ -9,6 +9,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Arrays**: `[N]T`, `[_]T` (size inferred from the literal), and
+  `[N:x]T` sentinel-terminated arrays — array literals with inferred or
+  explicit element types, index access and element assignment
+  (`arr[i]`, `arr[i] = v`), the `.len` property (compile-time constant
+  for arrays), and `for arr |x|` collection iteration. Multidimensional
+  row-major arrays (`[4][5]f32`) support chained indexing (`mat[i][j]`)
+  and row-by-row iteration; iterating a multidimensional array directly
+  is rejected with a hint.
+- **Slices**: `[]T` — a fat pointer `{ ptr: ^T, len: usize }` that
+  views an array's storage. Arrays convert implicitly to slices at call
+  sites and in assignments, so functions take collections as slices
+  (`fn total(s []i32)`), index and mutate through them (write-through
+  to the backing array), read `.len` at runtime, and iterate with
+  `for s |v|`. Array parameters, array returns, and whole-array
+  assignment are rejected with a "use a slice" diagnostic; slice types
+  are emitted as named typedefs (`tnc_slice_i32`) so prototypes and
+  definitions share one C type.
+- **Samples**: `samples/19_array_basics.tnc` through
+  `samples/22_array_functions.tnc` covering array literals/types,
+  slices and implicit conversion, multidimensional + sentinel arrays,
+  and functions over collections.
+- **Docs**: `syntax.md`'s Array section (previously a placeholder) now
+  documents arrays, slices, multidimensional arrays, and
+  sentinel-terminated arrays with working examples.
+
 - **Enums**: `enum Name { Variant, Other(type), ... }` — fieldless
   variants compile to plain C enums; variants with payloads become
   tagged unions (tag + per-variant anonymous struct), so multi-field
@@ -49,6 +74,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (where git used to check out CRLF).
 
 ### Fixed
+
+- **Float literals**: underscore digit separators (e.g. `1_000.5`) are now
+  stripped before emission into C, so float literals with separators no
+  longer generate C that fails to compile.
+- **For-collection loops**: the loop index is compared against the
+  collection length as `size_t`, eliminating a `-Wsign-compare` warning
+  when iterating slices (and the generated loop now binds the collection
+  once, evaluating it exactly once).
+- **Slice `.len`**: typed as `i32` so `i < s.len` type-checks; codegen
+  casts the C `size_t` field so user comparisons do not trigger
+  `-Wsign-compare`.
+- **Const arrays**: iterating a `const` array no longer emits a
+  `-Wdiscarded-qualifiers` warning (the loop uses a const pointer).
 
 - **Compiler**: calling an instance method that was declared without a
   `self` parameter (e.g. `fn make() Data { ... }` inside a struct/union

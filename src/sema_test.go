@@ -1133,3 +1133,216 @@ union Pair:T { first T; }
 fn main() void { }
 `, "generic unions")
 }
+
+// === Arrays & Slices ===
+
+func TestArrayLiteralInferredType(t *testing.T) {
+	checkNoErrors(t, `
+fn main() void {
+	const nums = [1, 2, 3];
+	return;
+}
+`)
+}
+
+func TestArrayExplicitTypeWithChars(t *testing.T) {
+	checkNoErrors(t, `
+fn main() void {
+	const alt [5]u8 = ['h', 'e', 'l', 'l', 'o'];
+	return;
+}
+`)
+}
+
+func TestArrayInferredSize(t *testing.T) {
+	checkNoErrors(t, `
+fn main() void {
+	var xs [_]i32 = [10, 20, 30, 40];
+	return;
+}
+`)
+}
+
+func TestArrayLiteralLengthMismatch(t *testing.T) {
+	checkHasError(t, `
+fn main() void {
+	var xs [3]i32 = [1, 2, 3, 4];
+	return;
+}
+`, "declared type is [3]i32")
+}
+
+func TestArrayLiteralElementMismatch(t *testing.T) {
+	checkHasError(t, `
+fn main() void {
+	var xs [3]i32 = [1, 2, "x"];
+	return;
+}
+`, "array literal elements must all have the same type")
+}
+
+func TestArrayIndexingAndLen(t *testing.T) {
+	checkNoErrors(t, `
+fn main() void {
+	var nums [3]i32 = [7, 8, 9];
+	var first = nums[0];
+	const n = nums.len;
+	nums[1] = 42;
+	return;
+}
+`)
+}
+
+func TestArrayIndexMustBeInteger(t *testing.T) {
+	checkHasError(t, `
+fn main() void {
+	var nums [3]i32 = [7, 8, 9];
+	var x = nums["a"];
+	return;
+}
+`, "array index must be an integer")
+}
+
+func TestSliceDeclaredFromLiteral(t *testing.T) {
+	checkNoErrors(t, `
+fn main() void {
+	var s []i32 = [1, 2, 3];
+	var n = s.len;
+	var x = s[0];
+	s[1] = 5;
+	return;
+}
+`)
+}
+
+func TestArrayToSliceConversion(t *testing.T) {
+	checkNoErrors(t, `
+fn sum(s []i32) i32 {
+	var total i32 = 0;
+	for s |v| {
+		total += v;
+	}
+	return total;
+}
+
+fn main() void {
+	var nums [4]i32 = [1, 2, 3, 4];
+	var total = sum(nums);
+	var s []i32 = nums;
+	return;
+}
+`)
+}
+
+func TestArrayParamRejected(t *testing.T) {
+	checkHasError(t, `
+fn f(a [3]i32) i32 {
+	return a[0];
+}
+`, "array parameter")
+}
+
+func TestArrayReturnRejected(t *testing.T) {
+	checkHasError(t, `
+fn f() [3]i32 {
+	var a [3]i32 = [1, 2, 3];
+	return a;
+}
+`, "returning an array value")
+}
+
+func TestWholeArrayAssignmentRejected(t *testing.T) {
+	checkHasError(t, `
+fn main() void {
+	var a [2]i32 = [1, 2];
+	var b [2]i32 = [3, 4];
+	a = b;
+	return;
+}
+`, "cannot assign a whole array")
+}
+
+func TestArrayComparisonRejected(t *testing.T) {
+	checkHasError(t, `
+fn main() void {
+	var a [2]i32 = [1, 2];
+	var b [2]i32 = [1, 2];
+	if a == b {
+		return;
+	}
+	return;
+}
+`, "cannot compare")
+}
+
+func TestSliceComparisonRejected(t *testing.T) {
+	checkHasError(t, `
+fn main() void {
+	var a []i32 = [1, 2];
+	var b []i32 = [1, 2];
+	if a == b {
+		return;
+	}
+	return;
+}
+`, "cannot compare")
+}
+
+func TestMultidimArrayLiteral(t *testing.T) {
+	checkNoErrors(t, `
+fn main() void {
+	const mat [2][2]f32 = [[1.0, 0.0], [0.0, 1.0]];
+	var e = mat[1][0];
+	return;
+}
+`)
+}
+
+func TestSentinelArray(t *testing.T) {
+	checkNoErrors(t, `
+fn main() void {
+	const buf [_:0]u8 = [1, 2, 3, 4];
+	const n = buf.len;
+	const z = buf[4];
+	return;
+}
+`)
+}
+
+func TestForOverCollection(t *testing.T) {
+	checkNoErrors(t, `
+fn main() void {
+	var nums [4]i32 = [1, 2, 3, 4];
+	var total i32 = 0;
+	for nums |n| {
+		total += n;
+	}
+	var s []i32 = nums;
+	for s |v| {
+		total += v;
+	}
+	return;
+}
+`)
+}
+
+func TestForOverMultidimRejected(t *testing.T) {
+	checkHasError(t, `
+fn main() void {
+	const mat [2][2]f32 = [[1.0, 0.0], [0.0, 1.0]];
+	for mat |row| {
+	}
+	return;
+}
+`, "multidimensional")
+}
+
+func TestArrayCopyFromAnotherArrayRejected(t *testing.T) {
+	checkHasError(t, `
+fn main() void {
+	var a [2]i32 = [1, 2];
+	var b [2]i32 = a;
+	return;
+}
+`, "cannot initialize array")
+}

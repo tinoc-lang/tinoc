@@ -154,6 +154,13 @@ type Sema struct {
 	// `str` variable handed to printf's variadic %s). Codegen consults it
 	// when rendering real C calls.
 	cStrArgs map[Expression]bool
+
+	// sliceConvs marks expressions Sema accepted as an implicit
+	// array -> slice conversion (a `[N]T` value used where a `[]T` is
+	// expected: var initializer, call argument, return value, or
+	// assignment). Codegen wraps these in a fat-pointer compound
+	// literal `((tinoc_slice(T)){ .ptr = ..., .len = N })`.
+	sliceConvs map[Expression]bool
 }
 
 // NewSema constructs a Sema instance bound to the given diagnostics
@@ -180,6 +187,7 @@ func NewSema(diags *Diagnostics) *Sema {
 		unionTypes:     make(map[string]*Type),
 		unionMethods:   make(map[string]map[string]*Symbol),
 		cStrArgs:       make(map[Expression]bool),
+		sliceConvs:     make(map[Expression]bool),
 	}
 }
 
@@ -325,6 +333,12 @@ func (s *Sema) registerFunctionSignature(fn *FunctionStatement) {
 			s.errorAt(fn.Token.Line, fn.Token.Column, "parameter %s is missing a type", pname)
 			pt = &Type{Kind: KindInvalid}
 		}
+		// C cannot pass arrays by value; array-typed parameters are
+		// rejected up front with a slice suggestion.
+		if pt != nil && pt.Kind == KindArray {
+			s.errorAt(fn.Token.Line, fn.Token.Column, "array parameter %s is not supported (%s) — use a slice ([]%s) instead", pname, pt.String(), typeStringOrInvalid(pt.Elem))
+			pt = &Type{Kind: KindInvalid}
+		}
 		sym.Params = append(sym.Params, pt)
 		sym.ParamNames = append(sym.ParamNames, pname)
 	}
@@ -332,6 +346,14 @@ func (s *Sema) registerFunctionSignature(fn *FunctionStatement) {
 	if fn.ReturnType != nil {
 		sym.ReturnType = s.resolveTypeExpr(fn.ReturnType)
 	} else {
+		sym.ReturnType = typeVoid
+	}
+
+	// C cannot return arrays by value (and Tinoc has no struct wrapper
+	// for them yet); reject array-typed returns with a clear diagnostic.
+	// Slices return fine — they are a struct.
+	if sym.ReturnType != nil && sym.ReturnType.Kind == KindArray {
+		s.errorAt(fn.Token.Line, fn.Token.Column, "returning an array value is not supported (%s) — return a slice ([]%s) instead", sym.ReturnType.String(), typeStringOrInvalid(sym.ReturnType.Elem))
 		sym.ReturnType = typeVoid
 	}
 
@@ -673,6 +695,12 @@ func (s *Sema) registerTypeMethod(typeName string, methods map[string]map[string
 			s.errorAt(line, col, "parameter %s is missing a type", pname)
 			pt = &Type{Kind: KindInvalid}
 		}
+		// Array-typed method parameters are rejected the same way as
+		// plain function parameters (C cannot pass arrays by value).
+		if pt != nil && pt.Kind == KindArray {
+			s.errorAt(line, col, "array parameter %s is not supported (%s) — use a slice ([]%s) instead", pname, pt.String(), typeStringOrInvalid(pt.Elem))
+			pt = &Type{Kind: KindInvalid}
+		}
 		sym.Params = append(sym.Params, pt)
 		sym.ParamNames = append(sym.ParamNames, pname)
 	}
@@ -697,9 +725,13 @@ func (s *Sema) registerTypeMethod(typeName string, methods map[string]map[string
 		sym.ReturnType = typeVoid
 	}
 
+	if sym.ReturnType != nil && sym.ReturnType.Kind == KindArray {
+		s.errorAt(line, col, "returning an array value is not supported (%s.%s) — return a slice ([]%s) instead", typeName, name, typeStringOrInvalid(sym.ReturnType.Elem))
+		sym.ReturnType = typeVoid
+	}
+
 	methods[typeName][name] = sym
 }
-
 func typeStringOrInvalid(t *Type) string {
 	if t == nil {
 		return "<invalid>"
@@ -844,6 +876,34 @@ func (s *Sema) resolveOptionalType(te TypeExpr) *Type {
 func (s *Sema) reconcileDeclType(name string, declaredType, valueType *Type, valueExpr Expression, line, col int) *Type {
 	switch {
 	case declaredType != nil && valueType != nil:
+		// Array/slice result locations: an array literal binds directly
+		// (with length/sentinel validation and element retyping), and a
+		// plain array value converts to a slice target (`var s []i32 =
+		// nums;`).
+		if declaredType.Kind == KindArray || declaredType.Kind == KindSlice {
+			if s.retypeArrayLiteral(declaredType, valueExpr, line, col) {
+				// An array literal bound to a slice target keeps its [N]T
+				// type (codegen slices it via sliceConvs); bound to an
+				// array target it retypes to the declared array so codegen
+				// emits the correct size/sentinel.
+				if declaredType.Kind == KindArray {
+					s.resolvedTypes[valueExpr] = declaredType
+				}
+				return declaredType
+			}
+			if declaredType.Kind == KindSlice && valueType.Kind == KindArray &&
+				valueType.Elem != nil && valueType.Elem.Kind != KindArray &&
+				typesEqual(declaredType.Elem, valueType.Elem) {
+				s.sliceConvs[valueExpr] = true
+				return declaredType
+			}
+		}
+		// Copying one array value into another has no C equivalent
+		// (arrays are not assignable lvalues); point users at slices.
+		if declaredType.Kind == KindArray && valueType.Kind == KindArray {
+			s.errorAt(line, col, "cannot initialize array %s from another array (type %s) — use a slice ([]%s) or copy element-wise", name, valueType.String(), typeStringOrInvalid(declaredType.Elem))
+			return declaredType
+		}
 		if isUntypedLiteral(valueExpr) && valueType.isNumeric() && declaredType.isNumeric() {
 			// Untyped numeric literal adapts to the declared type,
 			// e.g. `var big i64 = 5;` -- 5 defaults to i32 but widens to
@@ -1255,6 +1315,13 @@ func (s *Sema) checkReturnStatement(r *ReturnStatement) {
 		return
 	}
 
+	// Array value returned from a `[]T` function converts to a slice.
+	if want.Kind == KindSlice && got != nil && got.Kind == KindArray &&
+		got.Elem != nil && got.Elem.Kind != KindArray && typesEqual(want.Elem, got.Elem) {
+		s.sliceConvs[r.ReturnValue] = true
+		return
+	}
+
 	if !assignable(want, got) {
 		s.errorAt(r.Token.Line, r.Token.Column, "%s", describeMismatch("return value", got, want))
 	}
@@ -1287,8 +1354,17 @@ func (s *Sema) checkForStatement(f *ForStatement) {
 
 	var elemType *Type
 	if f.Collection != nil {
-		s.checkExpression(f.Collection)
-		elemType = &Type{Kind: KindUnknown, Name: "elem"} // arrays/slices unresolved in this pass
+		collType := s.checkExpression(f.Collection)
+		if collType != nil && (collType.Kind == KindArray || collType.Kind == KindSlice) {
+			if collType.Elem != nil && collType.Elem.Kind == KindArray {
+				s.errorAt(f.Token.Line, f.Token.Column, "cannot iterate over a multidimensional array (%s) — iterate over a row or index explicitly", collType.String())
+				elemType = &Type{Kind: KindUnknown, Name: "elem"}
+			} else {
+				elemType = collType.Elem
+			}
+		} else {
+			elemType = &Type{Kind: KindUnknown, Name: "elem"}
+		}
 	} else {
 		if f.Start != nil {
 			s.checkExpression(f.Start)
@@ -1356,10 +1432,7 @@ func (s *Sema) inferExpression(e Expression) *Type {
 	case *NullLiteral:
 		return &Type{Kind: KindUnknown, Name: "null"}
 	case *ArrayLiteral:
-		for _, el := range ex.Elements {
-			s.checkExpression(el)
-		}
-		return &Type{Kind: KindUnknown, Name: "array"}
+		return s.checkArrayLiteral(ex)
 	case *PrefixExpression:
 		return s.checkPrefixExpression(ex)
 	case *PostfixExpression:
@@ -1371,13 +1444,7 @@ func (s *Sema) inferExpression(e Expression) *Type {
 	case *CallExpression:
 		return s.checkCallExpression(ex)
 	case *IndexExpression:
-		if ex.Left != nil {
-			s.checkExpression(ex.Left)
-		}
-		if ex.Index != nil {
-			s.checkExpression(ex.Index)
-		}
-		return &Type{Kind: KindUnknown, Name: "index"}
+		return s.checkIndexExpression(ex)
 	case *FieldAccessExpression:
 		// Module member access (cio.printf / io.println) and struct field
 		// access both parse to this node. C module members (#importc) are
@@ -1419,6 +1486,126 @@ func bitsNeeded(v int64) int {
 	return 32 + bits
 }
 
+// checkArrayLiteral infers the type of an array literal: the element type
+// comes from the first element (recursively for nested literals, so
+// `[[1, 2], [3, 4]]` infers `[2][2]i32`), and every element must agree.
+// An empty literal has no element type to infer from; Sema returns
+// KindUnknown and relies on an explicit declared type (`var s []i32 =
+// [];`) to retype it in reconcileDeclType.
+func (s *Sema) checkArrayLiteral(al *ArrayLiteral) *Type {
+	if len(al.Elements) == 0 {
+		return &Type{Kind: KindUnknown, Name: "array"}
+	}
+
+	var elemType *Type
+	for i, el := range al.Elements {
+		elType := s.checkExpression(el)
+		if i == 0 {
+			elemType = elType
+			continue
+		}
+		if elemType != nil && elType != nil && !typesEqual(elemType, elType) {
+			s.errorAt(al.Token.Line, al.Token.Column, "array literal elements must all have the same type (got %s and %s)", elemType.String(), elType.String())
+		}
+	}
+	if elemType == nil {
+		return &Type{Kind: KindUnknown, Name: "array"}
+	}
+	t := &Type{Kind: KindArray, Elem: elemType, ArraySize: len(al.Elements)}
+	t.Name = t.arrayTypeName()
+	return t
+}
+
+// checkIndexExpression types `a[i]`: indexing an array or slice yields
+// its element type, and the index must be an integer. Anything else
+// keeps the previous unresolved behavior (e.g. pointer indexing, which
+// codegen emits as plain C `p[i]` without further type-checking).
+func (s *Sema) checkIndexExpression(ie *IndexExpression) *Type {
+	var leftType *Type
+	if ie.Left != nil {
+		leftType = s.checkExpression(ie.Left)
+	}
+	var idxType *Type
+	if ie.Index != nil {
+		idxType = s.checkExpression(ie.Index)
+	}
+
+	if leftType != nil && (leftType.Kind == KindArray || leftType.Kind == KindSlice) {
+		if leftType.Elem == nil {
+			return &Type{Kind: KindUnknown, Name: "index"}
+		}
+		if idxType != nil && idxType.Kind != KindUnknown && idxType.Kind != KindInvalid && !idxType.isInteger() {
+			s.errorAt(ie.Token.Line, ie.Token.Column, "array index must be an integer (got %s)", idxType.String())
+		}
+		return leftType.Elem
+	}
+	return &Type{Kind: KindUnknown, Name: "index"}
+}
+
+// retypeArrayLiteral rebinds an array literal to an explicit declared
+// array/slice type at a result location (`var a [5]u8 = [...]`,
+// `const m [2][2]f32 = [[...]]`, `var s []i32 = [1, 2, 3];`). It
+// validates length agreement, fills in an inferred `[_]T` size, retypes
+// every element (recursively for nested literals) so inner untyped
+// literals widen to the declared element type, and records the array ->
+// slice conversion for codegen. Returns false when valueExpr is not an
+// array literal, so the caller falls through to its other checks.
+func (s *Sema) retypeArrayLiteral(declared *Type, valueExpr Expression, line, col int) bool {
+	al, ok := valueExpr.(*ArrayLiteral)
+	if !ok || al == nil {
+		return false
+	}
+
+	if declared.Kind == KindSlice {
+		// `var s []i32 = [1, 2, 3];` — the literal is stored as a
+		// temporary [N]T array that codegen slices into {ptr, len}.
+		s.sliceConvs[al] = true
+		if declared.Elem != nil {
+			s.retypeArrayLiteralElements(al, declared.Elem, line, col)
+		}
+		return true
+	}
+
+	// KindArray: length agreement, and infer `[_]T` from the literal.
+	if declared.ArraySize == 0 {
+		declared.ArraySize = len(al.Elements)
+		declared.Name = declared.arrayTypeName()
+	} else if declared.ArraySize != len(al.Elements) {
+		s.errorAt(line, col, "array literal has %d element(s), but declared type is %s", len(al.Elements), declared.String())
+		return true
+	}
+	if declared.Elem != nil {
+		s.retypeArrayLiteralElements(al, declared.Elem, line, col)
+	}
+	return true
+}
+
+// retypeArrayLiteralElements sets each element of a literal to the
+// declared element type, recursing into nested literals so
+// multidimensional arrays retype level by level. Untyped numeric and
+// char literals adapt freely (e.g. `[5]u8 = ['h', 'e', ...]`); genuinely
+// mismatched elements are reported.
+func (s *Sema) retypeArrayLiteralElements(al *ArrayLiteral, wantElem *Type, line, col int) {
+	for _, el := range al.Elements {
+		if inner, ok := el.(*ArrayLiteral); ok && inner != nil && wantElem.Kind == KindArray {
+			s.retypeArrayLiteralElements(inner, wantElem.Elem, line, col)
+			s.resolvedTypes[inner] = wantElem
+			continue
+		}
+		elType := s.resolvedTypes[el]
+		if isUntypedLiteral(el) && wantElem.isNumeric() {
+			s.resolvedTypes[el] = wantElem
+			continue
+		}
+		if elType != nil && elType.Kind == KindChar && wantElem.isInteger() {
+			s.resolvedTypes[el] = wantElem
+			continue
+		}
+		if elType != nil && wantElem != nil && !typesEqual(elType, wantElem) {
+			s.errorAt(line, col, "%s", describeMismatch("array literal element", elType, wantElem))
+		}
+	}
+}
 func (s *Sema) checkIdentifier(id *Identifier) *Type {
 	if sym, ok := s.current.Lookup(id.Value); ok {
 		return sym.Type
@@ -1494,6 +1681,12 @@ func (s *Sema) checkFieldAccess(fa *FieldAccessExpression) *Type {
 	// `getPoint().x`. The receiver type drives everything.
 	if fa.Left != nil && fa.Field != nil {
 		recvType := s.checkExpression(fa.Left)
+		// Array/slice `.len`: the element count — a compile-time constant
+		// for arrays, the runtime len field for slices.
+		if recvType != nil && fa.Field.Value == "len" &&
+			(recvType.Kind == KindArray || recvType.Kind == KindSlice) {
+			return typeI32
+		}
 		if recvType != nil && recvType.Kind == KindStruct {
 			if idx, ok := recvType.FieldIndex[fa.Field.Value]; ok {
 				return recvType.Fields[idx].Type
@@ -1817,6 +2010,14 @@ func (s *Sema) checkCallArgs(ce *CallExpression, sym *Symbol, calleeName string,
 			s.cStrArgs[ce.Arguments[i]] = true
 			continue
 		}
+		// A fixed-size array argument converts implicitly to a slice
+		// parameter: `total(nums)` with `fn total(s []i32)`.
+		if want.Kind == KindSlice && argType.Kind == KindArray &&
+			argType.Elem != nil && argType.Elem.Kind != KindArray &&
+			typesEqual(want.Elem, argType.Elem) {
+			s.sliceConvs[ce.Arguments[i]] = true
+			continue
+		}
 		if want.Kind == KindUnknown || argType.Kind == KindUnknown || argType.Kind == KindInvalid {
 			continue
 		}
@@ -1929,13 +2130,14 @@ func (s *Sema) checkInfixExpression(ie *InfixExpression) *Type {
 			s.resolvedTypes[ie.Right] = lt
 		}
 		s.checkOperandsCompatible(ie, lt, rt)
-		// C has no equality operator for structs or unions, so comparing
-		// them is rejected outright rather than miscompiled.
-		if (lt != nil && (lt.Kind == KindStruct || lt.Kind == KindUnion)) || (rt != nil && (rt.Kind == KindStruct || rt.Kind == KindUnion)) {
+		// C has no equality operator for structs, unions, arrays, or
+		// slices (arrays are not comparable in C at all; slices are
+		// structs), so comparing them is rejected outright rather than
+		// miscompiled.
+		if (lt != nil && (lt.Kind == KindStruct || lt.Kind == KindUnion || lt.Kind == KindArray || lt.Kind == KindSlice)) || (rt != nil && (rt.Kind == KindStruct || rt.Kind == KindUnion || rt.Kind == KindArray || rt.Kind == KindSlice)) {
 			s.errorAt(ie.Token.Line, ie.Token.Column, "invalid operation: cannot compare values of type %s with %s", typeStringOrInvalid(lt), typeStringOrInvalid(rt))
 			return typeBool
-		}
-		// str supports content equality (==/!= via the tinoc_str_eq
+		} // str supports content equality (==/!= via the tinoc_str_eq
 		// runtime helper) but has no ordering: `<`, `>`, `<=`, `>=` on a
 		// str would emit C comparing structs with a binary operator,
 		// which does not compile. Reject them as a proper diagnostic
@@ -1949,11 +2151,10 @@ func (s *Sema) checkInfixExpression(ie *InfixExpression) *Type {
 		return typeBool
 
 	default: // arithmetic / bitwise
-		if (lt != nil && (lt.Kind == KindStruct || lt.Kind == KindUnion)) || (rt != nil && (rt.Kind == KindStruct || rt.Kind == KindUnion)) {
+		if (lt != nil && (lt.Kind == KindStruct || lt.Kind == KindUnion || lt.Kind == KindArray || lt.Kind == KindSlice)) || (rt != nil && (rt.Kind == KindStruct || rt.Kind == KindUnion || rt.Kind == KindArray || rt.Kind == KindSlice)) {
 			s.errorAt(ie.Token.Line, ie.Token.Column, "invalid operation: operator %s not defined on %s (type %s)", ie.Operator, ie.Left.String(), typeStringOrInvalid(lt))
 			return &Type{Kind: KindInvalid}
-		}
-		// str has no arithmetic/bitwise operators. Rejecting here (rather
+		} // str has no arithmetic/bitwise operators. Rejecting here (rather
 		// than silently emitting C that fails to compile, e.g. `"a" + "b"`)
 		// keeps the error a proper semantic diagnostic.
 		if (lt != nil && lt.Kind == KindStr) || (rt != nil && rt.Kind == KindStr) {
@@ -2015,8 +2216,21 @@ func (s *Sema) checkAssignExpression(ae *AssignExpression) *Type {
 		valueType = targetType
 	}
 
-	if targetType != nil && valueType != nil &&
-		targetType.Kind != KindUnknown && targetType.Kind != KindInvalid &&
+	// Whole-array assignment (`a = b;`) has no C equivalent — arrays are
+	// not assignable lvalues. The idiomatic path is a slice.
+	if targetType != nil && targetType.Kind == KindArray {
+		s.errorAt(ae.Token.Line, ae.Token.Column, "cannot assign a whole array (type %s) — use a slice ([]%s) or copy element-wise", targetType.String(), typeStringOrInvalid(targetType.Elem))
+		return targetType
+	}
+	// An array value assigned to a slice target: `s = nums;`.
+	if ae.Operator == "=" && targetType != nil && targetType.Kind == KindSlice &&
+		valueType != nil && valueType.Kind == KindArray && valueType.Elem != nil &&
+		valueType.Elem.Kind != KindArray && typesEqual(targetType.Elem, valueType.Elem) {
+		s.sliceConvs[ae.Value] = true
+		return targetType
+	}
+
+	if targetType != nil && valueType != nil && targetType.Kind != KindUnknown && targetType.Kind != KindInvalid &&
 		valueType.Kind != KindUnknown && valueType.Kind != KindInvalid {
 		if ae.Operator == "=" {
 			if !assignable(targetType, valueType) {

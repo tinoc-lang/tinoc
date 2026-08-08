@@ -98,7 +98,7 @@ What the compiler supports end-to-end in the current release:
 | C interop | ✅ | `#importc "header.h" as alias;` (clang/gcc parsing) and `extern "C" fn` declarations |
 | Generic functions / structs | ❌ | `fn foo:T(...)`, `struct Pair:T` — rejected with a clear "not yet supported" diagnostic |
 | `union` + methods | ✅ | C-style shared-memory fields (`as_int`/`as_float` reinterpret the same bytes); instance methods (`self ^Name`), static methods |
-| Arrays / slices | ❌ | `[N]T`, `[]T`, `for coll |x|` — planned |
+| Arrays / slices | ✅ | `[N]T`, `[_]T` (inferred size), `[]T` slices, `[N:x]T` sentinel arrays, array literals, indexing, `.len`, `for coll |x|`, implicit array→slice conversion at calls/assignments; array params/returns/whole-array assignment rejected with a slice hint |
 | Optionals / error unions | ❌ | `?T`, `!T`, `orelse`, `catch` — planned |
 | Standard library (`std.io`, ...) | ❌ | Module system is next after the type system |
 
