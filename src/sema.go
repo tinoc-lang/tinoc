@@ -62,6 +62,15 @@ type Symbol struct {
 	CSymbol   string
 	IsCImport bool
 	Variadic  bool
+
+	// CName is the exact C identifier codegen must emit for this symbol
+	// when it differs from the default naming. Module functions and
+	// monomorphized generic instances set it to their mangled name
+	// ("tnc_math_abs", "tnc_identity_str"); imported consts carry the
+	// defining module's mangled global name. Empty means "use the
+	// default naming scheme" (cFunctionName for functions, the declared
+	// identifier for variables/consts).
+	CName string
 }
 
 // Scope is a single lexical scope: function body, block, or the file's
@@ -107,8 +116,28 @@ type Sema struct {
 	funcs   map[string]*Symbol // top-level function table, for forward calls
 	current *Scope
 
+	// Module-system state: state is the shared CompileState (nil for
+	// the legacy single-file RunSema path); moduleName is this file's
+	// canonical dotted module name ("" for the entry file without a
+	// module declaration); module is the owning TinocModule; selfView is
+	// the module's own registry so pub items publish as they register;
+	// blockPrefix tracks the enclosing `module name { ... }` namespace
+	// while walking statements; modules maps every bound module
+	// namespace (imports, the self-view, and in-file blocks);
+	// typeAliases maps alias and selected-import type names to their
+	// resolved types; importConsts tracks imported const bindings for
+	// duplicate detection.
+	state        *CompileState
+	moduleName   string
+	module       *TinocModule
+	selfView     *TinocModule
+	blockPrefix  []string
+	modules      map[string]*TinocModule
+	typeAliases  map[string]*Type
+	importConsts map[string]*Symbol
+
 	// sourceDir is the directory of the file being checked, used to
-	// resolve local headers named by #importc.
+	// resolve local headers named by #importc and module imports.
 	sourceDir string
 
 	// importCModules holds the symbol surface of every #importc, keyed by
@@ -169,6 +198,30 @@ type Sema struct {
 	// codegen wraps a value in a some-optional and `null` in an empty
 	// optional compound literal.
 	optWraps map[Expression]*Type
+
+	// callTargets records which Symbol each resolved call expression
+	// targets, so codegen can emit the symbol's mangled C name (module
+	// functions, generic instances, imported functions).
+	callTargets map[*CallExpression]*Symbol
+
+	// idCName records expressions that resolve to a symbol with a
+	// non-default C name (imported consts, module consts), keyed by
+	// node identity, for codegen's identifier emission.
+	idCName map[Expression]string
+
+	// canonNames records the canonical (module-mangled) name of each
+	// aggregate declaration, so later passes and codegen can key the
+	// per-type registries consistently across registration and use.
+	canonNames map[Statement]string
+
+	// cnameOverrides records the C name codegen must emit for a
+	// top-level var/const in a module file (all module globals are
+	// mangled to avoid cross-module C collisions).
+	cnameOverrides map[Statement]string
+
+	// pendingChecks queues monomorphized generic function/method bodies
+	// for checking; drainPendingChecks runs them after the main passes.
+	pendingChecks []pendingCheck
 }
 
 // NewSema constructs a Sema instance bound to the given diagnostics
@@ -197,6 +250,13 @@ func NewSema(diags *Diagnostics) *Sema {
 		cStrArgs:       make(map[Expression]bool),
 		sliceConvs:     make(map[Expression]bool),
 		optWraps:       make(map[Expression]*Type),
+		modules:        make(map[string]*TinocModule),
+		typeAliases:    make(map[string]*Type),
+		importConsts:   make(map[string]*Symbol),
+		callTargets:    make(map[*CallExpression]*Symbol),
+		idCName:        make(map[Expression]string),
+		canonNames:     make(map[Statement]string),
+		cnameOverrides: make(map[Statement]string),
 	}
 }
 
@@ -221,54 +281,109 @@ func (s *Sema) Check(prog *Program) {
 	// Pass 0: process every #importc by invoking the C header parser
 	// (clang/gcc) and registering the resulting module under its alias.
 	// A failing import is a hard error reported at the directive.
-	for _, stmt := range prog.Statements {
+	s.walkStatements(prog.Statements, nil, func(stmt Statement) {
 		if ics, ok := stmt.(*ImportCStatement); ok {
 			s.importCModule(ics)
 		}
-	}
+	})
 
 	// Pass 1: register every struct's, enum's and union's type name
 	// first, so fields and payloads can reference their own type via
 	// pointers (struct Node { next ^Node; }) and methods' `self ^Node`
-	// parameters resolve during signature registration.
-	for _, stmt := range prog.Statements {
-		if st, ok := stmt.(*StructStatement); ok {
+	// parameters resolve during signature registration. Generic
+	// declarations are registered into the CompileState instead.
+	s.walkStatements(prog.Statements, nil, func(stmt Statement) {
+		switch st := stmt.(type) {
+		case *StructStatement:
 			s.registerStructName(st)
-		} else if es, ok := stmt.(*EnumStatement); ok {
-			s.registerEnumName(es)
-		} else if us, ok := stmt.(*UnionStatement); ok {
-			s.registerUnionName(us)
+		case *EnumStatement:
+			s.registerEnumName(st)
+		case *UnionStatement:
+			s.registerUnionName(st)
 		}
-	}
+	})
+
+	// Pass 1.5: resolve `alias Name = Type;` declarations now that every
+	// aggregate name is registered, so struct fields and signatures can
+	// use aliases. Generic aliases register into the CompileState.
+	s.walkStatements(prog.Statements, nil, func(stmt Statement) {
+		if tas, ok := stmt.(*TypeAliasStatement); ok {
+			s.checkTypeAliasStatement(tas)
+		}
+	})
 
 	// Pass 2: resolve struct fields/enum variants/union fields and
 	// register method signatures, now that every struct/enum/union name
 	// is visible.
-	for _, stmt := range prog.Statements {
-		if st, ok := stmt.(*StructStatement); ok {
+	s.walkStatements(prog.Statements, nil, func(stmt Statement) {
+		switch st := stmt.(type) {
+		case *StructStatement:
 			s.resolveStruct(st)
-		} else if es, ok := stmt.(*EnumStatement); ok {
-			s.resolveEnum(es)
-		} else if us, ok := stmt.(*UnionStatement); ok {
-			s.resolveUnion(us)
+		case *EnumStatement:
+			s.resolveEnum(st)
+		case *UnionStatement:
+			s.resolveUnion(st)
 		}
-	}
+	})
 
 	// Pass 3: register every top-level function signature first, so calls
 	// can appear textually before the function they call (Tinoc, like C
 	// via forward declarations, allows this -- main() calling helpers
 	// defined further down the file is the common case, see samples/*).
-	for _, stmt := range prog.Statements {
-		if fn, ok := stmt.(*FunctionStatement); ok {
-			s.registerFunctionSignature(fn)
-		} else if ecs, ok := stmt.(*ExternCFuncStatement); ok {
-			s.registerExternCFunc(ecs)
+	s.walkStatements(prog.Statements, nil, func(stmt Statement) {
+		switch st := stmt.(type) {
+		case *FunctionStatement:
+			s.registerFunctionSignature(st)
+		case *ExternCFuncStatement:
+			s.registerExternCFunc(st)
+		}
+	})
+
+	// Pass 3.5: publish in-file `module name { ... }` namespaces so
+	// qualified member access (`math.abs(...)`) resolves while bodies
+	// are checked, regardless of statement order. walkStatements
+	// descends into module blocks without invoking the visitor on the
+	// block itself, so blocks are walked here explicitly. The recursion
+	// threads the enclosing block names, so a nested
+	// `module a { module b { ... } }` registers its namespace under the
+	// full dotted name `a.b` (see bindBlockView).
+	var bindBlockViews func(stmts []Statement, prefix []string)
+	bindBlockViews = func(stmts []Statement, prefix []string) {
+		for _, stmt := range stmts {
+			if mb, ok := stmt.(*ModuleBlockStatement); ok {
+				full := append(append([]string{}, prefix...), mb.Name...)
+				s.bindBlockView(mb, full)
+				bindBlockViews(mb.Statements, full)
+			}
 		}
 	}
+	bindBlockViews(prog.Statements, nil)
 
 	// Pass 4: check bodies and top-level var/const statements in order.
 	for _, stmt := range prog.Statements {
 		s.checkStatement(stmt)
+	}
+
+	// Pass 5: check every monomorphized generic body queued during the
+	// passes above (and by other instances' bodies).
+	s.drainPendingChecks()
+}
+
+// walkStatements visits every statement in stmts, descending into
+// `module name { ... }` blocks with their name prefix set on the Sema so
+// canonical names and C mangling reflect the block namespace.
+func (s *Sema) walkStatements(stmts []Statement, prefix []string, fn func(stmt Statement)) {
+	for _, st := range stmts {
+		if st == nil {
+			continue
+		}
+		if mb, ok := st.(*ModuleBlockStatement); ok {
+			s.walkStatements(mb.Statements, append(prefix, mb.Name...), fn)
+			continue
+		}
+		s.blockPrefix = prefix
+		fn(st)
+		s.blockPrefix = nil
 	}
 }
 
@@ -307,6 +422,10 @@ func (s *Sema) registerFunctionSignature(fn *FunctionStatement) {
 	name := fn.Name.Value
 
 	if len(fn.GenericParams) > 0 {
+		if s.state != nil {
+			s.state.registerGenericFn(s, fn, s.itemCanonical(name))
+			return
+		}
 		s.errorAt(fn.Token.Line, fn.Token.Column, "generic functions are not yet supported (%s)", name)
 		return
 	}
@@ -321,17 +440,48 @@ func (s *Sema) registerFunctionSignature(fn *FunctionStatement) {
 		return
 	}
 
+	sym := s.resolveFnSignature(fn, name, fn.Token.Line, fn.Token.Column)
+	if sym == nil {
+		return
+	}
+
+	// Module-aware C naming: entry-file functions keep the legacy
+	// tnc_<name> scheme (CName empty); module functions get their
+	// module-mangled C name (math.abs -> tnc_math_abs). The C entry
+	// point `main` always stays `main`.
+	if s.state != nil {
+		cname := s.itemCName(name)
+		if cname != "" {
+			sym.CName = "tnc_" + cname
+		}
+	}
+
+	s.funcs[name] = sym
+	s.global.Define(sym)
+	if fn.IsPub {
+		s.publishExport(name, "fn", sym, nil, nil)
+	}
+}
+
+// resolveFnSignature resolves a function's parameter and return types
+// into a Symbol without registering it (shared by plain function
+// registration and generic instantiation, which register under mangled
+// names). Returns nil only when fn.Name is nil.
+func (s *Sema) resolveFnSignature(fn *FunctionStatement, name string, line, col int) *Symbol {
+	if fn == nil {
+		return nil
+	}
 	sym := &Symbol{Name: name, Kind: SymFunc}
 
 	seenParams := make(map[string]bool)
 	for _, p := range fn.Params {
-		if p.Name == nil {
+		if p == nil || p.Name == nil {
 			continue
 		}
 		pname := p.Name.Value
 		if pname != "self" {
 			if seenParams[pname] {
-				s.errorAt(fn.Token.Line, fn.Token.Column, "duplicate parameter %s", pname)
+				s.errorAt(line, col, "duplicate parameter %s", pname)
 			}
 			seenParams[pname] = true
 		}
@@ -339,13 +489,13 @@ func (s *Sema) registerFunctionSignature(fn *FunctionStatement) {
 		if p.Type != nil {
 			pt = s.resolveTypeExpr(p.Type)
 		} else {
-			s.errorAt(fn.Token.Line, fn.Token.Column, "parameter %s is missing a type", pname)
+			s.errorAt(line, col, "parameter %s is missing a type", pname)
 			pt = &Type{Kind: KindInvalid}
 		}
 		// C cannot pass arrays by value; array-typed parameters are
 		// rejected up front with a slice suggestion.
 		if pt != nil && pt.Kind == KindArray {
-			s.errorAt(fn.Token.Line, fn.Token.Column, "array parameter %s is not supported (%s) — use a slice ([]%s) instead", pname, pt.String(), typeStringOrInvalid(pt.Elem))
+			s.errorAt(line, col, "array parameter %s is not supported (%s) — use a slice ([]%s) instead", pname, pt.String(), typeStringOrInvalid(pt.Elem))
 			pt = &Type{Kind: KindInvalid}
 		}
 		sym.Params = append(sym.Params, pt)
@@ -362,12 +512,11 @@ func (s *Sema) registerFunctionSignature(fn *FunctionStatement) {
 	// for them yet); reject array-typed returns with a clear diagnostic.
 	// Slices return fine — they are a struct.
 	if sym.ReturnType != nil && sym.ReturnType.Kind == KindArray {
-		s.errorAt(fn.Token.Line, fn.Token.Column, "returning an array value is not supported (%s) — return a slice ([]%s) instead", sym.ReturnType.String(), typeStringOrInvalid(sym.ReturnType.Elem))
+		s.errorAt(line, col, "returning an array value is not supported (%s) — return a slice ([]%s) instead", sym.ReturnType.String(), typeStringOrInvalid(sym.ReturnType.Elem))
 		sym.ReturnType = typeVoid
 	}
 
-	s.funcs[name] = sym
-	s.global.Define(sym)
+	return sym
 }
 
 // registerExternCFunc registers an `extern "C" fn` declaration: a real C
@@ -438,14 +587,41 @@ func (s *Sema) registerStructName(st *StructStatement) {
 	name := st.Name.Value
 	line, col := st.Token.Line, st.Token.Column
 
-	if _, dup := s.structTypes[name]; dup {
+	// Generic structs register as templates, not concrete types.
+	if s.state != nil && len(st.GenericParams) > 0 {
+		s.state.registerGenericStruct(s, st, s.itemCanonical(name))
+		return
+	}
+
+	// Module files register aggregates under their canonical dotted name
+	// ("math.Circle") with a mangled C name ("math_Circle"); entry-file
+	// aggregates keep their bare name and legacy C naming.
+	canonical := name
+	cname := ""
+	if s.state != nil {
+		canonical = s.itemCanonical(name)
+		cname = s.itemCName(name)
+	}
+
+	if _, dup := s.structTypes[canonical]; dup {
 		s.errorAt(line, col, "%s redeclared in this block", name)
 		return
 	}
 
-	t := &Type{Kind: KindStruct, Name: name, FieldIndex: make(map[string]int)}
-	s.structTypes[name] = t
-	s.structMethods[name] = make(map[string]*Symbol)
+	t := &Type{Kind: KindStruct, Name: canonical, CName: cname, FieldIndex: make(map[string]int)}
+	s.structTypes[canonical] = t
+	s.canonNames[st] = canonical
+	s.structMethods[canonical] = make(map[string]*Symbol)
+	// Mirror the bare local name (as importers do) so user-written
+	// references inside the defining module — `Circle.create()`, `var c
+	// Circle;`, struct literals, `self ^Circle` — resolve.
+	if canonical != name {
+		s.structTypes[name] = t
+		s.structMethods[name] = s.structMethods[canonical]
+	}
+	if st.IsPub {
+		s.publishExport(name, "type", nil, t, nil)
+	}
 }
 
 // resolveStruct resolves a struct's field types and registers its method
@@ -455,11 +631,29 @@ func (s *Sema) resolveStruct(st *StructStatement) {
 	if st.Name == nil {
 		return
 	}
-	t := s.structTypes[st.Name.Value]
+	canonical, ok := s.canonNames[st]
+	if !ok {
+		canonical = st.Name.Value
+	}
+	t := s.structTypes[canonical]
 	if t == nil {
 		return // duplicate/error already reported during name registration
 	}
 
+	s.resolveStructFields(t, st, canonical)
+
+	for _, m := range st.Methods {
+		s.registerStructMethod(canonical, m)
+	}
+}
+
+// resolveStructFields resolves a struct declaration's field types onto
+// the given (already-registered) type. Shared by plain struct
+// registration and generic struct instantiation.
+func (s *Sema) resolveStructFields(t *Type, st *StructStatement, canonical string) {
+	if t == nil || st == nil {
+		return
+	}
 	seen := make(map[string]bool)
 	for _, f := range st.Fields {
 		if f == nil || f.Name == nil {
@@ -467,7 +661,7 @@ func (s *Sema) resolveStruct(st *StructStatement) {
 		}
 		name := f.Name.Value
 		if seen[name] {
-			s.errorAt(f.Name.Token.Line, f.Name.Token.Column, "duplicate field %s in struct %s", name, st.Name.Value)
+			s.errorAt(f.Name.Token.Line, f.Name.Token.Column, "duplicate field %s in struct %s", name, canonical)
 			continue
 		}
 		seen[name] = true
@@ -482,16 +676,12 @@ func (s *Sema) resolveStruct(st *StructStatement) {
 		}
 		// A struct cannot contain itself by value (C requires complete
 		// types for by-value members); a pointer to itself is fine.
-		if ft.Kind == KindStruct && ft.Name == st.Name.Value {
-			s.errorAt(f.Name.Token.Line, f.Name.Token.Column, "struct %s contains itself by value (use ^%s for the field type)", st.Name.Value, st.Name.Value)
+		if ft.Kind == KindStruct && ft.Name == canonical {
+			s.errorAt(f.Name.Token.Line, f.Name.Token.Column, "struct %s contains itself by value (use ^%s for the field type)", canonical, canonical)
 		}
 
 		t.Fields = append(t.Fields, &StructFieldInfo{Name: name, Type: ft})
 		t.FieldIndex[name] = len(t.Fields) - 1
-	}
-
-	for _, m := range st.Methods {
-		s.registerStructMethod(st.Name.Value, m)
 	}
 }
 
@@ -509,14 +699,30 @@ func (s *Sema) registerUnionName(us *UnionStatement) {
 	name := us.Name.Value
 	line, col := us.Token.Line, us.Token.Column
 
-	if _, dup := s.unionTypes[name]; dup {
+	canonical := name
+	cname := ""
+	if s.state != nil {
+		canonical = s.itemCanonical(name)
+		cname = s.itemCName(name)
+	}
+
+	if _, dup := s.unionTypes[canonical]; dup {
 		s.errorAt(line, col, "%s redeclared in this block", name)
 		return
 	}
 
-	t := &Type{Kind: KindUnion, Name: name, FieldIndex: make(map[string]int)}
-	s.unionTypes[name] = t
-	s.unionMethods[name] = make(map[string]*Symbol)
+	t := &Type{Kind: KindUnion, Name: canonical, CName: cname, FieldIndex: make(map[string]int)}
+	s.unionTypes[canonical] = t
+	s.canonNames[us] = canonical
+	s.unionMethods[canonical] = make(map[string]*Symbol)
+	// Mirror the bare local name (see registerStructName).
+	if canonical != name {
+		s.unionTypes[name] = t
+		s.unionMethods[name] = s.unionMethods[canonical]
+	}
+	if us.IsPub {
+		s.publishExport(name, "type", nil, t, nil)
+	}
 }
 
 // resolveUnion resolves a union's field types and registers its method
@@ -527,7 +733,11 @@ func (s *Sema) resolveUnion(us *UnionStatement) {
 	if us.Name == nil {
 		return
 	}
-	t := s.unionTypes[us.Name.Value]
+	canonical, ok := s.canonNames[us]
+	if !ok {
+		canonical = us.Name.Value
+	}
+	t := s.unionTypes[canonical]
 	if t == nil {
 		return // duplicate/error already reported during name registration
 	}
@@ -539,7 +749,7 @@ func (s *Sema) resolveUnion(us *UnionStatement) {
 		}
 		name := f.Name.Value
 		if seen[name] {
-			s.errorAt(f.Name.Token.Line, f.Name.Token.Column, "duplicate field %s in union %s", name, us.Name.Value)
+			s.errorAt(f.Name.Token.Line, f.Name.Token.Column, "duplicate field %s in union %s", name, canonical)
 			continue
 		}
 		seen[name] = true
@@ -558,7 +768,7 @@ func (s *Sema) resolveUnion(us *UnionStatement) {
 	}
 
 	for _, m := range us.Methods {
-		s.registerUnionMethod(us.Name.Value, m)
+		s.registerUnionMethod(canonical, m)
 	}
 }
 
@@ -575,14 +785,30 @@ func (s *Sema) registerEnumName(es *EnumStatement) {
 	name := es.Name.Value
 	line, col := es.Token.Line, es.Token.Column
 
-	if _, dup := s.enumTypes[name]; dup {
+	canonical := name
+	cname := ""
+	if s.state != nil {
+		canonical = s.itemCanonical(name)
+		cname = s.itemCName(name)
+	}
+
+	if _, dup := s.enumTypes[canonical]; dup {
 		s.errorAt(line, col, "%s redeclared in this block", name)
 		return
 	}
 
-	t := &Type{Kind: KindEnum, Name: name, EnumVariantIdx: make(map[string]int)}
-	s.enumTypes[name] = t
-	s.enumMethods[name] = make(map[string]*Symbol)
+	t := &Type{Kind: KindEnum, Name: canonical, CName: cname, EnumVariantIdx: make(map[string]int)}
+	s.enumTypes[canonical] = t
+	s.canonNames[es] = canonical
+	s.enumMethods[canonical] = make(map[string]*Symbol)
+	// Mirror the bare local name (see registerStructName).
+	if canonical != name {
+		s.enumTypes[name] = t
+		s.enumMethods[name] = s.enumMethods[canonical]
+	}
+	if es.IsPub {
+		s.publishExport(name, "type", nil, t, nil)
+	}
 }
 
 // resolveEnum resolves an enum's variants (and their payload types) and
@@ -593,7 +819,11 @@ func (s *Sema) resolveEnum(es *EnumStatement) {
 	if es.Name == nil {
 		return
 	}
-	t := s.enumTypes[es.Name.Value]
+	canonical, ok := s.canonNames[es]
+	if !ok {
+		canonical = es.Name.Value
+	}
+	t := s.enumTypes[canonical]
 	if t == nil {
 		return // duplicate/error already reported during name registration
 	}
@@ -605,7 +835,7 @@ func (s *Sema) resolveEnum(es *EnumStatement) {
 		}
 		name := v.Name.Value
 		if seen[name] {
-			s.errorAt(v.Name.Token.Line, v.Name.Token.Column, "duplicate variant %s in enum %s", name, es.Name.Value)
+			s.errorAt(v.Name.Token.Line, v.Name.Token.Column, "duplicate variant %s in enum %s", name, canonical)
 			continue
 		}
 		seen[name] = true
@@ -617,7 +847,7 @@ func (s *Sema) resolveEnum(es *EnumStatement) {
 			}
 			pt := s.resolveTypeExpr(te)
 			if pt == nil {
-				s.errorAt(v.Name.Token.Line, v.Name.Token.Column, "variant %s.%s has an unsupported or unknown payload type", es.Name.Value, name)
+				s.errorAt(v.Name.Token.Line, v.Name.Token.Column, "variant %s.%s has an unsupported or unknown payload type", canonical, name)
 				pt = &Type{Kind: KindInvalid}
 			}
 			info.Types = append(info.Types, pt)
@@ -631,7 +861,7 @@ func (s *Sema) resolveEnum(es *EnumStatement) {
 	}
 
 	for _, m := range es.Methods {
-		s.registerEnumMethod(es.Name.Value, m)
+		s.registerEnumMethod(canonical, m)
 	}
 }
 
@@ -780,6 +1010,18 @@ func (s *Sema) checkStatement(stmt Statement) {
 		s.checkUnionStatement(st)
 	case *SwitchStatement:
 		s.checkSwitchStatement(st)
+	case *TypeAliasStatement:
+		// Non-generic aliases were resolved in the pass-1.5 sweep; the
+		// generic ones register there too. Nothing per-statement remains.
+	case *ModuleDeclStatement:
+		// Metadata only; the module name was read by the loader.
+	case *ModuleBlockStatement:
+		prev := s.blockPrefix
+		s.blockPrefix = append(s.blockPrefix, st.Name...)
+		for _, inner := range st.Statements {
+			s.checkStatement(inner)
+		}
+		s.blockPrefix = prev
 	case *BreakStatement, *ContinueStatement, *ImportStatement, *ImportCStatement, *ExternCFuncStatement:
 		// Nothing to resolve for this pass (imports/extern decls were
 		// processed in Check's passes 0-3).
@@ -831,6 +1073,19 @@ func (s *Sema) checkVarStatement(v *VarStatement) {
 	if !s.current.Define(sym) {
 		s.errorAt(line, col, "%s redeclared in this block", name)
 	}
+
+	// Module files mangle every top-level global's C name to avoid
+	// cross-module collisions; pub globals also publish as exports.
+	if s.current == s.global && s.state != nil {
+		if cname := s.itemCName(name); cname != "" {
+			s.cnameOverrides[v] = cname
+			sym.CName = cname
+		}
+		if v.IsPub && s.selfView != nil && finalType != nil {
+			s.selfView.PubConsts[name] = &constExport{Name: name, Type: finalType, CName: s.cnameOverrides[v], Mutable: true, IsStatic: v.IsStatic}
+			s.selfView.PubTypes[name] = finalType
+		}
+	}
 }
 
 func (s *Sema) checkConstStatement(c *ConstStatement) {
@@ -857,6 +1112,19 @@ func (s *Sema) checkConstStatement(c *ConstStatement) {
 	sym := &Symbol{Name: name, Kind: SymConst, Type: finalType, IsStatic: c.IsStatic, Mutable: false}
 	if !s.current.Define(sym) {
 		s.errorAt(line, col, "%s redeclared in this block", name)
+	}
+
+	// Module files mangle every top-level global's C name to avoid
+	// cross-module collisions; pub consts also publish as exports.
+	if s.current == s.global && s.state != nil {
+		if cname := s.itemCName(name); cname != "" {
+			s.cnameOverrides[c] = cname
+			sym.CName = cname
+		}
+		if c.IsPub && s.selfView != nil && finalType != nil {
+			s.selfView.PubConsts[name] = &constExport{Name: name, Type: finalType, CName: s.cnameOverrides[c], Mutable: false, IsStatic: c.IsStatic}
+			s.selfView.PubTypes[name] = finalType
+		}
 	}
 }
 
@@ -958,15 +1226,58 @@ func (s *Sema) reconcileDeclType(name string, declaredType, valueType *Type, val
 // can adapt to whatever numeric type context it's declared or passed
 // into, rather than being pinned to its own default inferred type.
 func isUntypedLiteral(e Expression) bool {
-	switch e.(type) {
+	switch ex := e.(type) {
 	case *IntegerLiteral, *FloatLiteral:
 		return true
+	case *PrefixExpression:
+		// `-250`, `-1.5`: a negated literal is still an untyped
+		// literal, so `var x i16 = -250;` adapts like `var x i16 =
+		// 250;` does.
+		return ex.Operator == "-" && isUntypedLiteral(ex.Right)
 	default:
 		return false
 	}
 }
 
 // === fn ===
+
+// checkTypeAliasStatement resolves an `alias Name = Type;` declaration
+// (pass 1.5). Generic aliases register as templates in the CompileState;
+// concrete aliases bind the resolved type under their name.
+func (s *Sema) checkTypeAliasStatement(tas *TypeAliasStatement) {
+	if tas == nil || tas.Name == nil {
+		return
+	}
+	name := tas.Name.Value
+
+	if len(tas.GenericParams) > 0 {
+		if s.state == nil {
+			s.errorAt(tas.Token.Line, tas.Token.Column, "generic aliases are not yet supported (%s)", name)
+			return
+		}
+		s.state.registerGenericAlias(s, tas, s.itemCanonical(name))
+		return
+	}
+
+	if _, dup := s.typeAliases[name]; dup {
+		s.errorAt(tas.Token.Line, tas.Token.Column, "%s redeclared in this block", name)
+		return
+	}
+	if _, dup := s.funcs[name]; dup {
+		s.errorAt(tas.Token.Line, tas.Token.Column, "%s redeclared in this block", name)
+		return
+	}
+
+	t := s.resolveTypeExpr(tas.Type)
+	if t == nil {
+		s.errorAt(tas.Token.Line, tas.Token.Column, "alias %s has an unsupported or unknown type", name)
+		t = &Type{Kind: KindInvalid}
+	}
+	s.typeAliases[name] = t
+	if tas.IsPub {
+		s.publishExport(name, "type", nil, t, nil)
+	}
+}
 
 func (s *Sema) checkFunctionStatement(fn *FunctionStatement) {
 	if fn.Name == nil || len(fn.GenericParams) > 0 {
@@ -989,15 +1300,19 @@ func (s *Sema) checkStructStatement(st *StructStatement) {
 	if st.Name == nil {
 		return
 	}
+	canonical, ok := s.canonNames[st]
+	if !ok {
+		canonical = st.Name.Value
+	}
 	for _, m := range st.Methods {
 		if m == nil || m.Name == nil {
 			continue
 		}
-		sym := s.structMethods[st.Name.Value][m.Name.Value]
+		sym := s.structMethods[canonical][m.Name.Value]
 		if sym == nil {
 			continue
 		}
-		s.checkFunctionBody(st.Name.Value+"."+m.Name.Value, sym, m.Params, m.Body, m.Token, true)
+		s.checkFunctionBody(canonical+"."+m.Name.Value, sym, m.Params, m.Body, m.Token, true)
 	}
 }
 
@@ -1007,15 +1322,19 @@ func (s *Sema) checkEnumStatement(es *EnumStatement) {
 	if es.Name == nil {
 		return
 	}
+	canonical, ok := s.canonNames[es]
+	if !ok {
+		canonical = es.Name.Value
+	}
 	for _, m := range es.Methods {
 		if m == nil || m.Name == nil {
 			continue
 		}
-		sym := s.enumMethods[es.Name.Value][m.Name.Value]
+		sym := s.enumMethods[canonical][m.Name.Value]
 		if sym == nil {
 			continue
 		}
-		s.checkFunctionBody(es.Name.Value+"."+m.Name.Value, sym, m.Params, m.Body, m.Token, true)
+		s.checkFunctionBody(canonical+"."+m.Name.Value, sym, m.Params, m.Body, m.Token, true)
 	}
 }
 
@@ -1025,15 +1344,19 @@ func (s *Sema) checkUnionStatement(us *UnionStatement) {
 	if us.Name == nil {
 		return
 	}
+	canonical, ok := s.canonNames[us]
+	if !ok {
+		canonical = us.Name.Value
+	}
 	for _, m := range us.Methods {
 		if m == nil || m.Name == nil {
 			continue
 		}
-		sym := s.unionMethods[us.Name.Value][m.Name.Value]
+		sym := s.unionMethods[canonical][m.Name.Value]
 		if sym == nil {
 			continue
 		}
-		s.checkFunctionBody(us.Name.Value+"."+m.Name.Value, sym, m.Params, m.Body, m.Token, true)
+		s.checkFunctionBody(canonical+"."+m.Name.Value, sym, m.Params, m.Body, m.Token, true)
 	}
 }
 
@@ -1651,6 +1974,12 @@ func (s *Sema) retypeArrayLiteralElements(al *ArrayLiteral, wantElem *Type, line
 }
 func (s *Sema) checkIdentifier(id *Identifier) *Type {
 	if sym, ok := s.current.Lookup(id.Value); ok {
+		// Symbols with an explicit C name (imported module consts,
+		// module-local globals, generic instances) record it so codegen
+		// emits the mangled identifier, not the bare name.
+		if sym.CName != "" {
+			s.idCName[id] = sym.CName
+		}
 		return sym.Type
 	}
 	if sym, ok := s.funcs[id.Value]; ok {
@@ -1660,6 +1989,11 @@ func (s *Sema) checkIdentifier(id *Identifier) *Type {
 	// has no value type; report it as an opaque module rather than an
 	// undefined-name error, since the name is defined.
 	if _, ok := s.importCModules[id.Value]; ok {
+		return &Type{Kind: KindUnknown, Name: "module"}
+	}
+	// Same for a user module namespace (`var m = math;`): the name is
+	// defined, it just isn't a value.
+	if _, ok := s.modules[id.Value]; ok {
 		return &Type{Kind: KindUnknown, Name: "module"}
 	}
 	s.errorAt(id.Token.Line, id.Token.Column, "undefined: %s", id.Value)
@@ -1682,6 +2016,36 @@ func (s *Sema) checkFieldAccess(fa *FieldAccessExpression) *Type {
 			return c.Type
 		}
 		s.errorAt(fa.Token.Line, fa.Token.Column, "undefined: %s.%s", mod.Alias, member)
+		return &Type{Kind: KindInvalid}
+	}
+
+	// 1b. User module member reference: `math.PI` (pub const),
+	// `math.square` (pub fn), `vec.Vec2` (pub type). Only pub items are
+	// reachable through an imported namespace; private ones get a
+	// specific diagnostic instead of a generic undefined-name error.
+	// (In-file `module name { ... }` blocks expose every member.)
+	if mod, ok := s.tinocModule(fa.Left); ok && fa.Field != nil {
+		member := fa.Field.Value
+		if fn, ok := mod.PubFuncs[member]; ok {
+			return fn.ReturnType // call sites check the full signature
+		}
+		if ce, ok := mod.PubConsts[member]; ok {
+			return ce.Type
+		}
+		if t, ok := mod.PubTypes[member]; ok {
+			return t
+		}
+		// A nested module namespace (`a.b` where `b` is itself a
+		// module): the reference is an opaque module; the next access
+		// segment resolves inside it (tinocModule resolves the chain).
+		if _, nested := s.modules[mod.Name+"."+member]; nested {
+			return &Type{Kind: KindUnknown, Name: "module"}
+		}
+		if _, priv := mod.Funcs[member]; priv {
+			s.errorAt(fa.Token.Line, fa.Token.Column, "symbol %s is private to module %s", member, mod.Name)
+			return &Type{Kind: KindInvalid}
+		}
+		s.errorAt(fa.Token.Line, fa.Token.Column, "module %s has no public member %s", mod.Name, member)
 		return &Type{Kind: KindInvalid}
 	}
 
@@ -2381,6 +2745,51 @@ func (s *Sema) checkCallExpression(ce *CallExpression) *Type {
 				s.errorAt(ce.Token.Line, ce.Token.Column, "undefined: %s.%s", mod.Alias, member)
 				return &Type{Kind: KindInvalid}
 			}
+		} else if mod, isMod := s.tinocModule(fa.Left); isMod && fa.Field != nil {
+			// `math.square(...)`: user module call. Resolve the member's
+			// signature through the module's pub function table so
+			// argument/return types are checked like any local call.
+			member := fa.Field.Value
+			if fn, ok := mod.PubFuncs[member]; ok {
+				sym = fn
+				calleeName = mod.Name + "." + member
+			} else if decl := s.lookupModuleGenericFn(mod, member); decl != nil {
+				// Qualified generic call: `math.identity:i32(42)` (explicit
+				// type args) or `math.identity(42)` (inferred from the
+				// argument types). Monomorphize exactly like a local
+				// generic call and check against the instance signature.
+				var argTypes []*Type
+				if len(ce.GenericArgs) > 0 {
+					argTypes = s.resolveGenericArgs(decl.Params, ce.GenericArgs, member, ce.Token)
+				} else {
+					argTypes = s.inferGenericArgs(decl, ce)
+				}
+				if argTypes == nil {
+					s.checkArgsOnly(ce)
+					return &Type{Kind: KindInvalid}
+				}
+				gsym := s.instantiateGenericFn(decl, argTypes)
+				if gsym == nil {
+					s.checkArgsOnly(ce)
+					return &Type{Kind: KindInvalid}
+				}
+				s.callTargets[ce] = gsym
+				for _, a := range ce.Arguments {
+					s.checkExpression(a)
+				}
+				s.checkCallArgs(ce, gsym, mod.Name+"."+member, 0)
+				return gsym.ReturnType
+			} else {
+				for _, a := range ce.Arguments {
+					s.checkExpression(a)
+				}
+				if _, priv := mod.Funcs[member]; priv {
+					s.errorAt(ce.Token.Line, ce.Token.Column, "symbol %s is private to module %s", member, mod.Name)
+				} else {
+					s.errorAt(ce.Token.Line, ce.Token.Column, "module %s has no public function %s", mod.Name, member)
+				}
+				return &Type{Kind: KindInvalid}
+			}
 		} else if fa.Left != nil && fa.Field != nil {
 			// Static method call / enum constructor: the receiver is the
 			// bare type name, which resolves against the struct/enum
@@ -2437,6 +2846,12 @@ func (s *Sema) checkCallExpression(ce *CallExpression) *Type {
 		var ok bool
 		sym, ok = s.funcs[ident.Value]
 		if !ok {
+			// A generic function template (`fn identity:T(x T) T`):
+			// monomorphize with explicit type args (`identity:str(x)`) or
+			// inferred from the call-site argument types (`identity(5)`).
+			if gsym, handled := s.tryGenericCall(ce, ident); handled {
+				return gsym.ReturnType
+			}
 			// No first-class function values in this pass; treat as
 			// unknown-callee.
 			for _, a := range ce.Arguments {

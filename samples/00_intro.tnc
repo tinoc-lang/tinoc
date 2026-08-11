@@ -1,4 +1,7 @@
-#import std.io;
+// Hello world, Tinoc style. C interop is declared directly (extern "C"
+// fn) or via #importc "stdio.h" — see samples/05 and samples/06.
+
+extern "C" fn printf(fmt *const char, ...) i32;
 
 // Main function
 fn main() void 
@@ -6,5 +9,5 @@ fn main() void
     var name str = "Prathmesh";
     const lang = "Tinoc";
     // This comment should be ignored    
-    io.println("{s} is creator of {s} Programming Language!", name, lang);
+    printf("%s is creator of %s Programming Language!\n", name, lang);
 }

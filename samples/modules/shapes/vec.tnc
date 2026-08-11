@@ -1,0 +1,12 @@
+// Submodule: `shapes/vec.tnc` is the module `shapes.vec` (its name is
+// derived from its file stem), so both `#import shapes.vec;` and
+// `#import shapes.vec.{Vec2, dot};` resolve here.
+
+pub struct Vec2 {
+	x f32;
+	y f32;
+}
+
+pub fn dot(a Vec2, b Vec2) f32 {
+	return a.x * b.x + a.y * b.y;
+}

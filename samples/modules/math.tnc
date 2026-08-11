@@ -1,0 +1,19 @@
+// A user module named by `module math;`. Files without a module
+// declaration get their module name from their file stem instead
+// (`vec.tnc` -> module `vec`, and `shapes/mod.tnc` -> module `shapes`).
+
+module math;
+
+pub const PI f64 = 3.14159;
+pub const E f64 = 2.71828;
+
+// Private: only reachable inside this module (or via this file).
+const TAU = 6.28318;
+
+pub fn square(x f64) f64 {
+	return x * x;
+}
+
+pub fn identity:T(val T) T {
+	return val;
+}

@@ -791,62 +791,143 @@ fn main() void {
 
 # Modules
 
-**Tinoc** uses `#import` for module resolution. The `#` prefix marks module and preprocessor directives.
+**Tinoc** uses `#import` for module resolution. The `#` prefix marks module and preprocessor directives. `#import` replaces C `#include` with *semantic* module resolution: modules are parsed and type-checked once, only `pub` exports are visible to importers, and every loaded module compiles into a single merged C translation unit — no text insertion, no header guards.
 
-***Syntax:***
+## The `module` keyword
 
+`module <name>;` names the file's module. A file without a declaration gets its module name from its file stem (`vec.tnc` → module `vec`), and convention files `mod.tnc` / `index.tnc` take their containing directory's name (`shapes/mod.tnc` → module `shapes`) — **directories become modules automatically**.
+
+```tinoc
+module math;   // this file is the module `math`; importers say: #import math;
+
+pub const PI f64 = 3.14159;
+const TAU f64 = 6.28318;   // private: only visible inside this module
+
+pub fn square(x f64) f64 {
+	return x * x;
+}
 ```
-Syntax:
-    #import <module.path>;
-    --> import a specific module.
 
-    #import <module.path>.*;
-    --> import all exports from a module.
+`module <name> { ... }` groups declarations into an **in-file namespace** — the members are reachable as `name.member` from the rest of the file. Blocks nest (`module a { module b { ... } }` → `a.b.member`) and accept dotted names (`module a.b { ... }`).
+
+```tinoc
+module physics {
+	pub const g f64 = 9.81;
+
+	pub fn energy(m f64, v f64) f64 {
+		return 0.5 * m * v * v;
+	}
+}
+
+fn main() void {
+	// physics.energy / physics.g usable here
+}
 ```
+
+## Import forms
+
+```tinoc
+#import module;                  // namespace import -> module.symbol
+#import module.sub;              // nested path / submodule
+#import module.*;                // wildcard: every pub symbol, usable bare
+#import module.symbol;           // single symbol, usable directly
+#import module.{a, b as c};      // selected symbols, per-symbol aliases
+#import module as alias;         // rename the namespace
+#import "rel/path.tnc" as alias; // file import (module name from file)
+```
+
+Whether a bare dotted tail (`math.PI`) is a submodule or a single symbol is decided by the module loader: it tries a module file first (`math/PI.tnc`, `math/PI/mod.tnc`), then a pub symbol of the prefix module (`math`). The `{...}` and `.*` forms are unambiguous. `module.symbol as name` renames a single-symbol import; `#import module as m;` renames the namespace.
 
 ***Example:***
 
-`util.tnc`:
+`shapes/vec.tnc` (the submodule `shapes.vec`):
 ```tinoc
-pub fn add(a i32, b i32) i32 {
-	return a + b;
+pub struct Vec2 {
+	x f32;
+	y f32;
+}
+
+pub fn dot(a Vec2, b Vec2) f32 {
+	return a.x * b.x + a.y * b.y;
 }
 ```
 
 `main.tnc`:
-```
-#import std.io;
-#import util;
-#import std.collections.*;
-
-fn main() void {
-    // std.io symbols accessed via module name
-    io.println("Hello, Tinoc");
-
-    // std.collections.* symbols available directly
-    var v vec:i32;
-    
-    const result = util.add(125, 2022);
-    io.println("{any}",result);
-}
+```tinoc
+#import math;
+#import math.PI;                 // single symbol -> PI
+#import math.E as EULER;         // single symbol, renamed
+#import shapes.vec;              // namespace -> vec.Vec2 / vec.dot
+#import shapes.vec.{Vec2, dot};  // selected symbols, usable directly
+#import "shapes/vec.tnc" as vf; // file import under an alias
+#import shapes.*;                // wildcard -> circumference(...)
 ```
 
-***Notes:***
+## Visibility
 
-- `#import` replaces C `#include`; it uses semantic module resolution, not file text insertion.
-- `.*` wildcard imports all public exports from a module into the current scope.
-- `pub` keyword is used to declare a function/struct/enum/union/const etc. public for import.
-- Without `.*`, symbols are accessed via the last path segment (e.g. `std.io` → `io.println`).
+`pub` marks a function, struct, enum, union, const, var, or alias as exported from its module; everything else is private and rejected when imported — `symbol x is private to module math` for a private member, `module math has no public symbol x` for a missing one. In-file `module name { ... }` blocks expose every member (they are the same file's namespace).
+
+## Modules & generics
+
+Generic declarations cross module boundaries: instantiate a module's generic struct with the qualified name (`shapes.Circle:f64`) and call its generic functions qualified (`math.identity:i32(42)`), or import the items and use them bare. Each concrete instantiation is monomorphized once per type-argument set.
+
+## Module resolution rules
+
+- Imports resolve **relative to the importing file's directory**: `#import a.b.c;` looks for `a/b/c.tnc`, then `a/b/c/mod.tnc`, then `a/b/c/c.tnc`.
+- Modules load **recursively** (imports of imports) with **cycle detection** (`import cycle detected: a -> b -> a`), and are **cached by absolute path** — diamond imports (`main` → `a` → `base`, `main` → `b` → `base`) share one instance.
+- Re-importing the same module under the same local name is idempotent (`#import vec; #import vec.{Vec2};` binds `vec` once); binding a *different* module under a taken name is an error.
+- Two files claiming the same module name collide (`module math is already defined by ...`), since their items would mangle to the same C symbols.
+- The **standard library is not available yet**: `#import std.io;` is rejected with `standard library modules are not yet available (std.io)` — user modules only for now.
+- Every module's code is merged into one C translation unit; module items get mangled C names (`math.abs` → `tnc_math_abs`) so same-named items across modules never collide.
 
 ---
 
 # Preprocessor
 
-- `#import`: ***Comptime*** module resolution, you have to pass main file(i.e. `main.tnc`) and compiler will handle the rest.
+- `#import`: ***Comptime*** module resolution. Pass the entry file (i.e. `main.tnc`) and the compiler loads, checks, and merges every transitively imported module (see [Modules](#modules)).
+- `#importc`: ***C header import***. `#importc "stdio.h" "math.h" as c;` parses real C headers (clang's JSON AST, gcc's `-aux-info` fallback) and exposes their functions, extern variables, enum constants, typedefs, and simple macros under the alias with full type checking — `c.printf(...)`, `c.EOF`, `c.sqrt(16.0)`. Without `as alias` the alias defaults to the header's file stem (`#importc "stdio.h";` → `stdio.printf(...)`). Codegen emits a matching `#include` per header. See [C Interop](#c-interop).
+- `extern "C" fn name(.symbol)?(params...) Ret;`: declares a C function by hand (no header parsing) — `extern "C" fn printf(fmt *const char, ...) i32;` — callable by its Tinoc name with automatic `str` → `char*` argument unwrapping.
 - `#run`: ***Comptime*** execution as expression or block, useful for Meta Programming.
 - `#partial`: Tells compiler about a partial implementation of switch on enum.
 
-Other useful Preprocessor may be add in future versions.
+Other useful Preprocessor directives may be added in future versions.
+
+---
+
+# C Interop
+
+**Tinoc** talks to C two ways: `#importc` parses real headers, `extern "C" fn` declares functions by hand. Both give you type-checked calls into libc and any other C library.
+
+## `#importc` — import C headers
+
+```tinoc
+#importc "stdio.h";                 // alias defaults to the file stem: stdio
+#importc "stdio.h" "math.h" as c;  // multiple headers, explicit alias
+#importc "mylib.h" as mylib;        // local header next to the source
+```
+
+The compiler parses each header and registers every function, extern variable, enum constant, typedef, and object-like macro under the alias:
+
+```tinoc
+#importc "stdio.h" as cio;
+
+fn main() void {
+	cio.printf("%.1f\n", 3.14);   // full argument type/count checking
+	var code i32 = cio.EOF;        // -1 (macro constant)
+}
+```
+
+Codegen emits one `#include` per header into the merged output, so the declarations resolve at C compile time. Type safety is enforced at the Tinoc level first — unknown members (`undefined: cio.doesNotExist`) and wrong argument counts/types are caught before C ever runs.
+
+## `extern "C" fn` — hand-declared C functions
+
+```tinoc
+extern "C" fn printf(fmt *const char, ...) i32;
+extern "C" fn strlen(s *const char) usize;
+extern "C" fn my_puts.puts(s *const char) i32;   // call my_puts, C symbol puts
+```
+
+Declarations must end with `;` (no body); variadic declarations need at least one named parameter before `...`. `str` arguments are unwrapped to their underlying `char*` automatically, so `printf("%s\n", lang)` passes the string's data pointer.
 
 ---
 

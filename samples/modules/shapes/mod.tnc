@@ -1,0 +1,13 @@
+// Directory module: `shapes/mod.tnc` (or `shapes/shapes.tnc`) is the
+// module `shapes`, so `#import shapes;` / `#import shapes.*;` resolve
+// here. Directories become modules automatically.
+
+pub fn circumference(r f64) f64 {
+	return 2.0 * 3.14159 * r;
+}
+
+// Generic structs live in the module's generic registry; importers
+// instantiate them with the qualified name: shapes.Circle:f64.
+pub struct Circle:T {
+	r T;
+}

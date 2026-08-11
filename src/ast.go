@@ -434,11 +434,12 @@ func (f *StructField) String() string {
 // (`struct Pair:T { ... }`) are rejected during parsing with a clear
 // "not yet supported" diagnostic.
 type StructStatement struct {
-	Token   Token // TOKEN_STRUCT
-	Name    *Identifier
-	Fields  []*StructField
-	Methods []*FunctionStatement
-	IsPub   bool
+	Token         Token // TOKEN_STRUCT
+	Name          *Identifier
+	GenericParams []string // e.g. ["T"] / ["K", "V"] for generic structs; empty when non-generic
+	Fields        []*StructField
+	Methods       []*FunctionStatement
+	IsPub         bool
 }
 
 func (ss *StructStatement) statementNode()       {}
@@ -490,11 +491,12 @@ func (ss *StructStatement) String() string {
 // (`union Pair:T { ... }`) are rejected during parsing with a clear
 // "not yet supported" diagnostic, matching structs/enums.
 type UnionStatement struct {
-	Token   Token // TOKEN_UNION
-	Name    *Identifier
-	Fields  []*StructField
-	Methods []*FunctionStatement
-	IsPub   bool
+	Token         Token // TOKEN_UNION
+	Name          *Identifier
+	GenericParams []string // e.g. ["T"] for generic unions; empty when non-generic
+	Fields        []*StructField
+	Methods       []*FunctionStatement
+	IsPub         bool
 }
 
 func (us *UnionStatement) statementNode()       {}
@@ -670,6 +672,89 @@ func (at *ArrayType) String() string {
 
 // === Statements ===
 
+// ModuleDeclStatement is `module name;` — the file-level module
+// declaration that names the file's module. It must be the first
+// statement in a file (comments allowed). Dotted names are supported:
+// `module vec.vec2;`. A file without a module declaration gets its
+// module name automatically from its file stem (the "smart module"
+// default).
+type ModuleDeclStatement struct {
+	Token Token // TOKEN_MODULE
+	Name  []string
+}
+
+func (mds *ModuleDeclStatement) statementNode()       {}
+func (mds *ModuleDeclStatement) TokenLiteral() string { return mds.Token.Literal }
+func (mds *ModuleDeclStatement) String() string {
+	return "module " + strings.Join(mds.Name, ".") + ";"
+}
+
+// ModuleBlockStatement is `module name { ... }` — a named module scope
+// that groups declarations (pub fns, structs, consts, ...) into a
+// namespace within the current file. Nested module blocks are allowed.
+// The members are exported from the module when marked pub and are
+// addressable as `name.member` within the file.
+type ModuleBlockStatement struct {
+	Token      Token // TOKEN_MODULE
+	Name       []string
+	Statements []Statement
+}
+
+func (mbs *ModuleBlockStatement) statementNode()       {}
+func (mbs *ModuleBlockStatement) TokenLiteral() string { return mbs.Token.Literal }
+func (mbs *ModuleBlockStatement) String() string {
+	var out bytes.Buffer
+	out.WriteString("module ")
+	out.WriteString(strings.Join(mbs.Name, "."))
+	out.WriteString(" {\n")
+	for _, s := range mbs.Statements {
+		if s != nil {
+			out.WriteString("\t")
+			out.WriteString(s.String())
+			out.WriteString("\n")
+		}
+	}
+	out.WriteString("}")
+	return out.String()
+}
+
+// TypeAliasStatement is `alias Name = Type;` (or `pub alias ...`) — a
+// named alias for a type expression. The alias can name an instantiated
+// generic (`alias IntPair = Pair:i32;`) or carry its own generic
+// parameters (`alias Opt(T) = ?T;`), in which case it is instantiated
+// like a generic type (`Opt:i32`).
+type TypeAliasStatement struct {
+	Token         Token // TOKEN_ALIAS
+	Name          *Identifier
+	GenericParams []string // e.g. ["T"] for `alias Opt(T) = ?T;`
+	Type          TypeExpr
+	IsPub         bool
+}
+
+func (tas *TypeAliasStatement) statementNode()       {}
+func (tas *TypeAliasStatement) TokenLiteral() string { return tas.Token.Literal }
+func (tas *TypeAliasStatement) String() string {
+	var out bytes.Buffer
+	if tas.IsPub {
+		out.WriteString("pub ")
+	}
+	out.WriteString("alias ")
+	if tas.Name != nil {
+		out.WriteString(tas.Name.String())
+	}
+	if len(tas.GenericParams) == 1 {
+		out.WriteString(":" + tas.GenericParams[0])
+	} else if len(tas.GenericParams) > 1 {
+		out.WriteString(":(" + strings.Join(tas.GenericParams, ", ") + ")")
+	}
+	out.WriteString(" = ")
+	if tas.Type != nil {
+		out.WriteString(tas.Type.String())
+	}
+	out.WriteString(";")
+	return out.String()
+}
+
 // VarStatement represents a `var` declaration, with or without an explicit
 // type and/or initializer:
 //
@@ -682,6 +767,7 @@ type VarStatement struct {
 	Type     TypeExpr   // nil when the type is inferred
 	Value    Expression // nil for decl-only
 	IsStatic bool       // set for `static var`
+	IsPub    bool       // set for `pub var` (module exports)
 }
 
 func (vs *VarStatement) statementNode()       {}
@@ -712,6 +798,7 @@ type ConstStatement struct {
 	Type     TypeExpr   // nil when the type is inferred
 	Value    Expression // nil for decl-only
 	IsStatic bool       // set for `static const`
+	IsPub    bool       // set for `pub const` (module exports)
 }
 
 func (cs *ConstStatement) statementNode()       {}
@@ -957,12 +1044,45 @@ func (cs *ContinueStatement) statementNode()       {}
 func (cs *ContinueStatement) TokenLiteral() string { return cs.Token.Literal }
 func (cs *ContinueStatement) String() string       { return "continue;" }
 
-// ImportStatement represents `#import <module.path>;` or the wildcard form
-// `#import <module.path>.*;`.
+// ImportSymbol is one selected symbol in a `#import module.{a, b as c}`
+// list: the exported name in the module plus an optional local alias.
+type ImportSymbol struct {
+	Name  string // exported symbol name in the module
+	Alias string // optional local alias; empty means use Name
+}
+
+func (isym *ImportSymbol) String() string {
+	if isym == nil {
+		return ""
+	}
+	if isym.Alias != "" && isym.Alias != isym.Name {
+		return isym.Name + " as " + isym.Alias
+	}
+	return isym.Name
+}
+
+// ImportStatement represents a complete `#import` directive:
+//
+//	#import module;                    // namespace import (use module.symbol)
+//	#import module.sub;                // nested path / submodule
+//	#import module.*;                  // wildcard: every pub symbol into scope
+//	#import module.symbol;             // single symbol, usable directly
+//	#import module.{a, b as c};        // selected symbols, per-symbol aliases
+//	#import module as alias;           // rename the namespace
+//	#import "rel/path.tnc";            // file import (module name from file)
+//
+// Path holds the dotted segments (Path[0] is the top module); Symbols is
+// non-empty for `.{...}` / `.symbol` selected forms; Wildcard marks `.*`;
+// ModuleAlias renames the namespace; IsFileImport + FilePath handle the
+// quoted-path form.
 type ImportStatement struct {
-	Token    Token    // TOKEN_IMPORT
-	Path     []string // dotted path segments, e.g. ["std", "io"]
-	Wildcard bool
+	Token        Token           // TOKEN_IMPORT
+	Path         []string        // dotted path segments, e.g. ["std", "io"]
+	Wildcard     bool            // `.*`
+	Symbols      []*ImportSymbol // selected symbols (`module.{a}` / `module.sym`)
+	ModuleAlias  string          // `as alias` for the namespace
+	IsFileImport bool            // `#import "path.tnc"` form
+	FilePath     string          // the quoted relative path
 }
 
 func (is *ImportStatement) statementNode()       {}
@@ -970,9 +1090,27 @@ func (is *ImportStatement) TokenLiteral() string { return is.Token.Literal }
 func (is *ImportStatement) String() string {
 	var out bytes.Buffer
 	out.WriteString("#import ")
-	out.WriteString(strings.Join(is.Path, "."))
+	if is.IsFileImport {
+		out.WriteString("\"" + is.FilePath + "\"")
+	} else {
+		out.WriteString(strings.Join(is.Path, "."))
+	}
 	if is.Wildcard {
 		out.WriteString(".*")
+	}
+	if len(is.Symbols) > 0 {
+		if len(is.Symbols) == 1 && is.Symbols[0] != nil && is.Symbols[0].Alias == "" {
+			out.WriteString("." + is.Symbols[0].Name)
+		} else {
+			parts := make([]string, 0, len(is.Symbols))
+			for _, sy := range is.Symbols {
+				parts = append(parts, sy.String())
+			}
+			out.WriteString(".{" + strings.Join(parts, ", ") + "}")
+		}
+	}
+	if is.ModuleAlias != "" {
+		out.WriteString(" as " + is.ModuleAlias)
 	}
 	out.WriteString(";")
 	return out.String()
@@ -1091,11 +1229,12 @@ func (ev *EnumVariant) String() string {
 // (`enum Something:T { ... }`) are rejected during parsing with a clear
 // "not yet supported" diagnostic.
 type EnumStatement struct {
-	Token    Token // TOKEN_ENUM
-	Name     *Identifier
-	Variants []*EnumVariant
-	Methods  []*FunctionStatement
-	IsPub    bool
+	Token         Token // TOKEN_ENUM
+	Name          *Identifier
+	GenericParams []string // e.g. ["T"] for generic enums; empty when non-generic
+	Variants      []*EnumVariant
+	Methods       []*FunctionStatement
+	IsPub         bool
 }
 
 func (es *EnumStatement) statementNode()       {}

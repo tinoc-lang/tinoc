@@ -274,6 +274,10 @@ func (p *Parser) parseStatement() Statement {
 		return p.parseSwitchStatement()
 	case TOKEN_PUB:
 		return p.parsePubStatement()
+	case TOKEN_MODULE:
+		return p.parseModuleStatement()
+	case TOKEN_ALIAS:
+		return p.parseAliasStatement(false)
 	case TOKEN_STATIC:
 		return p.parseStaticStatement()
 	case TOKEN_IF:
@@ -400,8 +404,38 @@ func (p *Parser) parseContinueStatement() Statement {
 
 // === #import ===
 
+// parseImportStatement handles the complete `#import` grammar:
+//
+//	#import module;                    // namespace import (use module.symbol)
+//	#import module.sub;                // nested path / submodule
+//	#import module.*;                  // wildcard: every pub symbol into scope
+//	#import module.symbol;             // single symbol, usable directly
+//	#import module.{a, b as c};        // selected symbols, per-symbol aliases
+//	#import module as alias;           // rename the namespace
+//	#import "rel/path.tnc";            // file import (module name from file)
+//
+// Whether a bare dotted tail (`math.PI`) is a submodule or a single
+// symbol is decided by the module loader (it tries a module file first,
+// then a pub symbol of the prefix module). `{...}` and `.*` forms are
+// unambiguous.
 func (p *Parser) parseImportStatement() Statement {
 	stmt := &ImportStatement{Token: p.curToken}
+
+	// File form: #import "rel/path.tnc" [as alias];.
+	if p.peekTokenIs(TOKEN_STRING) {
+		p.nextToken()
+		stmt.IsFileImport = true
+		stmt.FilePath = p.curToken.Literal
+		if p.peekTokenIs(TOKEN_IDENT) && p.peekToken.Literal == "as" {
+			p.nextToken() // consume 'as'
+			if !p.expectPeek(TOKEN_IDENT) {
+				return nil
+			}
+			stmt.ModuleAlias = p.curToken.Literal
+		}
+		p.skipSemicolon()
+		return stmt
+	}
 
 	if !p.expectPeek(TOKEN_IDENT) {
 		return nil
@@ -410,15 +444,49 @@ func (p *Parser) parseImportStatement() Statement {
 
 	for p.peekTokenIs(TOKEN_DOT) {
 		p.nextToken() // consume '.'
-		if p.peekTokenIs(TOKEN_ASTERISK) {
+		switch p.peekToken.Type {
+		case TOKEN_ASTERISK:
 			p.nextToken()
 			stmt.Wildcard = true
-			break
+			p.skipSemicolon()
+			return stmt
+		case TOKEN_LBRACE:
+			p.nextToken() // consume '{'
+			for !p.peekTokenIs(TOKEN_RBRACE) && !p.peekTokenIs(TOKEN_EOF) {
+				p.nextToken()
+				sym := &ImportSymbol{Name: p.curToken.Literal}
+				if p.peekTokenIs(TOKEN_IDENT) && p.peekToken.Literal == "as" {
+					p.nextToken() // consume 'as'
+					if !p.expectPeek(TOKEN_IDENT) {
+						return nil
+					}
+					sym.Alias = p.curToken.Literal
+				}
+				stmt.Symbols = append(stmt.Symbols, sym)
+				if p.peekTokenIs(TOKEN_COMMA) {
+					p.nextToken()
+				}
+			}
+			if !p.expectPeek(TOKEN_RBRACE) {
+				return nil
+			}
+			p.skipSemicolon()
+			return stmt
+		default:
+			if !p.expectPeek(TOKEN_IDENT) {
+				return nil
+			}
+			stmt.Path = append(stmt.Path, p.curToken.Literal)
 		}
+	}
+
+	// `as alias` suffix renames the namespace binding.
+	if p.peekTokenIs(TOKEN_IDENT) && p.peekToken.Literal == "as" {
+		p.nextToken() // consume 'as'
 		if !p.expectPeek(TOKEN_IDENT) {
 			return nil
 		}
-		stmt.Path = append(stmt.Path, p.curToken.Literal)
+		stmt.ModuleAlias = p.curToken.Literal
 	}
 
 	p.skipSemicolon()
@@ -530,6 +598,81 @@ func (p *Parser) parseForStatement() Statement {
 	return stmt
 }
 
+// === module / alias ===
+
+// parseModuleStatement handles both module forms: `module name;` (file
+// declaration) and `module name { ... }` (named module block grouping
+// declarations). Dotted names are supported for both
+// (`module vec.vec2;`). Blocks recurse through parseStatement so nested
+// module blocks are allowed.
+func (p *Parser) parseModuleStatement() Statement {
+	stmt := &ModuleDeclStatement{Token: p.curToken}
+
+	if !p.expectPeek(TOKEN_IDENT) {
+		return nil
+	}
+	stmt.Name = append(stmt.Name, p.curToken.Literal)
+
+	for p.peekTokenIs(TOKEN_DOT) {
+		p.nextToken() // consume '.'
+		if !p.expectPeek(TOKEN_IDENT) {
+			return nil
+		}
+		stmt.Name = append(stmt.Name, p.curToken.Literal)
+	}
+
+	if p.peekTokenIs(TOKEN_SEMICOLON) {
+		p.skipSemicolon()
+		return stmt
+	}
+
+	// Block form: `module name { ... }`.
+	if !p.expectPeek(TOKEN_LBRACE) {
+		return nil
+	}
+	block := &ModuleBlockStatement{Token: stmt.Token, Name: stmt.Name}
+	p.nextToken() // consume '{'
+	for !p.curTokenIs(TOKEN_RBRACE) && !p.curTokenIs(TOKEN_EOF) {
+		s := p.parseStatement()
+		if s != nil {
+			block.Statements = append(block.Statements, s)
+		}
+		p.nextToken()
+	}
+	return block
+}
+
+// parseAliasStatement handles `alias Name = Type;` and the generic form
+// `alias Name:T = Type;` / `alias Name:(T, U) = Type;`.
+func (p *Parser) parseAliasStatement(isPub bool) Statement {
+	stmt := &TypeAliasStatement{Token: p.curToken, IsPub: isPub}
+
+	if !p.expectPeek(TOKEN_IDENT) {
+		return nil
+	}
+	stmt.Name = &Identifier{Token: p.curToken, Value: p.curToken.Literal}
+
+	// Optional generic parameter list: `alias Opt:T = ...` / `alias Map:(K, V) = ...`.
+	if p.peekTokenIs(TOKEN_COLON) {
+		p.nextToken() // consume ':'
+		if p.peekTokenIs(TOKEN_LPAREN) {
+			p.nextToken() // consume '('
+			stmt.GenericParams = p.parseIdentList(TOKEN_RPAREN)
+		} else if p.expectPeek(TOKEN_IDENT) {
+			stmt.GenericParams = []string{p.curToken.Literal}
+		}
+	}
+
+	if !p.expectPeek(TOKEN_ASSIGN) {
+		return nil
+	}
+	p.nextToken()
+	stmt.Type = p.parseType()
+
+	p.skipSemicolon()
+	return stmt
+}
+
 // === fn / pub / static ===
 
 func (p *Parser) parsePubStatement() Statement {
@@ -565,9 +708,27 @@ func (p *Parser) parsePubStatement() Statement {
 		}
 		return stmt
 	}
-	// `pub const` / `pub var` / `pub struct` etc. reuse the same
-	// declaration parsers; the pub-ness itself isn't tracked on those
-	// nodes yet since this is a partial AST.
+	if p.peekTokenIs(TOKEN_ALIAS) {
+		p.nextToken()
+		return p.parseAliasStatement(true)
+	}
+	if p.peekTokenIs(TOKEN_VAR) {
+		p.nextToken()
+		stmt := p.parseVarStatement()
+		if v, ok := stmt.(*VarStatement); ok {
+			v.IsPub = true
+		}
+		return stmt
+	}
+	if p.peekTokenIs(TOKEN_CONST) {
+		p.nextToken()
+		stmt := p.parseConstStatement()
+		if c, ok := stmt.(*ConstStatement); ok {
+			c.IsPub = true
+		}
+		return stmt
+	}
+	// `pub` on anything else reuses the plain declaration parsers.
 	p.nextToken()
 	return p.parseStatement()
 }
@@ -620,9 +781,8 @@ func (p *Parser) parseStaticStatement() Statement {
 //
 // Field lines are `name type;` pairs; method lines start with `fn` (or
 // `static fn`). Generic struct headers (`struct Pair:T {` and
-// `struct Map:(K, V) {`) are recognized and rejected with a clear
-// "not yet supported" diagnostic, but the generic args are still
-// consumed so parsing can continue past them.
+// `struct Map:(K, V) {`) record their type parameters in
+// GenericParams for Sema's monomorphization pass.
 func (p *Parser) parseStructStatement() Statement {
 	stmt := &StructStatement{Token: p.curToken}
 
@@ -631,16 +791,16 @@ func (p *Parser) parseStructStatement() Statement {
 	}
 	stmt.Name = &Identifier{Token: p.curToken, Value: p.curToken.Literal}
 
-	// Reject generic struct headers: `struct Pair:T {` / `struct Map:(K, V) {`.
+	// Generic struct header: `struct Pair:T {` / `struct Map:(K, V) {`.
 	if p.peekTokenIs(TOKEN_COLON) {
 		p.nextToken() // consume ':'
 		if p.peekTokenIs(TOKEN_LPAREN) {
 			p.nextToken() // consume '('
-			p.parseIdentList(TOKEN_RPAREN)
+			stmt.GenericParams = p.parseIdentList(TOKEN_RPAREN)
 		} else if p.peekTokenIs(TOKEN_IDENT) {
 			p.nextToken()
+			stmt.GenericParams = []string{p.curToken.Literal}
 		}
-		p.addError("generic structs are not yet supported (%s)", stmt.Name.Value)
 	}
 
 	if !p.expectPeek(TOKEN_LBRACE) {
@@ -1509,6 +1669,17 @@ func (p *Parser) parseType() TypeExpr {
 
 func (p *Parser) parseNamedOrGenericType() TypeExpr {
 	base := &NamedType{Token: p.curToken, Name: p.curToken.Literal}
+
+	// Dotted (qualified) type names: `math.Circle`, `vec.vec2.F32`.
+	// Module members are spelled with their full dotted path so the
+	// resolver can find the owning module and the pub member inside it.
+	for p.peekTokenIs(TOKEN_DOT) {
+		p.nextToken() // consume '.'
+		if !p.expectPeek(TOKEN_IDENT) {
+			return base
+		}
+		base.Name = base.Name + "." + p.curToken.Literal
+	}
 
 	// `E!T` explicit error union: an identifier immediately followed by
 	// `!` denotes the error set name, not a plain named type.
