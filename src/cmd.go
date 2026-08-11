@@ -434,7 +434,7 @@ func runCompilerPipeline(mode string, config PipelineConfig) {
 		fmt.Printf("  %s\n", cc.Version)
 	}
 
-	binPath, workDir, err := compileGeneratedC(cc, config.FilePath, cCode, outName, ephemeral, config.Verbose, useColor)
+	binPath, workDir, err := compileGeneratedC(cc, config.FilePath, cCode, outName, ephemeral, config.Verbose, useColor, moduleIncludeDirs(state))
 	if err != nil {
 		fail(useColor, "%v", err)
 		os.Exit(1)
@@ -472,7 +472,13 @@ func runCompilerPipeline(mode string, config PipelineConfig) {
 // written inside the scratch directory so nothing remains after the
 // program finishes; otherwise it is written to outName and kept. On any
 // failure the scratch directory is removed here before the error returns.
-func compileGeneratedC(cc *CCompiler, sourcePath, cCode, outName string, ephemeral, verbose, useColor bool) (binPath, workDir string, err error) {
+//
+// extraIncludeDirs are additional -I paths for the C compiler: the
+// directories of every loaded module, so #importc'd local headers that
+// live next to a module file in a subdirectory (not just next to the
+// entry file) resolve even though the merged C is compiled from the
+// scratch work directory.
+func compileGeneratedC(cc *CCompiler, sourcePath, cCode, outName string, ephemeral, verbose, useColor bool, extraIncludeDirs []string) (binPath, workDir string, err error) {
 	workDir, err = os.MkdirTemp("", "tinoc-build-*")
 	if err != nil {
 		return "", "", fmt.Errorf("cannot create build work directory: %w", err)
@@ -506,7 +512,13 @@ func compileGeneratedC(cc *CCompiler, sourcePath, cCode, outName string, ephemer
 	// The source file's directory is added as an include path so
 	// #importc'd local headers (`#include "myheader.h"`) resolve even
 	// though the generated C is compiled from a temp work directory.
-	args := cc.BuildArgs(cFile, outPath, []string{workDir, filepath.Dir(sourcePath)})
+	// Every loaded module's directory is appended too: a module file in
+	// a subdirectory may import a header that lives next to itself, and
+	// the merged C is compiled from the scratch dir, not the module's
+	// own directory.
+	incDirs := []string{workDir, filepath.Dir(sourcePath)}
+	incDirs = append(incDirs, extraIncludeDirs...)
+	args := cc.BuildArgs(cFile, outPath, incDirs)
 
 	if verbose {
 		if useColor {
@@ -524,6 +536,32 @@ func compileGeneratedC(cc *CCompiler, sourcePath, cCode, outName string, ephemer
 	}
 
 	return outPath, workDir, nil
+}
+
+// moduleIncludeDirs returns the directory of every loaded module (in
+// load order, imports before importers, deduplicated) for the C
+// compiler's -I include path. #importc'd local headers may live next to
+// any module file — e.g. `#importc "vecmath.h"` inside lib/mathc.tnc
+// whose header sits beside it — and the merged C is compiled from a
+// scratch directory, so every module's directory must be on the include
+// path for those quoted includes to resolve.
+func moduleIncludeDirs(state *CompileState) []string {
+	if state == nil {
+		return nil
+	}
+	seen := make(map[string]bool)
+	var dirs []string
+	for _, mod := range state.ModuleList {
+		if mod == nil || mod.Path == "" {
+			continue
+		}
+		d := filepath.Dir(mod.Path)
+		if !seen[d] {
+			seen[d] = true
+			dirs = append(dirs, d)
+		}
+	}
+	return dirs
 }
 
 // runBinary executes the compiled program, forwarding stdio directly so

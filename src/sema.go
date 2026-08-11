@@ -1084,6 +1084,11 @@ func (s *Sema) checkVarStatement(v *VarStatement) {
 		if v.IsPub && s.selfView != nil && finalType != nil {
 			s.selfView.PubConsts[name] = &constExport{Name: name, Type: finalType, CName: s.cnameOverrides[v], Mutable: true, IsStatic: v.IsStatic}
 			s.selfView.PubTypes[name] = finalType
+		} else if s.selfView != nil && finalType != nil {
+			// Track private top-level globals so importers get an
+			// explicit "is private" diagnostic instead of a generic
+			// "no public symbol" (matching private functions).
+			s.selfView.PrivateConsts[name] = true
 		}
 	}
 }
@@ -1124,6 +1129,11 @@ func (s *Sema) checkConstStatement(c *ConstStatement) {
 		if c.IsPub && s.selfView != nil && finalType != nil {
 			s.selfView.PubConsts[name] = &constExport{Name: name, Type: finalType, CName: s.cnameOverrides[c], Mutable: false, IsStatic: c.IsStatic}
 			s.selfView.PubTypes[name] = finalType
+		} else if s.selfView != nil && finalType != nil {
+			// Track private top-level globals so importers get an
+			// explicit "is private" diagnostic instead of a generic
+			// "no public symbol" (matching private functions).
+			s.selfView.PrivateConsts[name] = true
 		}
 	}
 }
@@ -2040,6 +2050,16 @@ func (s *Sema) checkFieldAccess(fa *FieldAccessExpression) *Type {
 		// segment resolves inside it (tinocModule resolves the chain).
 		if _, nested := s.modules[mod.Name+"."+member]; nested {
 			return &Type{Kind: KindUnknown, Name: "module"}
+		}
+		// Same for a module-file block namespace reached cross-module
+		// (`math.physics` — physics is a block inside math.tnc): the
+		// block's pub projection lives in the file module's SubModules.
+		if _, sub := mod.SubModules[member]; sub {
+			return &Type{Kind: KindUnknown, Name: "module"}
+		}
+		if mod.PrivateConsts[member] {
+			s.errorAt(fa.Token.Line, fa.Token.Column, "symbol %s is private to module %s", member, mod.Name)
+			return &Type{Kind: KindInvalid}
 		}
 		if _, priv := mod.Funcs[member]; priv {
 			s.errorAt(fa.Token.Line, fa.Token.Column, "symbol %s is private to module %s", member, mod.Name)

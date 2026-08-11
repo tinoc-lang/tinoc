@@ -65,16 +65,32 @@ type TinocModule struct {
 	// Funcs holds every function (pub and private) for "symbol is
 	// private" diagnostics on qualified access.
 	Funcs map[string]*Symbol
+
+	// PrivateConsts holds the names of top-level const/var globals that
+	// are NOT pub, so importers get an explicit "is private to module"
+	// diagnostic instead of a generic "no public symbol" (the const
+	// counterpart of Funcs).
+	PrivateConsts map[string]bool
+
+	// SubModules exposes in-file `module name { ... }` blocks of a
+	// module file as nested namespaces, so importers can chain through
+	// them (`module math; ... module physics { pub const g; }` ->
+	// `math.physics.g`). Values are pub-only projections of the blocks:
+	// blocks expose every member in-file (same-file namespace), but
+	// across the module boundary only `pub` members are visible.
+	SubModules map[string]*TinocModule
 }
 
 func newTinocModule(name, path string) *TinocModule {
 	return &TinocModule{
-		Name:      name,
-		Path:      path,
-		PubFuncs:  make(map[string]*Symbol),
-		PubTypes:  make(map[string]*Type),
-		PubConsts: make(map[string]*constExport),
-		Funcs:     make(map[string]*Symbol),
+		Name:          name,
+		Path:          path,
+		PubFuncs:      make(map[string]*Symbol),
+		PubTypes:      make(map[string]*Type),
+		PubConsts:     make(map[string]*constExport),
+		Funcs:         make(map[string]*Symbol),
+		PrivateConsts: make(map[string]bool),
+		SubModules:    make(map[string]*TinocModule),
 	}
 }
 
@@ -509,6 +525,10 @@ func (s *Sema) bindSymbolImport(is *ImportStatement, mod *TinocModule, name, ali
 		s.errorAt(line, col, "symbol %s is private to module %s", name, mod.Name)
 		return
 	}
+	if mod.PrivateConsts[name] {
+		s.errorAt(line, col, "symbol %s is private to module %s", name, mod.Name)
+		return
+	}
 	s.errorAt(line, col, "module %s has no public symbol %s", mod.Name, name)
 }
 
@@ -787,6 +807,15 @@ func (s *Sema) resolveQualifiedType(t *NamedType) *Type {
 			return ty
 		}
 	}
+	// A block inside a module file extends its namespace
+	// (`math.physics.Point`): descend into the block's pub projection.
+	if len(segs) > 2 {
+		if sub, ok := mod.SubModules[segs[1]]; ok {
+			if ty, ok := sub.PubTypes[strings.Join(segs[2:], ".")]; ok {
+				return ty
+			}
+		}
+	}
 	s.errorAt(t.Token.Line, t.Token.Column, "module %s has no public type %s", segs[0], rest)
 	return nil
 }
@@ -804,6 +833,14 @@ func (s *Sema) tinocModule(e Expression) (*TinocModule, bool) {
 		if base, ok := s.tinocModule(ex.Left); ok && ex.Field != nil {
 			if nmod, ok2 := s.modules[base.Name+"."+ex.Field.Value]; ok2 {
 				return nmod, true
+			}
+			// Blocks inside a module file extend its namespace:
+			// `math.physics` resolves through the file module's
+			// SubModules (pub-only projection of the block).
+			if base.SubModules != nil {
+				if nmod, ok2 := base.SubModules[ex.Field.Value]; ok2 {
+					return nmod, true
+				}
 			}
 		}
 		return nil, false
@@ -1355,6 +1392,106 @@ func (s *Sema) bindBlockView(mbs *ModuleBlockStatement, full []string) {
 			s.modules[key] = view
 		}
 	}
+
+	// Publish a pub-only projection of the block into the file module's
+	// namespace so importers can chain through it (`module math;` file
+	// containing `module physics { pub const g; }` -> `math.physics.g`).
+	// Blocks expose every member in-file (same-file namespace), but
+	// across the module boundary only `pub` members are visible, so the
+	// projection filters IsPub. Nested blocks wire parent -> child so
+	// chains (`math.a.b.VAL`) resolve through each projection's own
+	// SubModules.
+	if s.selfView != nil {
+		proj := s.blockPubProjection(view, mbs)
+		s.selfView.SubModules[strings.Join(full, ".")] = proj
+		if len(full) > 1 {
+			parent := s.selfView.SubModules[strings.Join(full[:len(full)-1], ".")]
+			if parent != nil {
+				parent.SubModules[full[len(full)-1]] = proj
+			}
+		}
+	}
+}
+
+// blockPubProjection builds the pub-only view of a block for
+// cross-module access: every member marked `pub` (functions, types,
+// consts/vars) is exported; private block members stay file-private.
+func (s *Sema) blockPubProjection(view *TinocModule, mbs *ModuleBlockStatement) *TinocModule {
+	proj := newTinocModule(view.Name, view.Path)
+	proj.IsBlock = true
+	// view.Name is the block's full dotted name ("physics" or "a.b"),
+	// which blockMemberCName needs as its segment list.
+	segments := strings.Split(view.Name, ".")
+	for _, stmt := range mbs.Statements {
+		switch inner := stmt.(type) {
+		case *FunctionStatement:
+			if inner.Name != nil && inner.IsPub {
+				if sym := s.funcs[inner.Name.Value]; sym != nil {
+					proj.PubFuncs[inner.Name.Value] = sym
+					proj.Funcs[inner.Name.Value] = sym
+				}
+			}
+		case *StructStatement:
+			if inner.Name != nil && inner.IsPub {
+				if t := s.structTypes[s.canonNames[inner]]; t != nil {
+					proj.PubTypes[inner.Name.Value] = t
+				}
+			}
+		case *EnumStatement:
+			if inner.Name != nil && inner.IsPub {
+				if t := s.enumTypes[s.canonNames[inner]]; t != nil {
+					proj.PubTypes[inner.Name.Value] = t
+				}
+			}
+		case *UnionStatement:
+			if inner.Name != nil && inner.IsPub {
+				if t := s.unionTypes[s.canonNames[inner]]; t != nil {
+					proj.PubTypes[inner.Name.Value] = t
+				}
+			}
+		case *ConstStatement:
+			if inner.Name != nil && inner.IsPub {
+				if t := s.declConstTypes[inner]; t != nil {
+					proj.PubConsts[inner.Name.Value] = &constExport{Name: inner.Name.Value, Type: t, CName: blockMemberCName(s, segments, inner.Name.Value), Mutable: false, IsStatic: inner.IsStatic}
+					proj.PubTypes[inner.Name.Value] = t
+				} else if inner.Type != nil {
+					if t := s.resolveTypeExpr(inner.Type); t != nil {
+						proj.PubConsts[inner.Name.Value] = &constExport{Name: inner.Name.Value, Type: t, CName: blockMemberCName(s, segments, inner.Name.Value), Mutable: false, IsStatic: inner.IsStatic}
+						proj.PubTypes[inner.Name.Value] = t
+					}
+				} else if inner.Value != nil {
+					if t := s.checkExpression(inner.Value); t != nil && t.Kind != KindInvalid {
+						proj.PubConsts[inner.Name.Value] = &constExport{Name: inner.Name.Value, Type: t, CName: blockMemberCName(s, segments, inner.Name.Value), Mutable: false, IsStatic: inner.IsStatic}
+						proj.PubTypes[inner.Name.Value] = t
+					}
+				}
+			}
+		case *VarStatement:
+			if inner.Name != nil && inner.IsPub {
+				if t := s.declVarTypes[inner]; t != nil {
+					proj.PubConsts[inner.Name.Value] = &constExport{Name: inner.Name.Value, Type: t, CName: blockMemberCName(s, segments, inner.Name.Value), Mutable: true, IsStatic: inner.IsStatic}
+					proj.PubTypes[inner.Name.Value] = t
+				} else if inner.Type != nil {
+					if t := s.resolveTypeExpr(inner.Type); t != nil {
+						proj.PubConsts[inner.Name.Value] = &constExport{Name: inner.Name.Value, Type: t, CName: blockMemberCName(s, segments, inner.Name.Value), Mutable: true, IsStatic: inner.IsStatic}
+						proj.PubTypes[inner.Name.Value] = t
+					}
+				} else if inner.Value != nil {
+					if t := s.checkExpression(inner.Value); t != nil && t.Kind != KindInvalid {
+						proj.PubConsts[inner.Name.Value] = &constExport{Name: inner.Name.Value, Type: t, CName: blockMemberCName(s, segments, inner.Name.Value), Mutable: true, IsStatic: inner.IsStatic}
+						proj.PubTypes[inner.Name.Value] = t
+					}
+				}
+			}
+		case *TypeAliasStatement:
+			if inner.Name != nil && inner.IsPub {
+				if t := s.typeAliases[inner.Name.Value]; t != nil {
+					proj.PubTypes[inner.Name.Value] = t
+				}
+			}
+		}
+	}
+	return proj
 }
 
 // blockMemberCName computes the mangled C name a module-block member

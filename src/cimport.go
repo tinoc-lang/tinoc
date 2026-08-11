@@ -226,7 +226,7 @@ func ImportCHeaders(alias string, headers []string, sourceDir string) (*CImportM
 		return nil, err
 	}
 
-	keyHash := cacheHash(wrapperSrc, dumper)
+	keyHash := cacheHash(wrapperSrc, dumper, headers, sourceDir)
 
 	// Macros: both backends use -dM -E.
 	macroText, err := cachedToolOutput(keyHash+".macros", func() ([]byte, error) {
@@ -342,9 +342,55 @@ func runTool(path string, args []string) error {
 
 // === Disk Cache ===
 
-func cacheHash(wrapperSrc string, d *headerDumper) string {
-	sum := sha256.Sum256([]byte(wrapperSrc + "\x00" + d.Path + "\x00" + d.Version + "\x00" + d.Kind))
-	return hex.EncodeToString(sum[:])[:32]
+// resolveLocalHeader reports the absolute path of a header when it
+// resolves as a local file next to the importing source (mirroring
+// cIncludeDirective's quote-include rule). System headers (bare names
+// with no file next to the source) return ok=false.
+func resolveLocalHeader(header, sourceDir string) (string, bool) {
+	p := header
+	if !filepath.IsAbs(p) && sourceDir != "" {
+		p = filepath.Join(sourceDir, header)
+	}
+	if info, err := os.Stat(p); err == nil && !info.IsDir() {
+		return filepath.Clean(p), true
+	}
+	return "", false
+}
+
+// cacheHash builds the disk-cache key for one header parse. The wrapper
+// text and dumper identity are not enough: `#importc "vecmath.h"` from
+// two different directories produces the same wrapper but parses
+// different files, and a local header's contents can change between
+// builds — a key over the wrapper alone would silently serve a stale
+// parse of a different (or older) file under the same name. Each header
+// therefore also folds in its resolved local path plus a hash of its
+// current contents, so edited or same-named local headers always
+// re-parse. System headers (bare names, no local file) key on the header
+// spelling, as before.
+func cacheHash(wrapperSrc string, d *headerDumper, headers []string, sourceDir string) string {
+	h := sha256.New()
+	h.Write([]byte(wrapperSrc))
+	h.Write([]byte{0})
+	h.Write([]byte(d.Path))
+	h.Write([]byte{0})
+	h.Write([]byte(d.Version))
+	h.Write([]byte{0})
+	h.Write([]byte(d.Kind))
+	for _, header := range headers {
+		h.Write([]byte{0})
+		if path, ok := resolveLocalHeader(header, sourceDir); ok {
+			h.Write([]byte("L"))
+			h.Write([]byte(path))
+			if data, err := os.ReadFile(path); err == nil {
+				sum := sha256.Sum256(data)
+				h.Write(sum[:])
+			}
+		} else {
+			h.Write([]byte("S"))
+			h.Write([]byte(header))
+		}
+	}
+	return hex.EncodeToString(h.Sum(nil))[:32]
 }
 
 // cachedToolOutput serves a subprocess's stdout from a disk cache keyed by

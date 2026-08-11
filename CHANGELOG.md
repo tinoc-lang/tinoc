@@ -133,6 +133,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`#importc` local headers next to modules in subdirectories**: a
+  module file importing its own local header (`#importc "vecmath.h"`
+  inside `lib/mathc.tnc` with `vecmath.h` beside it) emitted the right
+  quoted include into the merged C, but the C compile step only put the
+  *entry file's* directory on the include path — so the header was not
+  found and the build failed. `compileGeneratedC` now receives every
+  loaded module's directory as an `-I` path (in load order,
+  deduplicated), so local headers resolve wherever they live.
+- **Stale `#importc` parse cache**: the disk cache keyed only on the
+  wrapper text and dumper identity, so two `#importc "vecmath.h"` from
+  different directories (or an edited local header) could be served the
+  stale parse of a different file under the same name — silently missing
+  or wrong declarations. The key now folds in each local header's
+  resolved absolute path plus a hash of its current contents, so
+  same-named headers across directories and edits always re-parse.
+- **Module-file blocks unreachable from importers**: a
+  `module name { ... }` block inside a module file (`module math;` …
+  `module physics { pub const g; }`) could not be reached cross-module
+  — `math.physics.g` failed with "module math has no public member
+  physics". Blocks now publish a pub-only projection into the file
+  module's namespace, so dotted chains (`math.physics.g`,
+  `math.physics.weight`) resolve, nested blocks chain (`math.a.b.VAL`),
+  and private block members stay file-private with a clear diagnostic.
+- **Private `const`/`var` diagnostics**: importing a private top-level
+  `const`/`var` reported "module x has no public symbol y"; it now
+  reports "symbol y is private to module x", matching private
+  functions. Private globals are tracked per module and checked in both
+  the symbol-import and qualified-access paths.
 - **Module `str` globals**: top-level `const`/`var` of type `str` (or
   arrays/slices of `str`) in module files emitted invalid C
   (`static const str x = tinoc_str_lit(...)` — a function call in a

@@ -257,6 +257,54 @@ fn main() void {
 	}
 }
 
+func TestModuleBlockInImportedModuleFile(t *testing.T) {
+	// A `module physics { ... }` block inside a module file extends that
+	// module's namespace, so importers reach block members through the
+	// dotted chain (`math.physics.g`, `math.physics.weight`). Only `pub`
+	// block members cross the module boundary.
+	out, _ := compileAndRunModules(t, map[string]string{
+		"math.tnc": `module math;
+module physics {
+	pub const g f64 = 9.81;
+	const HIDDEN f64 = 123.0; // private
+	pub fn weight(m f64) f64 {
+		return m * g;
+	}
+}
+`,
+		"main.tnc": `#import math;
+extern "C" fn printf(fmt *const char, ...) i32;
+fn main() void {
+	printf("g=%.2f\n", math.physics.g);
+	printf("w=%.2f\n", math.physics.weight(10.0));
+}
+`,
+	}, "main.tnc")
+	if !strings.Contains(out, "g=9.81") || !strings.Contains(out, "w=98.10") {
+		t.Fatalf("expected math.physics.g / math.physics.weight to resolve, got %q", out)
+	}
+}
+
+func TestModuleBlockPrivateNotVisibleCrossModule(t *testing.T) {
+	// Private block members stay file-private: `math.physics.HIDDEN`
+	// must be rejected with a clear diagnostic, not silently exposed.
+	diags := checkModules(t, map[string]string{
+		"math.tnc": `module math;
+module physics {
+	const HIDDEN i32 = 5;
+}
+`,
+		"main.tnc": `#import math;
+fn main() void {
+	var v = math.physics.HIDDEN;
+}
+`,
+	}, "main.tnc")
+	if !moduleDiagContains(diags, "has no public member HIDDEN") {
+		t.Fatalf("expected private block member to be rejected, diags: %v", diags.All())
+	}
+}
+
 func TestModuleBlockPrivateAccessibleInFile(t *testing.T) {
 	// Block views expose every member (they are the same file's
 	// namespace), unlike imported modules which only expose pub items.
