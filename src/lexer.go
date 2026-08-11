@@ -42,6 +42,8 @@ func colorForToken(t TokenType) string {
 		return colorPurple
 	case TOKEN_IMPORT, TOKEN_IMPORTC, TOKEN_RUN, TOKEN_PARTIAL:
 		return colorYellow
+	case TOKEN_MODULE, TOKEN_ALIAS:
+		return colorYellow
 	case TOKEN_LPAREN, TOKEN_RPAREN, TOKEN_LBRACE, TOKEN_RBRACE, TOKEN_LBRACK, TOKEN_RBRACK,
 		TOKEN_COMMA, TOKEN_DOT, TOKEN_COLON, TOKEN_SEMICOLON, TOKEN_HASH:
 		return colorGray
@@ -93,6 +95,8 @@ const (
 	TOKEN_CONTINUE TokenType = "continue"
 	TOKEN_RETURN   TokenType = "return"
 	TOKEN_PUB      TokenType = "pub"
+	TOKEN_MODULE   TokenType = "module"
+	TOKEN_ALIAS    TokenType = "alias"
 	TOKEN_SELF     TokenType = "self"
 	TOKEN_STATIC   TokenType = "static"
 	TOKEN_EXTERN   TokenType = "extern"
@@ -185,6 +189,8 @@ var keywords = map[string]TokenType{
 	"continue": TOKEN_CONTINUE,
 	"return":   TOKEN_RETURN,
 	"pub":      TOKEN_PUB,
+	"module":   TOKEN_MODULE,
+	"alias":    TOKEN_ALIAS,
 	"self":     TOKEN_SELF,
 	"extern":   TOKEN_EXTERN,
 	"static":   TOKEN_STATIC,

@@ -1,5 +1,14 @@
-#import std.io;
-#import std.collections.*;
+// Types tour: arrays, multidimensional arrays, sentinel-terminated
+// arrays, optionals, pointers, and a generic struct instantiation.
+// (std.collections vec/map types arrive with the standard library.)
+
+extern "C" fn printf(fmt *const char, ...) i32;
+
+// generic struct type
+struct Pair:T {
+	first T;
+	second T;
+}
 
 fn main() void {
 	// arrays
@@ -19,22 +28,13 @@ fn main() void {
 	var maybe ?i32 = null;
 	maybe = 42;
 
-	// error union types
-	var inferred_err !i32 = 0;
-
 	// pointer type
 	var x i32 = 5;
 	var ptr ^i32 = &x;
 	ptr^ = 10;
 
-	// generic collection type
-	var v vec:i32;
-
 	// generic struct-literal instantiation
 	var pair Pair:i32 = Pair:i32 { .first = 10, .second = 20 };
 
-	// generic map type
-	var m map:(str, i32);
-
-	io.println("{any}", pair);
+	printf("pair.first=%d pair.second=%d\n", pair.first, pair.second);
 }

@@ -88,6 +88,13 @@ type Type struct {
 	Kind TypeKind
 	Name string // canonical Tinoc spelling, e.g. "i32", "str", "bool"
 
+	// CName overrides the C identifier codegen emits for aggregate
+	// types (struct/enum/union). Module types and monomorphized generic
+	// instances set it to their mangled name (e.g. "math_Circle",
+	// "math_Pair_i32"); everything else leaves it empty and codegen
+	// falls back to sanitizeCIdent(Name).
+	CName string
+
 	// Integer-specific.
 	IntBits   int // 8, 16, 32, 64, 128; 0 for usize/isize (platform width)
 	IntSigned bool
@@ -183,8 +190,12 @@ func (t *Type) CType() string {
 		// has_value; }` representation from syntax.md.
 		return optionalTypeName(t)
 	case KindStruct, KindEnum, KindUnion:
-		// Emitted as a typedef named after the type; sanitize so a name
+		// Emitted as a typedef named after the type (mangled for module
+		// types and generic instances via CName); sanitize so a name
 		// that collides with a C keyword still yields valid C.
+		if t.CName != "" {
+			return t.CName
+		}
 		return sanitizeCIdent(t.Name)
 	default:
 		return t.Name
@@ -349,20 +360,32 @@ func (s *Sema) resolveTypeExpr(te TypeExpr) *Type {
 		if ct, ok := s.cTypes[t.Name]; ok {
 			return ct
 		}
-		// A user-declared struct: return its registered, resolved type.
+		// User-declared struct/enum/union: return the registered, resolved
+		// type. Both the bare local name and the canonical (possibly
+		// dotted) name are registered, so `math.Circle` (written by an
+		// importer) and `Circle` (written by the defining module) both
+		// resolve here without needing module-namespace lookup.
 		if st, ok := s.structTypes[t.Name]; ok {
 			return st
 		}
-		// A user-declared enum: return its registered, resolved type.
 		if et, ok := s.enumTypes[t.Name]; ok {
 			return et
 		}
-		// A user-declared union: return its registered, resolved type.
 		if ut, ok := s.unionTypes[t.Name]; ok {
 			return ut
 		}
-		// Not a known primitive, C type, struct, enum, or union: an
-		// unknown name. Treated as KindUnknown (valid, opaque) rather
+		// A name bound by an alias (`alias Meters = f64;`) or a
+		// selected import (`#import math.{Circle}`): the aliased type.
+		if at, ok := s.typeAliases[t.Name]; ok {
+			return at
+		}
+		// Dotted qualified name (`math.Circle`) not yet bound in this
+		// Sema: resolve through the importing module's pub type table.
+		if strings.Contains(t.Name, ".") {
+			return s.resolveQualifiedType(t)
+		}
+		// Not a known primitive, C type, struct, enum, union, or alias:
+		// an unknown name. Treated as KindUnknown (valid, opaque) rather
 		// than an error so var/const/fn involving user-defined types
 		// don't hard-fail sema wholesale -- codegen will surface a clear
 		// "unsupported" diagnostic if it's actually asked to generate
@@ -382,8 +405,15 @@ func (s *Sema) resolveTypeExpr(te TypeExpr) *Type {
 		return &Type{Kind: KindPointer, Name: "^" + elem.Name, Elem: elem}
 
 	case *GenericType:
-		s.diags.Error("sema", 0, 0, "generic types are not yet supported (%s)", t.String())
-		return nil
+		// `Pair:i32` / `Opt:T` — a monomorphized generic struct or a
+		// generic alias. Without a compilation state (plain RunSema)
+		// generics stay unsupported, matching the single-file legacy
+		// pipeline.
+		if s.state == nil {
+			s.diags.Error("sema", 0, 0, "generic types are not yet supported (%s)", t.String())
+			return nil
+		}
+		return s.resolveGenericType(t)
 	case *OptionalType:
 		elem := s.resolveTypeExpr(t.Elem)
 		if elem == nil {
@@ -566,6 +596,38 @@ func arrayDimSuffix(t *Type) string {
 // message, matching Go's own phrasing for the same class of error.
 func describeMismatch(exprDesc string, got, want *Type) string {
 	return fmt.Sprintf("cannot use %s (type %s) as type %s", exprDesc, got.String(), want.String())
+}
+
+// typeExprFromType reconstructs a TypeExpr spelling of a resolved *Type,
+// used to re-instantiate generics with inferred type arguments (`fn
+// identity:T(x T) T` called as `identity(5)` infers T = i32, which is
+// re-fed into the monomorphizer as a NamedType "i32"). Struct/enum/union
+// types round-trip through their canonical (possibly dotted) Name so a
+// module-qualified type resolves in whatever scope the instantiation is
+// checked in.
+func typeExprFromType(t *Type) TypeExpr {
+	if t == nil {
+		return nil
+	}
+	switch t.Kind {
+	case KindPointer:
+		return &PointerType{Elem: typeExprFromType(t.Elem)}
+	case KindOptional:
+		return &OptionalType{Elem: typeExprFromType(t.Elem)}
+	case KindSlice:
+		return &ArrayType{Elem: typeExprFromType(t.Elem)}
+	case KindArray:
+		lit := &IntegerLiteral{Value: int64(t.ArraySize), Raw: fmt.Sprintf("%d", t.ArraySize)}
+		at := &ArrayType{Size: lit, Elem: typeExprFromType(t.Elem)}
+		if t.HasSentinel {
+			at.Sentinel = &IntegerLiteral{Value: t.SentinelValue, Raw: fmt.Sprintf("%d", t.SentinelValue)}
+		}
+		return at
+	case KindStruct, KindEnum, KindUnion:
+		return &NamedType{Name: t.Name}
+	default:
+		return &NamedType{Name: t.Name}
+	}
 }
 
 // === C Type Mapping ===

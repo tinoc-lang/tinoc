@@ -1,4 +1,7 @@
-#import std.io;
+// Control flow: if/else-if/else, for ranges, for collections, while,
+// pointers, and a generic function call with explicit type arguments.
+
+extern "C" fn printf(fmt *const char, ...) i32;
 
 fn add(a i32, b i32) i32 {
 	return a + b;
@@ -38,6 +41,6 @@ fn main() void {
 	var p ^i32 = &x;
 	var deref = p^;
 
-	io.println("{d}", same);
-	io.println("{d}", deref);
+	printf("%d\n", same);
+	printf("%d\n", deref);
 }

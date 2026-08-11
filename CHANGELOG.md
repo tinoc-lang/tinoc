@@ -9,6 +9,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Smart module system**: `#import` now resolves user modules semantically.
+  Every form is supported — namespace (`#import math;`), wildcard
+  (`#import math.*;`), single symbol (`#import math.PI;`), selected symbols
+  with per-symbol aliases (`#import math.{a, b as c};`), namespace aliases
+  (`#import math as m;`), submodule paths (`#import shapes.vec;`), and
+  quoted file imports (`#import "lib/tools.tnc" as t;`). Paths resolve
+  relative to the importing file; `a.b.c` finds `a/b/c.tnc`, then the
+  directory forms `a/b/c/mod.tnc` / `a/b/c/c.tnc` — **directories become
+  modules automatically** (`shapes/mod.tnc` is the module `shapes`).
+  Imports load recursively with cycle detection and cache by absolute
+  path, so diamond imports share one module instance; re-importing the
+  same module is idempotent. Module-name collisions and `std.*` imports
+  (not available yet) get clear diagnostics.
+- **`module` keyword**: `module name;` names a file's module (files
+  without one take their file stem); `module name { ... }` groups
+  declarations into an in-file namespace, with nesting
+  (`module a { module b { ... } }` → `a.b.member`) and dotted names
+  (`module a.b { ... }`). `pub` marks exports; private items are rejected
+  when imported (`symbol x is private to module math`).
+- **Generics end-to-end**: `fn name:T(...)`, `struct Name:T { ... }`, and
+  `alias Name:T = ...;` (including multi-param `:(K, V)` forms) are
+  monomorphized — each concrete type-argument set produces one copy with
+  a mangled C name (`Pair:i32` → `tnc_Pair_i32`), cached per instance.
+  Calls support explicit type arguments (`identity:str(x)`) and inference
+  from argument types (`identity(x)`), and generics work across module
+  boundaries (`shapes.Circle:f64`, `math.identity:i32(42)`).
+- **Single merged C output**: every loaded module compiles into one C
+  translation unit in load order (imports before importers), with type
+  typedefs, prototypes, and file-scope data hoisted so call order across
+  modules never matters; module items get mangled C names
+  (`math.abs` → `tnc_math_abs`) so same-named items never collide.
+- **Sample module demo**: `samples/modules/` — a multi-file demo
+  (`main.tnc`, `math.tnc`, `shapes/mod.tnc`, `shapes/vec.tnc`) exercising
+  every import form, the `module` keyword (declaration + block),
+  directory modules, and generics across modules; `samples/build.sh` runs
+  it alongside the single-file samples.
+- **Docs**: `syntax.md`'s Modules and Preprocessor sections now document
+  the full `#import` grammar, the `module` keyword, `pub`/private
+  visibility, directories-as-modules, and module resolution rules, plus
+  a new C Interop section covering `#importc` (previously undocumented)
+  and `extern "C" fn`; `README.md`'s language-support table reflects the
+  module system and generics.
 - **Optionals**: `?T` — a `{ T value; bool has_value; }` wrapper emitted
   as a named typedef (`?i32` -> `tnc_opt_i32`), with `null` as the empty
   value, `x orelse fallback` defaulting (the fallback is only evaluated
@@ -90,6 +132,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (where git used to check out CRLF).
 
 ### Fixed
+
+- **Module `str` globals**: top-level `const`/`var` of type `str` (or
+  arrays/slices of `str`) in module files emitted invalid C
+  (`static const str x = tinoc_str_lit(...)` — a function call in a
+  static-storage initializer). Literals now emit a constant brace
+  initializer (`{ .data = "...", .len = N }`); other str initializers
+  fall back to external linkage. This broke wildcard-imported string
+  constants.
+- **Nested module blocks**: `module a { module b { pub const VAL; } }`
+  failed to resolve `a.b.VAL` — block views registered only under their
+  local segment, so dotted chains through nested/dotted block namespaces
+  now register every dotted prefix of the full name.
+- **Dead module globals**: unreferenced private top-level `const`/`var`
+  in module files are no longer emitted into the merged C output (they
+  were always emitted as `static`, making the C compiler warn with
+  `-Wunused-const-variable`/`-Wunused-variable` and padding the output
+  with dead data). A global is kept when it is `pub` (reachable through
+  its module namespace, e.g. `math.PI`), a `module name { ... }` block
+  member, or referenced by a bare identifier anywhere in the
+  compilation.
 
 - **CI / C-interop tests**: the `#importc` error-checking tests
   (`TestCImport_UndefinedMember`, `TestCImport_WrongArgCount`,

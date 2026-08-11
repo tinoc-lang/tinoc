@@ -34,6 +34,13 @@ type Codegen struct {
 	indent    int
 	loopDepth int
 
+	// skipTopLevelData makes genTopLevelStatement omit top-level
+	// var/const declarations. GenerateAll uses it per module: file-scope
+	// data is collected into a prelude emitted before every function
+	// body, so a module const (math.PI) referenced from the entry file's
+	// main is always declared before use in the merged C output.
+	skipTopLevelData bool
+
 	// inMain tracks whether the function currently being generated is
 	// Tinoc's `main`, which C requires to return int even though Tinoc's
 	// own signature is `fn main() void`. genReturn consults this to turn
@@ -87,7 +94,11 @@ type Codegen struct {
 // already run Check() on the program being generated, so type queries
 // (TypeOf/TypeOfVarDecl/TypeOfConstDecl) return real answers.
 func NewCodegen(sema *Sema, diags *Diagnostics) *Codegen {
-	return &Codegen{sema: sema, diags: diags}
+	return &Codegen{
+		sema:             sema,
+		diags:            diags,
+		cSymbolsIncluded: make(map[string]bool),
+	}
 }
 
 func (g *Codegen) errorAt(line, col int, format string, args ...interface{}) {
@@ -108,9 +119,175 @@ func (g *Codegen) writeln(format string, args ...interface{}) {
 	g.out.WriteString("\n")
 }
 
-// Generate walks the whole program and returns the generated C source. It
-// is safe to call once per Codegen instance.
+// Generate walks a single program and returns the generated C source
+// (the legacy single-file pipeline). When a program was checked through a
+// CompileState (imports, modules, generics), use GenerateAll instead so
+// every loaded module and monomorphized instance lands in one merged
+// translation unit. It is safe to call once per Codegen instance.
 func (g *Codegen) Generate(prog *Program) string {
+	types, body := g.generateParts(prog)
+	var final bytes.Buffer
+	g.assembleFinal(&final, &types, &body)
+	return final.String()
+}
+
+// GenerateAll emits the whole compilation -- every module in load order
+// (imports before importers), then the monomorphized generic instances --
+// into a single merged C translation unit, per the module design in
+// module.go. Each module's declarations are generated through a Codegen
+// bound to that module's own Sema, so resolved types, CName mangling, and
+// typedefs resolve against the module that declared the items. Type
+// typedefs and function prototypes are hoisted to the top of the file,
+// so call order across modules never matters for C.
+func (g *Codegen) GenerateAll(state *CompileState) string {
+	if state == nil || len(state.ModuleList) == 0 {
+		return ""
+	}
+
+	// Module globals are emitted as `static` bindings, so an unreferenced
+	// one would make the C compiler warn (-Wunused-const-variable /
+	// -Wunused-variable). Compute the compilation-wide referenced set
+	// first: every bare identifier use of a mangled global is recorded in
+	// the referencing Sema's idCName (imported consts and module-local
+	// globals both resolve through checkIdentifier), and every global
+	// that is pub or a `module name { ... }` block member is published in
+	// a module view's PubConsts (qualified access, e.g. `math.PI` or
+	// `physics.g`, reaches it without going through idCName). Globals in
+	// neither set are dead in this compilation and are omitted below.
+	referencedGlobals := make(map[string]bool)
+	publishedGlobals := make(map[string]bool)
+	for _, mod := range state.ModuleList {
+		if mod == nil || mod.Sema == nil {
+			continue
+		}
+		for _, cn := range mod.Sema.idCName {
+			if cn != "" {
+				referencedGlobals[cn] = true
+			}
+		}
+		for _, view := range mod.Sema.modules {
+			if view == nil {
+				continue
+			}
+			for _, ce := range view.PubConsts {
+				if ce != nil && ce.CName != "" {
+					publishedGlobals[ce.CName] = true
+				}
+			}
+		}
+	}
+
+	seenIncludes := make(map[string]bool)
+	seenTypeDefs := make(map[string]bool)
+	var allIncludes, allDecls []string
+	var types, body, prelude bytes.Buffer
+
+	for _, mod := range state.ModuleList {
+		if mod == nil || mod.Prog == nil || mod.Sema == nil {
+			continue
+		}
+		mg := NewCodegen(mod.Sema, g.diags)
+		mg.sourceDir = filepath.Dir(mod.Path)
+
+		// #importc includes and header-declared symbols are
+		// translation-unit global; dedupe across modules so each
+		// include directive is emitted once.
+		for _, stmt := range mod.Prog.Statements {
+			if ics, ok := stmt.(*ImportCStatement); ok {
+				for _, h := range ics.Headers {
+					inc := cIncludeDirective(h, mg.sourceDir)
+					if !seenIncludes[inc] {
+						seenIncludes[inc] = true
+						allIncludes = append(allIncludes, inc)
+					}
+				}
+				if cmod, ok := mg.sema.importCModules[ics.Alias]; ok {
+					for name := range cmod.Funcs {
+						mg.cSymbolsIncluded[name] = true
+					}
+				}
+			}
+		}
+
+		// File-scope var/const for every module goes into a prelude
+		// emitted before all function bodies: C declares-before-use, and
+		// only function/method prototypes are otherwise hoisted, so a
+		// module const (math.PI) referenced from the entry file's main
+		// would otherwise be declared after its use.
+		mg.skipTopLevelData = true
+		modTypes, modBody := mg.generateParts(mod.Prog)
+		appendTypeDefs(&types, &modTypes, seenTypeDefs)
+		allDecls = append(allDecls, mg.forwardDecls...)
+
+		dg := NewCodegen(mod.Sema, g.diags)
+		dg.sourceDir = filepath.Dir(mod.Path)
+		walkTopLevelStatements(mod.Prog.Statements, func(stmt Statement) {
+			switch st := stmt.(type) {
+			case *VarStatement:
+				if dg.moduleGlobalUnused(st, referencedGlobals, publishedGlobals) {
+					return
+				}
+				dg.genTopLevelVar(st)
+			case *ConstStatement:
+				if dg.moduleGlobalUnused(st, referencedGlobals, publishedGlobals) {
+					return
+				}
+				dg.genTopLevelConst(st)
+			}
+		})
+		prelude.Write(dg.out.Bytes())
+		body.Write(modBody.Bytes())
+	}
+
+	// Monomorphized generic instances: struct typedefs first (so later
+	// bodies and function definitions can name them), then struct
+	// methods, then function definitions. Each instance generates
+	// against the Sema that created it.
+	for _, inst := range state.InstantiatedStructs {
+		if inst == nil || inst.Sema == nil {
+			continue
+		}
+		mg := NewCodegen(inst.Sema, g.diags)
+		mg.collectInstanceStructTypeDefs(inst)
+		appendInstanceTypedefs(&types, mg, seenTypeDefs)
+		mg.genStructInstanceDef(inst, &types, &body)
+		allDecls = append(allDecls, mg.forwardDecls...)
+	}
+	for _, inst := range state.InstantiatedFns {
+		if inst == nil || inst.Fn == nil || inst.Sema == nil {
+			continue
+		}
+		mg := NewCodegen(inst.Sema, g.diags)
+		mg.collectInstanceTypeDefs(inst)
+		appendInstanceTypedefs(&types, mg, seenTypeDefs)
+		mg.genFunction(inst.Fn)
+		allDecls = append(allDecls, mg.forwardDecls...)
+		body.Write(mg.out.Bytes())
+	}
+
+	g.cIncludes = allIncludes
+	g.forwardDecls = allDecls
+
+	// Splice the data prelude (all modules' file-scope var/const) in
+	// front of the bodies it was collected from.
+	if prelude.Len() > 0 {
+		var merged bytes.Buffer
+		merged.Write(prelude.Bytes())
+		merged.Write(body.Bytes())
+		body = merged
+	}
+
+	var final bytes.Buffer
+	g.assembleFinal(&final, &types, &body)
+	return final.String()
+}
+
+// generateParts runs every pre-pass and renders a program's type
+// declarations into `types` and its definitions into `body`, collecting
+// #importc includes, slice/optional typedefs, and forward declarations on
+// g. Callers assemble those parts (Generate for a single file, GenerateAll
+// for a whole compilation).
+func (g *Codegen) generateParts(prog *Program) (bytes.Buffer, bytes.Buffer) {
 	// Pre-pass: collect every #importc's include lines and the C symbols
 	// those headers declare, before any generation starts, so extern "C"
 	// prototypes can be deduped regardless of statement order.
@@ -157,21 +334,21 @@ func (g *Codegen) Generate(prog *Program) string {
 	if len(g.optionalTypeDefs) > 0 {
 		g.writeln("")
 	}
-	for _, stmt := range prog.Statements {
+	walkTopLevelStatements(prog.Statements, func(stmt Statement) {
 		if es, ok := stmt.(*EnumStatement); ok {
 			g.genEnumTypeDef(es)
 		}
-	}
-	for _, stmt := range prog.Statements {
+	})
+	walkTopLevelStatements(prog.Statements, func(stmt Statement) {
 		if st, ok := stmt.(*StructStatement); ok {
 			g.genStructTypeDef(st)
 		}
-	}
-	for _, stmt := range prog.Statements {
+	})
+	walkTopLevelStatements(prog.Statements, func(stmt Statement) {
 		if us, ok := stmt.(*UnionStatement); ok {
 			g.genUnionTypeDef(us)
 		}
-	}
+	})
 	types = g.out
 	g.out = *main
 
@@ -182,13 +359,16 @@ func (g *Codegen) Generate(prog *Program) string {
 	// declarations (functions and methods) into g.forwardDecls as we go,
 	// so the final output can place all prototypes before any definition.
 	g.out = body
-	for _, stmt := range prog.Statements {
-		g.genTopLevelStatement(stmt)
-	}
+	walkTopLevelStatements(prog.Statements, g.genTopLevelStatement)
 	body = g.out
 	g.out = *main
+	return types, body
+}
 
-	var final bytes.Buffer
+// assembleFinal writes the standard output shape -- header comment,
+// tinoc.h include, #importc includes, type typedefs, forward declarations,
+// then bodies -- from parts generated by generateParts / GenerateAll.
+func (g *Codegen) assembleFinal(final *bytes.Buffer, types, body *bytes.Buffer) {
 	final.WriteString("// Code generated by tinoc. DO NOT EDIT.\n")
 	final.WriteString("#include \"tinoc.h\"\n")
 	for _, inc := range g.cIncludes {
@@ -211,8 +391,41 @@ func (g *Codegen) Generate(prog *Program) string {
 	}
 
 	final.Write(body.Bytes())
+}
 
-	return final.String()
+// appendTypeDefs copies a module's type-declaration section into dst,
+// dropping typedef lines already emitted by an earlier module (a slice or
+// optional typedef shared by several modules must appear exactly once in
+// the merged translation unit). Aggregate typedefs span multiple lines;
+// only their first line starts with "typedef ", so they are never
+// spuriously deduplicated (each module's aggregate types are unique).
+func appendTypeDefs(dst, src *bytes.Buffer, seen map[string]bool) {
+	for _, line := range strings.Split(src.String(), "\n") {
+		if strings.HasPrefix(line, "typedef ") && seen[line] {
+			continue
+		}
+		if strings.HasPrefix(line, "typedef ") {
+			seen[line] = true
+		}
+		dst.WriteString(line)
+		dst.WriteString("\n")
+	}
+}
+
+// walkTopLevelStatements visits every top-level statement, descending into
+// `module name { ... }` blocks so declarations inside blocks are treated
+// as file scope (they are, semantically: their names are module-mangled).
+func walkTopLevelStatements(stmts []Statement, fn func(Statement)) {
+	for _, st := range stmts {
+		if st == nil {
+			continue
+		}
+		if mb, ok := st.(*ModuleBlockStatement); ok {
+			walkTopLevelStatements(mb.Statements, fn)
+			continue
+		}
+		fn(st)
+	}
 }
 
 // genTopLevelStatement dispatches the handful of statement kinds allowed
@@ -225,8 +438,14 @@ func (g *Codegen) genTopLevelStatement(stmt Statement) {
 	case *FunctionStatement:
 		g.genFunction(st)
 	case *VarStatement:
+		if g.skipTopLevelData {
+			return
+		}
 		g.genTopLevelVar(st)
 	case *ConstStatement:
+		if g.skipTopLevelData {
+			return
+		}
 		g.genTopLevelConst(st)
 	case *StructStatement:
 		g.genStructMethods(st)
@@ -240,12 +459,46 @@ func (g *Codegen) genTopLevelStatement(stmt Statement) {
 		// by a real standard library in this pass.)
 	case *ImportCStatement:
 		// Includes were collected in the pre-pass; nothing to emit here.
+	case *ModuleDeclStatement:
+		// `module name;` is a naming directive; no C is emitted.
+	case *ModuleBlockStatement:
+		// `module name { ... }` members are ordinary file-scope
+		// declarations (their names are module-mangled); recurse.
+		walkTopLevelStatements(st.Statements, g.genTopLevelStatement)
+	case *TypeAliasStatement:
+		// Aliases are a Sema-level name binding (including generic
+		// aliases, which expand at each use); no C is emitted.
 	case *ExternCFuncStatement:
 		g.genExternCFuncProto(st)
 	case nil:
 	default:
 		g.errorAt(0, 0, "codegen: unsupported top-level statement %T", stmt)
 	}
+}
+
+// typeCName returns the C identifier codegen must emit for a type given
+// its local name (bare, canonical, or mangled): the type's CName for
+// module/generic types, else the sanitized local name. Works across all
+// three aggregate registries, which mirror both bare and canonical keys.
+func (g *Codegen) typeCName(typeName string) string {
+	for _, tbl := range []map[string]*Type{g.sema.structTypes, g.sema.enumTypes, g.sema.unionTypes} {
+		if t := tbl[typeName]; t != nil && t.CName != "" {
+			return t.CName
+		}
+	}
+	return sanitizeCIdent(typeName)
+}
+
+// typeTagCName is the package-level variant of typeCName for a resolved
+// *Type (no Sema needed): the C identifier of the type's C tag/typedef.
+func typeTagCName(t *Type) string {
+	if t == nil {
+		return "void"
+	}
+	if t.CName != "" {
+		return t.CName
+	}
+	return sanitizeCIdent(t.Name)
 }
 
 // genExternCFuncProto emits the C prototype for an `extern "C" fn`
@@ -282,7 +535,7 @@ func (g *Codegen) genEnumTypeDef(es *EnumStatement) {
 	if t == nil {
 		return
 	}
-	name := sanitizeCIdent(es.Name.Value)
+	name := g.typeCName(es.Name.Value)
 
 	if t.HasPayload {
 		g.writeln("typedef struct %s {", name)
@@ -369,7 +622,7 @@ func (g *Codegen) genStructTypeDef(st *StructStatement) {
 	if st.Name == nil {
 		return
 	}
-	name := sanitizeCIdent(st.Name.Value)
+	name := g.typeCName(st.Name.Value)
 
 	g.writeln("struct %s;", name)
 	g.writeln("typedef struct %s {", name)
@@ -416,7 +669,7 @@ func (g *Codegen) genUnionTypeDef(us *UnionStatement) {
 	if us.Name == nil {
 		return
 	}
-	name := sanitizeCIdent(us.Name.Value)
+	name := g.typeCName(us.Name.Value)
 
 	g.writeln("union %s;", name)
 	g.writeln("typedef union %s {", name)
@@ -464,7 +717,7 @@ func (g *Codegen) genTypeMethod(typeName string, methods map[string]*Symbol, fn 
 	}
 
 	retC := cReturnType(sym.ReturnType, fn.Name.Value)
-	cName := "tnc_" + sanitizeCIdent(typeName) + "_" + sanitizeCIdent(fn.Name.Value)
+	cName := "tnc_" + g.typeCName(typeName) + "_" + sanitizeCIdent(fn.Name.Value)
 
 	var params []string
 	offset := 0
@@ -526,16 +779,17 @@ func cSelfParamType(selfType *Type) string {
 // use the tag spelling (`struct Point`, `struct Point*`) which compiles
 // even when the referenced struct is declared later in the file (tag
 // forward declarations were emitted in the struct pre-pass); everything
-// else uses the ordinary CType mapping.
+// else uses the ordinary CType mapping. The tag identifier is the type's
+// mangled CName for module/generic structs.
 func structFieldCType(t *Type) string {
 	if t == nil || t.Kind == KindInvalid || t.Kind == KindUnknown {
 		return "void*"
 	}
 	if t.Kind == KindStruct {
-		return "struct " + sanitizeCIdent(t.Name)
+		return "struct " + typeTagCName(t)
 	}
 	if t.Kind == KindPointer && t.Elem != nil && t.Elem.Kind == KindStruct {
-		return "struct " + sanitizeCIdent(t.Elem.Name) + "*"
+		return "struct " + typeTagCName(t.Elem) + "*"
 	}
 	return t.CType()
 }
@@ -563,7 +817,9 @@ func (g *Codegen) genFunction(fn *FunctionStatement) {
 		return
 	}
 	if len(fn.GenericParams) > 0 {
-		g.errorAt(fn.Token.Line, fn.Token.Column, "codegen: generic functions are not yet supported (%s)", fn.Name.Value)
+		// Generic functions are templates, not concrete functions: every
+		// use is monomorphized during sema and the copies are emitted by
+		// GenerateAll from state.InstantiatedFns. Nothing to emit here.
 		return
 	}
 
@@ -589,6 +845,12 @@ func (g *Codegen) genFunction(fn *FunctionStatement) {
 	paramList := strings.Join(params, ", ")
 
 	cName := cFunctionName(fn.Name.Value)
+	if sym.CName != "" {
+		// Module functions (math.abs -> tnc_math_abs), imported
+		// functions, and monomorphized generic instances carry their
+		// exact C symbol from Sema.
+		cName = sym.CName
+	}
 
 	// C requires main() to return int; Tinoc's `fn main() void` maps to
 	// `int main(void)` with an implicit `return 0;` appended, matching
@@ -680,6 +942,34 @@ var cKeywords = map[string]bool{
 
 // === Top-level var / const ===
 
+// moduleGlobalUnused reports whether a module-file top-level var/const
+// should be omitted from the merged C output (GenerateAll's prelude).
+// Module globals are emitted as `static` bindings, so an unreferenced one
+// makes the C compiler warn (-Wunused-const-variable / -Wunused-variable)
+// and pads the output with dead data. A global is kept when its mangled C
+// name is published (pub exports and `module name { ... }` block members
+// are reachable through qualified access, e.g. `math.PI` / `physics.g`, a
+// path that never goes through idCName) or referenced by a bare
+// identifier somewhere in the compilation (recorded in the referencing
+// Sema's idCName). Entry-file globals have no mangled name and keep the
+// legacy always-emit behavior.
+func (g *Codegen) moduleGlobalUnused(stmt Statement, referenced, published map[string]bool) bool {
+	var cname string
+	switch st := stmt.(type) {
+	case *ConstStatement:
+		cname = g.sema.cnameOverrides[st]
+	case *VarStatement:
+		cname = g.sema.cnameOverrides[st]
+	}
+	if cname == "" {
+		return false // entry file or unmangled binding: legacy behavior
+	}
+	if published[cname] {
+		return false // pub / block member: qualified-reachable, always emit
+	}
+	return !referenced[cname]
+}
+
 func (g *Codegen) genTopLevelVar(v *VarStatement) {
 	t := g.sema.TypeOfVarDecl(v)
 	if !g.checkEmittable(t, v.Token.Line, v.Token.Column, "var "+identName(v.Name)) {
@@ -693,13 +983,37 @@ func (g *Codegen) genTopLevelVar(v *VarStatement) {
 		// non-static top-level bindings are emitted as ordinary C globals.
 		storage = ""
 	}
+	name := sanitizeCIdent(v.Name.Value)
+	if cname, ok := g.sema.cnameOverrides[v]; ok && cname != "" {
+		// Module files mangle every top-level global's C name so
+		// same-named globals across modules never collide.
+		name = cname
+	}
+	// str bindings (and arrays/slices of str) have no constant-expression
+	// initializer form in C; see strGlobalDecl.
+	if t != nil && containsStr(t) {
+		if t.Kind == KindStr {
+			g.writeln("%s", g.strGlobalDecl(storage, name, v.Value, t))
+		} else {
+			// Arrays/slices of str can't be static-storage constant
+			// initializers; external linkage with runtime init.
+			init := ""
+			if v.Value != nil {
+				init = " = " + g.genInit(v.Value, t)
+			} else {
+				init = " = " + zeroValue(t)
+			}
+			g.writeln("%s%s;", cDeclarator(t, name), init)
+		}
+		return
+	}
 	init := ""
 	if v.Value != nil {
 		init = " = " + g.genInit(v.Value, t)
 	} else {
 		init = " = " + zeroValue(t)
 	}
-	g.writeln("%s%s%s;", storage, cDeclarator(t, sanitizeCIdent(v.Name.Value)), init)
+	g.writeln("%s%s%s;", storage, cDeclarator(t, name), init)
 }
 
 func (g *Codegen) genTopLevelConst(c *ConstStatement) {
@@ -715,7 +1029,60 @@ func (g *Codegen) genTopLevelConst(c *ConstStatement) {
 	// since C requires internal linkage for a header-free single
 	// translation unit and Tinoc const at file scope has no external
 	// visibility story yet (no `pub` propagation to codegen in this pass).
-	g.writeln("static const %s%s;", cDeclarator(t, sanitizeCIdent(c.Name.Value)), init)
+	name := sanitizeCIdent(c.Name.Value)
+	if cname, ok := g.sema.cnameOverrides[c]; ok && cname != "" {
+		// Module files mangle every top-level global's C name so
+		// same-named globals across modules never collide.
+		name = cname
+	}
+	// str values (and arrays/slices of str) have no constant-expression
+	// initializer in C; see strGlobalDecl.
+	if t != nil && containsStr(t) {
+		if t.Kind == KindStr {
+			g.writeln("%s", g.strGlobalDecl("static const ", name, c.Value, t))
+		} else {
+			// Arrays/slices of str can't be static-storage constant
+			// initializers; external linkage with runtime init.
+			g.writeln("%s%s;", cDeclarator(t, name), init)
+		}
+		return
+	}
+	g.writeln("static const %s%s;", cDeclarator(t, name), init)
+}
+
+// containsStr reports whether t is `str` or an array/slice whose element
+// type is eventually `str`. Top-level bindings of those types cannot use
+// constant-expression initializers in C (see strGlobalDecl).
+func containsStr(t *Type) bool {
+	if t == nil {
+		return false
+	}
+	if t.Kind == KindStr {
+		return true
+	}
+	if (t.Kind == KindArray || t.Kind == KindSlice) && t.Elem != nil {
+		return containsStr(t.Elem)
+	}
+	return false
+}
+
+// strGlobalDecl renders a top-level binding whose type is exactly str.
+// C requires constant expressions (or string literals) in static-storage
+// initializers, and `tinoc_str_lit(...)` is a function call — so a plain
+// string literal is emitted as a brace initializer (`{ .data = "...",
+// .len = N }` is a constant expression and keeps the binding static), and
+// any other str initializer (or a decl-only binding) falls back to
+// external linkage with a runtime initializer (Sema still enforces
+// const-ness on `const` bindings).
+func (g *Codegen) strGlobalDecl(storage, name string, value Expression, t *Type) string {
+	if sl, ok := value.(*StringLiteral); ok {
+		u := unescapeCString(sl.Value)
+		return fmt.Sprintf("%sstr %s = { .data = %s, .len = %d };", storage, name, cQuote(u), len(u))
+	}
+	if value == nil {
+		return storage + "str " + name + " = { .data = \"\", .len = 0 };"
+	}
+	return "str " + name + " = " + g.genInit(value, t) + ";"
 }
 
 func identName(id *Identifier) string {
@@ -1175,7 +1542,7 @@ func (g *Codegen) genSwitchArmLabel(v Expression) string {
 		if id, isID := fa.Left.(*Identifier); isID {
 			if et, ok := g.sema.enumTypes[id.Value]; ok {
 				if _, isVariant := et.EnumVariantIdx[fa.Field.Value]; isVariant {
-					return sanitizeCIdent(id.Value) + "_" + sanitizeCIdent(fa.Field.Value)
+					return g.typeCName(id.Value) + "_" + sanitizeCIdent(fa.Field.Value)
 				}
 			}
 		}
@@ -1211,7 +1578,7 @@ func (g *Codegen) genSwitchPatternArm(arm *SwitchArm, value string) bool {
 		return false
 	}
 	info := et.EnumVariants[idx]
-	name := sanitizeCIdent(et.Name)
+	name := g.typeCName(et.Name)
 	variant := sanitizeCIdent(info.Name)
 
 	g.writeln("case %s_%s:", name, variant)
@@ -1281,6 +1648,12 @@ func (g *Codegen) genExpr(e Expression) string {
 func (g *Codegen) genExprNoConv(e Expression) string {
 	switch ex := e.(type) {
 	case *Identifier:
+		// Imported module consts, module-local globals, and generic
+		// instances resolve to their mangled C name (recorded by Sema);
+		// everything else keeps the bare (sanitized) identifier.
+		if cname, ok := g.sema.idCName[ex]; ok {
+			return cname
+		}
 		return sanitizeCIdent(ex.Value)
 	case *IntegerLiteral:
 		return genIntegerLiteral(ex)
@@ -1336,6 +1709,13 @@ func (g *Codegen) genExprNoConv(e Expression) string {
 		if mod, ok := g.sema.moduleAlias(ex.Left); ok && ex.Field != nil {
 			if c, ok := mod.Consts[ex.Field.Value]; ok {
 				return c.CSymbol
+			}
+		}
+		// User module member: `math.PI` / `math.Circle` resolve to the
+		// defining module's mangled const/type name.
+		if tm, ok := g.sema.tinocModule(ex.Left); ok && ex.Field != nil {
+			if ce, ok := tm.PubConsts[ex.Field.Value]; ok && ce.CName != "" {
+				return ce.CName
 			}
 		}
 		// Enum variant reference: `Direction.North` -> `Direction_North`
@@ -1490,98 +1870,73 @@ func (g *Codegen) genArrayBraceInit(al *ArrayLiteral) string {
 func (g *Codegen) collectSliceTypes(prog *Program) {
 	g.sliceTypeDefs = nil
 	seen := make(map[string]bool)
-	var register func(t *Type)
-	register = func(t *Type) {
-		if t == nil {
-			return
-		}
-		switch t.Kind {
-		case KindArray, KindOptional:
-			register(t.Elem)
-		case KindSlice:
-			register(t.Elem) // nested slice elements first
-			name := sliceTypeName(t)
-			if seen[name] {
-				return
-			}
-			seen[name] = true
-			elemC := "void"
-			if t.Elem != nil {
-				elemC = t.Elem.CType()
-			}
-			g.sliceTypeDefs = append(g.sliceTypeDefs, fmt.Sprintf("typedef tinoc_slice(%s) %s;", elemC, name))
-		}
-	}
 	// Every var/const declaration — top-level and local — contributes
 	// its declared type, so a type used only in a local declaration
 	// still gets its typedef (e.g. `var s []i32` or `var o ?str` in a
 	// function body with no signature mention).
 	for _, t := range g.sema.declVarTypes {
-		register(t)
+		g.registerSliceTypedef(t, seen)
 	}
 	for _, t := range g.sema.declConstTypes {
-		register(t)
+		g.registerSliceTypedef(t, seen)
 	}
-	for _, stmt := range prog.Statements {
-		switch s := stmt.(type) {
+	walkTopLevelStatements(prog.Statements, func(stmt Statement) {
+		switch st := stmt.(type) {
 		case *FunctionStatement:
-			if s.Name != nil {
-				if sym := g.sema.funcs[s.Name.Value]; sym != nil {
+			if st.Name != nil {
+				if sym := g.sema.funcs[st.Name.Value]; sym != nil {
 					for _, p := range sym.Params {
-						register(p)
+						g.registerSliceTypedef(p, seen)
 					}
-					register(sym.ReturnType)
+					g.registerSliceTypedef(sym.ReturnType, seen)
 				}
 			}
 		case *ExternCFuncStatement:
-			if s.Name != nil {
-				if sym := g.sema.externCFuncs[s.Name.Value]; sym != nil {
+			if st.Name != nil {
+				if sym := g.sema.externCFuncs[st.Name.Value]; sym != nil {
 					for _, p := range sym.Params {
-						register(p)
+						g.registerSliceTypedef(p, seen)
 					}
-					register(sym.ReturnType)
+					g.registerSliceTypedef(sym.ReturnType, seen)
 				}
 			}
 		case *VarStatement:
-			register(g.sema.TypeOfVarDecl(s))
+			g.registerSliceTypedef(g.sema.TypeOfVarDecl(st), seen)
 		case *ConstStatement:
-			register(g.sema.TypeOfConstDecl(s))
+			g.registerSliceTypedef(g.sema.TypeOfConstDecl(st), seen)
 		case *StructStatement:
-			if s.Name != nil {
-				if st := g.sema.structTypes[s.Name.Value]; st != nil {
-					for _, f := range st.Fields {
-						register(f.Type)
+			if st.Name != nil {
+				if stt := g.sema.structTypes[st.Name.Value]; stt != nil {
+					for _, f := range stt.Fields {
+						g.registerSliceTypedef(f.Type, seen)
 					}
 				}
 			}
 		case *UnionStatement:
-			if s.Name != nil {
-				if ut := g.sema.unionTypes[s.Name.Value]; ut != nil {
+			if st.Name != nil {
+				if ut := g.sema.unionTypes[st.Name.Value]; ut != nil {
 					for _, f := range ut.Fields {
-						register(f.Type)
+						g.registerSliceTypedef(f.Type, seen)
 					}
 				}
 			}
 		}
-	}
+	})
 }
 
-func (g *Codegen) collectOptionalTypes(prog *Program) {
-	g.optionalTypeDefs = nil
-	seen := make(map[string]bool)
-	var register func(t *Type)
-	register = func(t *Type) {
-		if t == nil {
-			return
-		}
-		switch t.Kind {
-		case KindArray, KindSlice, KindOptional:
-			register(t.Elem) // nested element types first
-		}
-		if t.Kind != KindOptional {
-			return
-		}
-		name := optionalTypeName(t)
+// registerSliceTypedef records the named typedef for a slice type (and
+// any nested slice types it contains) if not already seen, appending to
+// g.sliceTypeDefs.
+func (g *Codegen) registerSliceTypedef(t *Type, seen map[string]bool) {
+	if t == nil {
+		return
+	}
+	switch t.Kind {
+	case KindArray, KindOptional:
+		g.registerSliceTypedef(t.Elem, seen)
+	case KindSlice:
+		g.registerSliceTypedef(t.Elem, seen) // nested slice elements first
+		name := sliceTypeName(t)
 		if seen[name] {
 			return
 		}
@@ -1590,60 +1945,219 @@ func (g *Codegen) collectOptionalTypes(prog *Program) {
 		if t.Elem != nil {
 			elemC = t.Elem.CType()
 		}
-		g.optionalTypeDefs = append(g.optionalTypeDefs, fmt.Sprintf("typedef struct { %s value; bool has_value; } %s;", elemC, name))
+		g.sliceTypeDefs = append(g.sliceTypeDefs, fmt.Sprintf("typedef tinoc_slice(%s) %s;", elemC, name))
 	}
+}
+
+// collectOptionalTypes walks the same declarations as collectSliceTypes
+// and registers a named typedef for every distinct optional type used in
+// the program (`?i32` -> tnc_opt_i32, `?[]i32` -> tnc_opt_tnc_slice_i32,
+// `?^str` -> tnc_opt_strp). Typedefs are emitted after slice typedefs
+// (an optional payload can itself be a slice) and before enums/structs
+// (struct and enum fields can be optional), mirroring the slice typedef
+// pattern: a named typedef keeps every declaration of the same optional
+// type identical in C.
+func (g *Codegen) collectOptionalTypes(prog *Program) {
+	g.optionalTypeDefs = nil
+	seen := make(map[string]bool)
 	// Every var/const declaration — top-level and local — contributes
 	// its declared type, so a type used only in a local declaration
 	// still gets its typedef (e.g. `var s []i32` or `var o ?str` in a
 	// function body with no signature mention).
 	for _, t := range g.sema.declVarTypes {
-		register(t)
+		g.registerOptionalTypedef(t, seen)
 	}
 	for _, t := range g.sema.declConstTypes {
-		register(t)
+		g.registerOptionalTypedef(t, seen)
 	}
-	for _, stmt := range prog.Statements {
-		switch s := stmt.(type) {
+	walkTopLevelStatements(prog.Statements, func(stmt Statement) {
+		switch st := stmt.(type) {
 		case *FunctionStatement:
-			if s.Name != nil {
-				if sym := g.sema.funcs[s.Name.Value]; sym != nil {
+			if st.Name != nil {
+				if sym := g.sema.funcs[st.Name.Value]; sym != nil {
 					for _, p := range sym.Params {
-						register(p)
+						g.registerOptionalTypedef(p, seen)
 					}
-					register(sym.ReturnType)
+					g.registerOptionalTypedef(sym.ReturnType, seen)
 				}
 			}
 		case *ExternCFuncStatement:
-			if s.Name != nil {
-				if sym := g.sema.externCFuncs[s.Name.Value]; sym != nil {
+			if st.Name != nil {
+				if sym := g.sema.externCFuncs[st.Name.Value]; sym != nil {
 					for _, p := range sym.Params {
-						register(p)
+						g.registerOptionalTypedef(p, seen)
 					}
-					register(sym.ReturnType)
+					g.registerOptionalTypedef(sym.ReturnType, seen)
 				}
 			}
 		case *VarStatement:
-			register(g.sema.TypeOfVarDecl(s))
+			g.registerOptionalTypedef(g.sema.TypeOfVarDecl(st), seen)
 		case *ConstStatement:
-			register(g.sema.TypeOfConstDecl(s))
+			g.registerOptionalTypedef(g.sema.TypeOfConstDecl(st), seen)
 		case *StructStatement:
-			if s.Name != nil {
-				if st := g.sema.structTypes[s.Name.Value]; st != nil {
-					for _, f := range st.Fields {
-						register(f.Type)
+			if st.Name != nil {
+				if stt := g.sema.structTypes[st.Name.Value]; stt != nil {
+					for _, f := range stt.Fields {
+						g.registerOptionalTypedef(f.Type, seen)
 					}
 				}
 			}
 		case *UnionStatement:
-			if s.Name != nil {
-				if ut := g.sema.unionTypes[s.Name.Value]; ut != nil {
+			if st.Name != nil {
+				if ut := g.sema.unionTypes[st.Name.Value]; ut != nil {
 					for _, f := range ut.Fields {
-						register(f.Type)
+						g.registerOptionalTypedef(f.Type, seen)
 					}
 				}
 			}
 		}
+	})
+}
+
+// registerOptionalTypedef records the named typedef for an optional type
+// (and any nested slice/optional types it contains) if not already seen,
+// appending to g.optionalTypeDefs.
+func (g *Codegen) registerOptionalTypedef(t *Type, seen map[string]bool) {
+	if t == nil {
+		return
 	}
+	switch t.Kind {
+	case KindArray, KindSlice, KindOptional:
+		g.registerOptionalTypedef(t.Elem, seen)
+	}
+	if t.Kind != KindOptional {
+		return
+	}
+	name := optionalTypeName(t)
+	if seen[name] {
+		return
+	}
+	seen[name] = true
+	elemC := "void"
+	if t.Elem != nil {
+		elemC = t.Elem.CType()
+	}
+	g.optionalTypeDefs = append(g.optionalTypeDefs, fmt.Sprintf("typedef struct { %s value; bool has_value; } %s;", elemC, name))
+}
+
+// collectInstanceTypeDefs registers the slice/optional typedefs a
+// monomorphized generic function instance needs (its resolved signature
+// types), which may go beyond what its creating module's own
+// declarations collected.
+func (g *Codegen) collectInstanceTypeDefs(inst *FnInstance) {
+	if inst == nil || inst.Fn == nil || inst.Sema == nil {
+		return
+	}
+	sym := inst.Sema.funcs[inst.Fn.Name.Value]
+	if sym == nil {
+		return
+	}
+	seen := make(map[string]bool)
+	for _, p := range sym.Params {
+		g.registerSliceTypedef(p, seen)
+	}
+	g.registerSliceTypedef(sym.ReturnType, seen)
+	seen2 := make(map[string]bool)
+	for _, p := range sym.Params {
+		g.registerOptionalTypedef(p, seen2)
+	}
+	g.registerOptionalTypedef(sym.ReturnType, seen2)
+}
+
+// collectInstanceStructTypeDefs registers the slice/optional typedefs a
+// monomorphized generic struct instance needs (its resolved field types
+// and method signatures).
+func (g *Codegen) collectInstanceStructTypeDefs(inst *StructInstance) {
+	if inst == nil || inst.Type == nil || inst.Sema == nil {
+		return
+	}
+	seen := make(map[string]bool)
+	seen2 := make(map[string]bool)
+	register := func(t *Type) {
+		g.registerSliceTypedef(t, seen)
+		g.registerOptionalTypedef(t, seen2)
+	}
+	for _, f := range inst.Type.Fields {
+		if f != nil {
+			register(f.Type)
+		}
+	}
+	for _, m := range inst.Methods {
+		if m == nil {
+			continue
+		}
+		for _, p := range m.Params {
+			register(p)
+		}
+		register(m.ReturnType)
+	}
+}
+
+// appendInstanceTypedefs writes a codegen's collected slice/optional
+// typedefs into the merged types buffer, deduped against typedefs already
+// emitted by earlier modules and instances.
+func appendInstanceTypedefs(types *bytes.Buffer, g *Codegen, seen map[string]bool) {
+	wrote := false
+	for _, td := range g.sliceTypeDefs {
+		if seen[td] {
+			continue
+		}
+		seen[td] = true
+		wrote = true
+		types.WriteString(td)
+		types.WriteString("\n")
+	}
+	for _, td := range g.optionalTypeDefs {
+		if seen[td] {
+			continue
+		}
+		seen[td] = true
+		wrote = true
+		types.WriteString(td)
+		types.WriteString("\n")
+	}
+	if wrote {
+		types.WriteString("\n")
+	}
+}
+
+// genStructInstanceDef emits the typedef and methods of one
+// monomorphized generic struct into the merged output: the typedef (with
+// its own slice/optional typedefs already appended by the caller) goes
+// into `types` so every later body can name it, and the method
+// definitions go into `body` with their prototypes collected in
+// g.forwardDecls. The instance generates against the Sema that created
+// it.
+func (g *Codegen) genStructInstanceDef(inst *StructInstance, types, body *bytes.Buffer) {
+	t := inst.Type
+	if t == nil {
+		return
+	}
+	name := typeTagCName(t)
+	main := &g.out
+
+	g.out = *types
+	g.writeln("struct %s;", name)
+	g.writeln("typedef struct %s {", name)
+	g.indent++
+	for _, f := range t.Fields {
+		if f == nil {
+			continue
+		}
+		g.writeln("%s;", cDeclarator(f.Type, sanitizeCIdent(f.Name)))
+	}
+	g.indent--
+	g.writeln("} %s;", name)
+	*types = g.out
+
+	g.out = *body
+	for _, m := range inst.Decl.Methods {
+		if m != nil {
+			g.genTypeMethod(name, inst.Methods, m)
+		}
+	}
+	*body = g.out
+	g.out = *main
 }
 
 // collectOptionalTypes walks the same declarations as collectSliceTypes
@@ -1940,6 +2454,23 @@ func (g *Codegen) genCall(ce *CallExpression) string {
 				return g.genCCall(fn.CSymbol, ce)
 			}
 		}
+		// User module call: `math.abs(...)` -> tnc_math_abs(...). The
+		// defining module's pub symbol carries the mangled C name. A
+		// qualified generic call (`math.identity:i32(...)`) is a
+		// monomorphized instance registered by Sema in the call-target
+		// table with its mangled instance CName.
+		if tm, isMod := g.sema.tinocModule(fa.Left); isMod && fa.Field != nil {
+			var margs []string
+			for _, a := range ce.Arguments {
+				margs = append(margs, g.genExpr(a))
+			}
+			if sym := tm.PubFuncs[fa.Field.Value]; sym != nil && sym.CName != "" {
+				return fmt.Sprintf("%s(%s)", sym.CName, strings.Join(margs, ", "))
+			}
+			if sym := g.sema.callTargets[ce]; sym != nil && sym.CName != "" {
+				return fmt.Sprintf("%s(%s)", sym.CName, strings.Join(margs, ", "))
+			}
+		}
 		// Static method call / enum constructor: `Point.create(...)` ->
 		// tnc_Point_create(...); `Shape.Circle(5.0)` -> a tagged-union
 		// compound literal; `Shape.kindName(...)` -> tnc_Shape_kindName(...).
@@ -1986,13 +2517,28 @@ func (g *Codegen) genCall(ce *CallExpression) string {
 		g.errorAt(ce.Token.Line, ce.Token.Column, "codegen: unsupported call target (module/method calls are not yet implemented)")
 		return "/* unsupported call */ 0"
 	}
-	if len(ce.GenericArgs) > 0 {
-		g.errorAt(ce.Token.Line, ce.Token.Column, "codegen: generic calls are not yet supported (%s)", ident.Value)
-	}
 
 	// extern "C" fn: printf(...) -> printf(...) under its real C symbol.
 	if sym, ok := g.sema.externCFuncs[ident.Value]; ok {
 		return g.genCCall(sym.CSymbol, ce)
+	}
+
+	// A monomorphized generic instance (identity:str) or an imported
+	// module function bound under a bare name carries its exact mangled
+	// C symbol from Sema; emit that, not the bare name.
+	if sym := g.sema.callTargets[ce]; sym != nil && sym.CName != "" {
+		var args []string
+		for _, a := range ce.Arguments {
+			args = append(args, g.genExpr(a))
+		}
+		return fmt.Sprintf("%s(%s)", sym.CName, strings.Join(args, ", "))
+	}
+	if sym := g.sema.funcs[ident.Value]; sym != nil && sym.CName != "" {
+		var args []string
+		for _, a := range ce.Arguments {
+			args = append(args, g.genExpr(a))
+		}
+		return fmt.Sprintf("%s(%s)", sym.CName, strings.Join(args, ", "))
 	}
 
 	var args []string
@@ -2059,7 +2605,7 @@ func (g *Codegen) genEnumConstructor(enumName, variant string, ce *CallExpressio
 		g.errorAt(ce.Token.Line, ce.Token.Column, "codegen: no resolved type for enum %s", enumName)
 		return "/* unsupported enum construction */ {0}"
 	}
-	name := sanitizeCIdent(enumName)
+	name := g.typeCName(enumName)
 
 	idx, ok := et.EnumVariantIdx[variant]
 	if !ok {
@@ -2112,7 +2658,7 @@ func (g *Codegen) genTypeMethodCall(typeName, method string, methods map[string]
 		return "/* unsupported call */ 0"
 	}
 
-	cName := "tnc_" + sanitizeCIdent(typeName) + "_" + sanitizeCIdent(method)
+	cName := "tnc_" + g.typeCName(typeName) + "_" + sanitizeCIdent(method)
 
 	var args []string
 	if recv != nil {

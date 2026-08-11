@@ -1,0 +1,68 @@
+// The module-system demo. Run it with:
+//
+//   tinoc run samples/modules/main.tnc
+//
+// This entry file exercises every import form and the `module` keyword:
+//
+//   #import math;                 namespace import  -> math.square(...)
+//   #import math.PI;              single symbol     -> PI
+//   #import math.E as EULER;      single symbol,    -> EULER
+//                                 renamed
+//   #import shapes.*;             wildcard          -> circumference(...)
+//   #import shapes.vec;           submodule         -> vec.Vec2 / vec.dot
+//   #import shapes.vec.{Vec2,dot} selected symbols  -> Vec2 / dot
+//   #import "shapes/vec.tnc" as f file import       -> f.Vec2 / f.dot
+//
+// plus an in-file `module physics { ... }` block, a directory module
+// (samples/modules/shapes/), and generic structs/functions used across
+// modules (`shapes.Circle:f64`, `math.identity:i32(...)`).
+
+#import math;
+#import math.PI;
+#import math.E as EULER;
+#import shapes.*;
+#import shapes.vec;
+#import shapes.vec.{Vec2, dot};
+#import "shapes/vec.tnc" as vfile;
+
+module physics {
+	pub const g f64 = 9.81;
+
+	pub fn energy(m f64, v f64) f64 {
+		return 0.5 * m * v * v;
+	}
+}
+
+extern "C" fn printf(fmt *const char, ...) i32;
+
+fn main() void {
+	printf("PI=%f EULER=%f\n", PI, EULER);
+	printf("math.square(3)=%f\n", math.square(3.0));
+
+	// Wildcard import: circumference comes in bare from shapes.*.
+	printf("circumference=%f\n", circumference(2.0));
+
+	// Selected symbols from the shapes.vec submodule: Vec2 and dot.
+	var v Vec2 = Vec2 { .x = 3.0, .y = 4.0 };
+	printf("dot=%f\n", dot(v, v));
+
+	// Submodule namespace: shapes.vec as `vec`.
+	var v2 vec.Vec2 = vec.Vec2 { .x = 1.0, .y = 2.0 };
+	printf("vec.dot=%f\n", vec.dot(v2, v2));
+
+	// Quoted file import with a namespace alias.
+	var v3 vfile.Vec2 = vfile.Vec2 { .x = 0.5, .y = 1.5 };
+	printf("vfile.dot=%f\n", vfile.dot(v3, v3));
+
+	// In-file module block: physics.energy / physics.g.
+	printf("energy=%f\n", physics.energy(2.0, 3.0));
+	printf("g=%f\n", physics.g);
+
+	// Generic struct from a module: shapes.Circle:f64.
+	var c shapes.Circle:f64 = shapes.Circle:f64 { .r = 2.5 };
+	printf("circle r=%f\n", c.r);
+
+	// Generic function from a module: math.identity:i32(42).
+	var id = math.identity:i32(42);
+	printf("identity=%d\n", id);
+}

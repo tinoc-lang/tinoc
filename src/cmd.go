@@ -239,30 +239,18 @@ func handleCheck(args []string) {
 	}
 	ok(useColor, "syntactic check passed")
 
-	// Sema runs on top of a clean parse. It covers var/const/static
-	// var/static const/fn fully; anything else in the program (struct/
-	// enum/union/switch/generics/etc) is left unchecked by this pass
-	// rather than reported as an error, matching the parser's own
-	// "partial, not wrong" stance above.
-	_, _, diags := RunSema(config.FilePath, source)
+	// Sema runs through the compilation state so imports and modules are
+	// resolved and checked too, matching the build/run pipeline.
+	diags := NewDiagnostics(config.FilePath)
+	state := NewCompileState()
+	state.LoadRoot(config.FilePath, source, diags)
 
-	semaErrs := 0
-	for _, d := range diags.All() {
-		if d.Severity == SeverityError && d.Stage == "sema" {
-			semaErrs++
-		}
-	}
-
-	if semaErrs > 0 {
-		fail(useColor, "semantic check found %s", pluralize(semaErrs, "issue", "issues"))
-		for _, d := range diags.All() {
-			if d.Stage == "sema" {
-				fmt.Fprintln(os.Stderr, "  "+d.Colorize(useColor))
-			}
-		}
+	if diags.HasErrors() {
+		fail(useColor, "semantic check found %s", pluralize(diags.Count(SeverityError), "issue", "issues"))
+		diags.PrintStderr()
 		os.Exit(1)
 	}
-	ok(useColor, "semantic check passed")
+	ok(useColor, "semantic check passed (%d module(s))", len(state.ModuleList))
 }
 
 // Binds short and long flags to the same option pointers.
@@ -370,26 +358,32 @@ func runCompilerPipeline(mode string, config PipelineConfig) {
 	// Phase 3: Sema. Type-checks and resolves names for var/const/static
 	// var/static const/fn (see sema.go); Codegen depends on its resolved
 	// types, so it always runs before codegen regardless of cutoff flags.
+	// The compilation state loads the entry file plus every transitively
+	// imported module (the "smart module system": #import paths resolve
+	// relative to the importing file, directories become modules, and
+	// in-file `module name { ... }` blocks namespace their members).
 
 	stage(useColor, "SEMA", "analyzing %s", config.FilePath)
 	diags := NewDiagnostics(config.FilePath)
-	sema := NewSema(diags)
-	sema.Check(program)
+	state := NewCompileState()
+	state.LoadRoot(config.FilePath, source, diags)
 
 	if diags.HasErrors() {
 		fail(useColor, "%s found", diags.Summary(useColor))
 		diags.PrintStderr()
 		os.Exit(1)
 	}
-	ok(useColor, "semantic analysis passed")
+	ok(useColor, "semantic analysis passed (%d module(s))", len(state.ModuleList))
 
 	// Phase 4: Codegen. -c/--emit-c is a cutoff: print the generated C
-	// and stop here (or write it to -o if given).
+	// and stop here (or write it to -o if given). Every module's
+	// declarations merge into one C translation unit (single merged
+	// output), with monomorphized generic instances appended.
 
 	stage(useColor, "CODEGEN", "transpiling %s to C", config.FilePath)
-	gen := NewCodegen(sema, diags)
+	gen := NewCodegen(state.Root.Sema, diags)
 	gen.sourceDir = filepath.Dir(config.FilePath)
-	cCode := gen.Generate(program)
+	cCode := gen.GenerateAll(state)
 
 	if diags.HasErrors() {
 		fail(useColor, "%s found during codegen", diags.Summary(useColor))

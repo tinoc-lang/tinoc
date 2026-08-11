@@ -96,12 +96,13 @@ What the compiler supports end-to-end in the current release:
 | Control flow | ✅ | `if` / `else if` / `else`, `while`, `for 0..10 |i|`, `break`, `continue` |
 | Literals & operators | ✅ | Integer (all bases, `_` separators), float, string, char, bool; arithmetic/comparison/logical/bitwise; content-based `str ==`/`!=` |
 | C interop | ✅ | `#importc "header.h" as alias;` (clang/gcc parsing) and `extern "C" fn` declarations |
-| Generic functions / structs | ❌ | `fn foo:T(...)`, `struct Pair:T` — rejected with a clear "not yet supported" diagnostic |
+| Modules & `#import` | ✅ | `module name;` / `module name { ... }` blocks, `pub` visibility, namespace/wildcard/selected/single-symbol/file imports with aliases, submodule paths, directories-as-modules (`mod.tnc`), import caching + cycle detection, single merged C output with mangled names |
+| Generic functions / structs / aliases | ✅ | `fn foo:T(...)`, `struct Pair:T`, `alias Opt:T = ?T;` — monomorphized per concrete type-argument set, including across module boundaries (`math.Pair:i32`) |
 | `union` + methods | ✅ | C-style shared-memory fields (`as_int`/`as_float` reinterpret the same bytes); instance methods (`self ^Name`), static methods |
 | Arrays / slices | ✅ | `[N]T`, `[_]T` (inferred size), `[]T` slices, `[N:x]T` sentinel arrays, array literals, indexing, `.len`, `for coll |x|`, implicit array→slice conversion at calls/assignments; array params/returns/whole-array assignment rejected with a slice hint |
 | Optionals | ✅ | `?T`, `null`, `orelse` defaulting, `x?` unwrap, `== null` / `!= null` checks; plain values (and `null`) auto-wrap where a `?T` is expected |
 | Error unions | ❌ | `!T`, `catch` — planned |
-| Standard library (`std.io`, ...) | ❌ | Module system is next after the type system |
+| Standard library (`std.io`, ...) | ❌ | User modules are in; the std library ships when the language matures |
 
 See [`CHANGELOG.md`](CHANGELOG.md) for what landed in each version and [`CHECKLIST.md`](CHECKLIST.md) for the release process.
 
