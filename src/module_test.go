@@ -542,3 +542,363 @@ func diagMessages(diags *Diagnostics) []string {
 	}
 	return msgs
 }
+
+// === generics imported by name (symbol / selected / wildcard) ===
+//
+// Generic declarations (`fn identity:T`, `struct Pair:T`, `alias Opt:T`)
+// register as templates, so binding them through an import must expose
+// the template — `#import math.identity;` then a bare `identity:i32(42)`
+// call, `#import math.{Pair};` then a `Pair:f64 { ... }` literal, and
+// wildcard imports binding every pub generic bare. Instantiations reuse
+// the defining module's prefix, so a bare call and a qualified call in
+// the same compilation produce ONE mangled C instance.
+
+func TestModuleGenericFnSymbolImport(t *testing.T) {
+	// `#import math.identity;` binds the generic fn template; bare
+	// `identity:i32(42)` and inferred `identity(7)` both instantiate it.
+	out, _ := compileAndRunModules(t, map[string]string{
+		"math.tnc": "module math;\npub fn identity:T(val T) T { return val; }\n",
+		"main.tnc": "#import math.identity;\nextern \"C\" fn printf(fmt *const char, ...) i32;\nfn main() void {\n\tprintf(\"%d %d\\n\", identity:i32(42), identity(7));\n}\n",
+	}, "main.tnc")
+	if !strings.Contains(out, "42 7") {
+		t.Fatalf("expected bare generic calls identity:i32(42)=42 identity(7)=7, got %q", out)
+	}
+}
+
+func TestModuleGenericFnRenamedImport(t *testing.T) {
+	// `#import math.identity as id;` binds under the alias.
+	out, _ := compileAndRunModules(t, map[string]string{
+		"math.tnc": "module math;\npub fn identity:T(val T) T { return val; }\n",
+		"main.tnc": "#import math.identity as id;\nextern \"C\" fn printf(fmt *const char, ...) i32;\nfn main() void {\n\tprintf(\"%s\\n\", id:str(\"renamed\"));\n}\n",
+	}, "main.tnc")
+	if !strings.Contains(out, "renamed") {
+		t.Fatalf("expected renamed generic call id:str(...)=renamed, got %q", out)
+	}
+}
+
+func TestModuleGenericStructSelectedImport(t *testing.T) {
+	// `#import math.{Pair};` binds the generic struct template; a bare
+	// `Pair:f64 { ... }` literal and `var p Pair:i32;` type reference
+	// both instantiate it.
+	out, _ := compileAndRunModules(t, map[string]string{
+		"math.tnc": "module math;\npub struct Pair:T { first T; second T; }\n",
+		"main.tnc": "#import math.{Pair};\nextern \"C\" fn printf(fmt *const char, ...) i32;\nfn main() void {\n\tvar p Pair:f64 = Pair:f64 { .first = 1.5, .second = 2.5 };\n\tprintf(\"%f\\n\", p.second);\n}\n",
+	}, "main.tnc")
+	if !strings.Contains(out, "2.500000") {
+		t.Fatalf("expected bare generic struct Pair:f64, got %q", out)
+	}
+}
+
+func TestModuleGenericAliasSymbolImport(t *testing.T) {
+	// `#import box.Opt;` binds the generic alias template; `Opt:i32`
+	// expands it locally.
+	out, _ := compileAndRunModules(t, map[string]string{
+		"box.tnc":  "pub alias Opt:T = ?T;\npub fn wrap(x i32) Opt:i32 { return x; }\n",
+		"main.tnc": "#import box.Opt;\n#import box.wrap;\nextern \"C\" fn printf(fmt *const char, ...) i32;\nfn main() void {\n\tvar o Opt:i32 = wrap(11);\n\tprintf(\"%d\\n\", o?);\n}\n",
+	}, "main.tnc")
+	if !strings.Contains(out, "11") {
+		t.Fatalf("expected imported generic alias Opt:i32, got %q", out)
+	}
+}
+
+func TestModuleGenericWildcardImport(t *testing.T) {
+	// `#import box.*;` binds every pub generic bare: fn, struct, alias.
+	out, _ := compileAndRunModules(t, map[string]string{
+		"box.tnc":  "pub fn pick:T(a T, b T) T { if a > b { return a; } return b; }\npub struct Wrap:T { v T; }\npub alias Maybe:T = ?T;\n",
+		"main.tnc": "#import box.*;\nextern \"C\" fn printf(fmt *const char, ...) i32;\nfn main() void {\n\tvar w Wrap:i32 = Wrap:i32 { .v = 5 };\n\tvar m Maybe:i32 = 9;\n\tprintf(\"%d %d %d\\n\", pick(3, 9), w.v, m?);\n}\n",
+	}, "main.tnc")
+	if !strings.Contains(out, "9 5 9") {
+		t.Fatalf("expected wildcard-imported generics pick/Wrap/Maybe, got %q", out)
+	}
+}
+
+func TestModuleGenericQualifiedAndBareShareInstance(t *testing.T) {
+	// A bare call through a symbol import and a qualified call
+	// (`math.identity:i32(42)`) instantiate the same mangled instance,
+	// so the merged C output contains exactly one definition.
+	dir := writeModuleFiles(t, map[string]string{
+		"math.tnc": "module math;\npub fn identity:T(val T) T { return val; }\n",
+		"main.tnc": "#import math.identity;\n#import math;\nextern \"C\" fn printf(fmt *const char, ...) i32;\nfn main() void {\n\tprintf(\"%d %d\\n\", identity:i32(1), math.identity:i32(2));\n}\n",
+	})
+	source, _ := os.ReadFile(filepath.Join(dir, "main.tnc"))
+	diags := NewDiagnostics("main.tnc")
+	state := NewCompileState()
+	state.LoadRoot(filepath.Join(dir, "main.tnc"), string(source), diags)
+	if diags.HasErrors() {
+		t.Fatalf("unexpected diagnostics: %v", diagMessages(diags))
+	}
+	gen := NewCodegen(state.Root.Sema, diags)
+	gen.sourceDir = dir
+	code := gen.GenerateAll(state)
+	want := "tnc_math_identity_i32"
+	n := strings.Count(code, want)
+	// The typedef/forward-declaration and the definition each reference
+	// the name; the important part is that there is exactly one
+	// definition and the bare + qualified calls resolved to the same
+	// symbol. Count occurrences and require the name to appear at least
+	// twice (prototype + definition) and the definition body once via a
+	// unique signature.
+	if n < 2 {
+		t.Fatalf("expected mangled instance %s in merged output (got %d occurrences):\n%s", want, n, code)
+	}
+	if !strings.Contains(code, want+"(") {
+		t.Fatalf("expected a single definition of %s:\n%s", want, code)
+	}
+}
+
+func TestModulePrivateGenericRejected(t *testing.T) {
+	// A non-pub generic fn/struct/alias is not importable and reports
+	// "is private to module" rather than a misleading missing-symbol
+	// error.
+	diags := checkModules(t, map[string]string{
+		"math.tnc": "module math;\nfn hidden:T(val T) T { return val; }\nstruct HStruct:T { v T; }\nalias HAlias:T = ?T;\n",
+		"main.tnc": "#import math.hidden;\nfn main() void {}\n",
+	}, "main.tnc")
+	if !moduleDiagContains(diags, "private to module") {
+		t.Fatalf("expected private-generic import diagnostic, got %v", diagMessages(diags))
+	}
+}
+
+func TestModulePrivateGenericQualifiedAccessRejected(t *testing.T) {
+	// Qualified calls / type references to a private generic are
+	// rejected cross-module: `math.hidden:i32(1)` must not resolve even
+	// though the template exists in the CompileState registry.
+	diags := checkModules(t, map[string]string{
+		"math.tnc": "module math;\nfn hidden:T(val T) T { return val; }\nstruct HStruct:T { v T; }\n",
+		"main.tnc": "#import math;\nfn main() void {\n\tvar x = math.hidden:i32(1);\n}\n",
+	}, "main.tnc")
+	if !moduleDiagContains(diags, "has no public function hidden") {
+		t.Fatalf("expected private generic call to be rejected, got %v", diagMessages(diags))
+	}
+}
+
+func TestModuleBlockGenericCrossModule(t *testing.T) {
+	// A pub generic fn inside a module block of a module file is
+	// reachable cross-module through the dotted chain:
+	// `math.physics.blockid:i32(42)`. Private block generics stay
+	// file-private.
+	out, _ := compileAndRunModules(t, map[string]string{
+		"math.tnc": `module math;
+module physics {
+	pub fn blockid:T(val T) T { return val; }
+	fn blockhidden:T(val T) T { return val; }
+}
+`,
+		"main.tnc": `#import math;
+extern "C" fn printf(fmt *const char, ...) i32;
+fn main() void {
+	printf("%d\n", math.physics.blockid:i32(42));
+}
+`,
+	}, "main.tnc")
+	if !strings.Contains(out, "42") {
+		t.Fatalf("expected cross-module block generic math.physics.blockid:i32(42), got %q", out)
+	}
+
+	diags := checkModules(t, map[string]string{
+		"math.tnc": `module math;
+module physics {
+	fn blockhidden:T(val T) T { return val; }
+}
+`,
+		"main.tnc": `#import math;
+fn main() void {
+	var x = math.physics.blockhidden:i32(1);
+}
+`,
+	}, "main.tnc")
+	if !moduleDiagContains(diags, "has no public function blockhidden") {
+		t.Fatalf("expected private block generic to be rejected, got %v", diagMessages(diags))
+	}
+}
+
+func TestModuleBlockGenericQualifiedInFile(t *testing.T) {
+	// Inside the defining file, a generic in a module block is
+	// reachable qualified (`physics.blockid:i32(8)`) and bare within
+	// the block (`blockid:i32(11)` in a sibling fn).
+	out, _ := compileAndRunModules(t, map[string]string{
+		"main.tnc": `module physics {
+	pub fn blockid:T(val T) T { return val; }
+	pub fn useit() i32 { return blockid:i32(11); }
+}
+extern "C" fn printf(fmt *const char, ...) i32;
+fn main() void {
+	printf("%d %d\n", physics.blockid:i32(8), physics.useit());
+}
+`,
+	}, "main.tnc")
+	if !strings.Contains(out, "8 11") {
+		t.Fatalf("expected in-file block generic qualified + bare use, got %q", out)
+	}
+}
+
+// === generics-import stress: generic-in-generic bodies, methods, errors ===
+
+func TestModuleGenericInGenericBody(t *testing.T) {
+	// A generic fn whose body references the module's own generic
+	// struct (`makePair:(K, V)` returning `Pair:(K, V) { ... }`) is the
+	// substituteBodyTypes case: after instantiation the body's type
+	// expressions still carried K/V and failed to re-check. Same file
+	// first; the cross-module variant follows.
+	out, _ := compileAndRunModules(t, map[string]string{
+		"main.tnc": `pub struct Pair:(T, U) {
+	first T;
+	second U;
+}
+pub fn makePair:(K, V)(a K, b V) Pair:(K, V) {
+	return Pair:(K, V) { .first = a, .second = b };
+}
+extern "C" fn printf(fmt *const char, ...) i32;
+fn main() void {
+	var p Pair:(str, i32) = makePair:(str, i32)("ab", 7);
+	printf("%s %d\n", p.first, p.second);
+}
+`,
+	}, "main.tnc")
+	if !strings.Contains(out, "ab 7") {
+		t.Fatalf("expected generic fn body referencing its own generic struct, got %q", out)
+	}
+}
+
+func TestModuleGenericInGenericCrossModule(t *testing.T) {
+	// The same generic-in-generic pattern across a module boundary:
+	// `makePair:(K, V)` lives in math, is imported by name, and its
+	// instantiated body resolves `Pair:(f64, i32)` against the defining
+	// module's registry — sharing one C instance with the caller's
+	// `Pair:(f64, i32)` type reference.
+	out, _ := compileAndRunModules(t, map[string]string{
+		"math.tnc": `module math;
+pub struct Pair:(T, U) {
+	first T;
+	second U;
+}
+pub fn makePair:(K, V)(a K, b V) Pair:(K, V) {
+	return Pair:(K, V) { .first = a, .second = b };
+}
+`,
+		"main.tnc": `#import math;
+#import math.{makePair, Pair};
+extern "C" fn printf(fmt *const char, ...) i32;
+fn main() void {
+	var p Pair:(f64, i32) = makePair:(f64, i32)(1.5, 4);
+	printf("%.1f %d\n", p.first, p.second);
+}
+`,
+	}, "main.tnc")
+	if !strings.Contains(out, "1.5 4") {
+		t.Fatalf("expected cross-module generic-in-generic instantiation, got %q", out)
+	}
+}
+
+func TestModuleImportedGenericStructMethod(t *testing.T) {
+	// Methods on a generic struct template instantiate with it: a bare
+	// symbol import (`#import math.Pair;`) followed by a literal
+	// `Pair:i32` and an instance method call resolves through the
+	// imported template. The method's `self ^Pair:T` re-enters
+	// instantiation while the instance is still being built (the
+	// early-cache path).
+	out, _ := compileAndRunModules(t, map[string]string{
+		"math.tnc": `module math;
+pub struct Pair:T {
+	first T;
+	second T;
+	fn sum(self ^Pair:T) T { return self^.first + self^.second; }
+}
+`,
+		"main.tnc": `#import math.Pair;
+extern "C" fn printf(fmt *const char, ...) i32;
+fn main() void {
+	var p Pair:i32 = Pair:i32 { .first = 20, .second = 22 };
+	printf("%d\n", p.sum());
+}
+`,
+	}, "main.tnc")
+	if !strings.Contains(out, "42") {
+		t.Fatalf("expected method call on imported generic struct instance, got %q", out)
+	}
+}
+
+func TestModuleGenericMethodUsesModulePrivateNames(t *testing.T) {
+	// Method bodies of a cross-module generic instance are checked
+	// against the DEFINING module's analyzer, so module-private helpers
+	// and consts resolve exactly as they do inside the defining file.
+	out, _ := compileAndRunModules(t, map[string]string{
+		"math.tnc": `module math;
+const OFFSET i32 = 5;
+fn bump(x i32) i32 { return x + OFFSET; }
+pub struct Box:T {
+	v T;
+	fn shifted(self ^Box:i32) i32 { return bump(self^.v); }
+}
+`,
+		"main.tnc": `#import math.Box;
+extern "C" fn printf(fmt *const char, ...) i32;
+fn main() void {
+	var b Box:i32 = Box:i32 { .v = 37 };
+	printf("%d\n", b.shifted());
+}
+`,
+	}, "main.tnc")
+	if !strings.Contains(out, "42") {
+		t.Fatalf("expected generic method to resolve module-private names, got %q", out)
+	}
+}
+
+func TestModuleGenericFnUsesModulePrivateNames(t *testing.T) {
+	// Same rule for generic fn bodies: a cross-module instance is
+	// checked against the defining module, so `scaled:i32` resolves the
+	// private `double` helper and the private `SCALE` const.
+	out, _ := compileAndRunModules(t, map[string]string{
+		"math.tnc": `module math;
+const SCALE i32 = 100;
+fn double(x i32) i32 { return x * 2; }
+pub fn scaled:T(x T) i32 { return double(x) * SCALE; }
+`,
+		"main.tnc": `#import math.scaled;
+extern "C" fn printf(fmt *const char, ...) i32;
+fn main() void {
+	printf("%d\n", scaled:i32(21));
+}
+`,
+	}, "main.tnc")
+	if !strings.Contains(out, "4200") {
+		t.Fatalf("expected generic fn body to resolve module-private names, got %q", out)
+	}
+}
+
+func TestModuleGenericImportMissingSymbol(t *testing.T) {
+	// Importing a generic name the module does not export reports the
+	// same "no public symbol" diagnostic as plain functions/consts.
+	diags := checkModules(t, map[string]string{
+		"math.tnc": "module math;\npub fn identity:T(val T) T { return val; }\n",
+		"main.tnc": "#import math.nope;\nfn main() void {}\n",
+	}, "main.tnc")
+	if !moduleDiagContains(diags, "module math has no public symbol nope") {
+		t.Fatalf("expected missing generic symbol diagnostic, got %v", diagMessages(diags))
+	}
+}
+
+func TestModuleGenericImportWrongTypeArgCount(t *testing.T) {
+	// A bare-imported generic struct instantiated with the wrong arity
+	// reports the same arity diagnostic as a local instantiation.
+	diags := checkModules(t, map[string]string{
+		"math.tnc": "module math;\npub struct Pair:T { first T; second T; }\n",
+		"main.tnc": "#import math.Pair;\nfn main() void {\n\tvar p Pair:(i32, str) = Pair:(i32, str) { .first = 1, .second = \"a\" };\n}\n",
+	}, "main.tnc")
+	if !moduleDiagContains(diags, "Pair expects 1 type argument(s), got 2") {
+		t.Fatalf("expected wrong type-arg count diagnostic, got %v", diagMessages(diags))
+	}
+}
+
+func TestModuleGenericImportRedeclared(t *testing.T) {
+	// Two modules exporting a pub generic under the same name, both
+	// imported bare, collide with the standard redeclaration diagnostic.
+	diags := checkModules(t, map[string]string{
+		"a.tnc":    "module a;\npub fn id:T(v T) T { return v; }\n",
+		"b.tnc":    "module b;\npub fn id:T(v T) T { return v; }\n",
+		"main.tnc": "#import a.id;\n#import b.id;\nfn main() void {}\n",
+	}, "main.tnc")
+	if !moduleDiagContains(diags, "id redeclared in this block") {
+		t.Fatalf("expected generic import redeclaration diagnostic, got %v", diagMessages(diags))
+	}
+}

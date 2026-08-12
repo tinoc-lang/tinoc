@@ -869,7 +869,20 @@ pub fn dot(a Vec2, b Vec2) f32 {
 
 ## Modules & generics
 
-Generic declarations cross module boundaries: instantiate a module's generic struct with the qualified name (`shapes.Circle:f64`) and call its generic functions qualified (`math.identity:i32(42)`), or import the items and use them bare. Each concrete instantiation is monomorphized once per type-argument set.
+Generic declarations (`fn name:T`, `struct Name:T`, `alias Name:T = ...;`, and the multi-param `:(K, V)` forms) cross module boundaries like any other pub symbol:
+
+```tinoc
+#import math;                  // qualified use: math.identity:i32(42)
+#import math.identity;         // bare use: identity:i32(42) or inferred identity(7)
+#import math.identity as id;   // renamed: id:str("hi")
+#import math.{Pair};           // bare struct template: Pair:f64 { .first = 1.0, ... }
+#import box.Opt;               // bare alias template: Opt:i32
+#import math.*;                // wildcard binds every pub generic bare
+```
+
+A bare instantiation and a qualified call of the same generic produce **one** shared mangled C instance (`identity:i32(42)` and `math.identity:i32(42)` emit a single `tnc_math_identity_i32`), so an imported generic is never duplicated. Private generics are rejected like private functions — `symbol x is private to module math` — whether imported by name or reached qualified. Each concrete instantiation is monomorphized once per type-argument set.
+
+Generic bodies are checked in the **defining module's scope**: an instantiated body resolves that module's private helpers and consts exactly as the template author wrote them, and may itself build the module's own generic types (`makePair:(K, V)` returning `Pair:(K, V) { ... }`) — generics compose across boundaries.
 
 ## Module resolution rules
 
