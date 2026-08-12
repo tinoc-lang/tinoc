@@ -136,6 +136,15 @@ type Sema struct {
 	typeAliases  map[string]*Type
 	importConsts map[string]*Symbol
 
+	// importedGeneric* hold generic templates bound by symbol/selected/
+	// wildcard imports (`#import math.identity;`, `#import math.*;`),
+	// keyed by their local name, so bare instantiations resolve exactly
+	// like local templates (lookupGenericFn/lookupGenericStruct/
+	// resolveGenericType consult these maps).
+	importedGenericFns     map[string]*GenericFnDecl
+	importedGenericStructs map[string]*GenericStructDecl
+	importedGenericAliases map[string]*GenericAliasDecl
+
 	// sourceDir is the directory of the file being checked, used to
 	// resolve local headers named by #importc and module imports.
 	sourceDir string
@@ -231,32 +240,35 @@ type Sema struct {
 func NewSema(diags *Diagnostics) *Sema {
 	global := newScope(nil)
 	return &Sema{
-		diags:          diags,
-		global:         global,
-		funcs:          make(map[string]*Symbol),
-		current:        global,
-		resolvedTypes:  make(map[Expression]*Type),
-		declVarTypes:   make(map[*VarStatement]*Type),
-		declConstTypes: make(map[*ConstStatement]*Type),
-		importCModules: make(map[string]*CImportModule),
-		externCFuncs:   make(map[string]*Symbol),
-		cTypes:         make(map[string]*Type),
-		structTypes:    make(map[string]*Type),
-		structMethods:  make(map[string]map[string]*Symbol),
-		enumTypes:      make(map[string]*Type),
-		enumMethods:    make(map[string]map[string]*Symbol),
-		unionTypes:     make(map[string]*Type),
-		unionMethods:   make(map[string]map[string]*Symbol),
-		cStrArgs:       make(map[Expression]bool),
-		sliceConvs:     make(map[Expression]bool),
-		optWraps:       make(map[Expression]*Type),
-		modules:        make(map[string]*TinocModule),
-		typeAliases:    make(map[string]*Type),
-		importConsts:   make(map[string]*Symbol),
-		callTargets:    make(map[*CallExpression]*Symbol),
-		idCName:        make(map[Expression]string),
-		canonNames:     make(map[Statement]string),
-		cnameOverrides: make(map[Statement]string),
+		diags:                  diags,
+		global:                 global,
+		funcs:                  make(map[string]*Symbol),
+		current:                global,
+		resolvedTypes:          make(map[Expression]*Type),
+		declVarTypes:           make(map[*VarStatement]*Type),
+		declConstTypes:         make(map[*ConstStatement]*Type),
+		importCModules:         make(map[string]*CImportModule),
+		externCFuncs:           make(map[string]*Symbol),
+		cTypes:                 make(map[string]*Type),
+		structTypes:            make(map[string]*Type),
+		structMethods:          make(map[string]map[string]*Symbol),
+		enumTypes:              make(map[string]*Type),
+		enumMethods:            make(map[string]map[string]*Symbol),
+		unionTypes:             make(map[string]*Type),
+		unionMethods:           make(map[string]map[string]*Symbol),
+		cStrArgs:               make(map[Expression]bool),
+		sliceConvs:             make(map[Expression]bool),
+		optWraps:               make(map[Expression]*Type),
+		modules:                make(map[string]*TinocModule),
+		typeAliases:            make(map[string]*Type),
+		importConsts:           make(map[string]*Symbol),
+		importedGenericFns:     make(map[string]*GenericFnDecl),
+		importedGenericStructs: make(map[string]*GenericStructDecl),
+		importedGenericAliases: make(map[string]*GenericAliasDecl),
+		callTargets:            make(map[*CallExpression]*Symbol),
+		idCName:                make(map[Expression]string),
+		canonNames:             make(map[Statement]string),
+		cnameOverrides:         make(map[Statement]string),
 	}
 }
 
@@ -1084,6 +1096,11 @@ func (s *Sema) checkVarStatement(v *VarStatement) {
 		if v.IsPub && s.selfView != nil && finalType != nil {
 			s.selfView.PubConsts[name] = &constExport{Name: name, Type: finalType, CName: s.cnameOverrides[v], Mutable: true, IsStatic: v.IsStatic}
 			s.selfView.PubTypes[name] = finalType
+		} else if s.selfView != nil && finalType != nil {
+			// Track private top-level globals so importers get an
+			// explicit "is private" diagnostic instead of a generic
+			// "no public symbol" (matching private functions).
+			s.selfView.PrivateConsts[name] = true
 		}
 	}
 }
@@ -1124,6 +1141,11 @@ func (s *Sema) checkConstStatement(c *ConstStatement) {
 		if c.IsPub && s.selfView != nil && finalType != nil {
 			s.selfView.PubConsts[name] = &constExport{Name: name, Type: finalType, CName: s.cnameOverrides[c], Mutable: false, IsStatic: c.IsStatic}
 			s.selfView.PubTypes[name] = finalType
+		} else if s.selfView != nil && finalType != nil {
+			// Track private top-level globals so importers get an
+			// explicit "is private" diagnostic instead of a generic
+			// "no public symbol" (matching private functions).
+			s.selfView.PrivateConsts[name] = true
 		}
 	}
 }
@@ -2040,6 +2062,16 @@ func (s *Sema) checkFieldAccess(fa *FieldAccessExpression) *Type {
 		// segment resolves inside it (tinocModule resolves the chain).
 		if _, nested := s.modules[mod.Name+"."+member]; nested {
 			return &Type{Kind: KindUnknown, Name: "module"}
+		}
+		// Same for a module-file block namespace reached cross-module
+		// (`math.physics` — physics is a block inside math.tnc): the
+		// block's pub projection lives in the file module's SubModules.
+		if _, sub := mod.SubModules[member]; sub {
+			return &Type{Kind: KindUnknown, Name: "module"}
+		}
+		if mod.PrivateConsts[member] {
+			s.errorAt(fa.Token.Line, fa.Token.Column, "symbol %s is private to module %s", member, mod.Name)
+			return &Type{Kind: KindInvalid}
 		}
 		if _, priv := mod.Funcs[member]; priv {
 			s.errorAt(fa.Token.Line, fa.Token.Column, "symbol %s is private to module %s", member, mod.Name)

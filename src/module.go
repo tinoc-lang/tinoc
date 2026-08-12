@@ -62,19 +62,57 @@ type TinocModule struct {
 	PubTypes  map[string]*Type
 	PubConsts map[string]*constExport
 
+	// PubGeneric* hold the module's exported generic templates
+	// (`fn identity:T`, `struct Pair:T`, `alias Opt:T = ?T;`), so
+	// importers can bind them as single symbols, selected symbols, or
+	// wildcards and then instantiate them bare (`identity:i32(42)`,
+	// `Pair:i32 { ... }`, `Opt:i32`). The values are the shared
+	// CompileState templates keyed by their canonical dotted name
+	// (e.g. `math.identity`), so a bare instantiation in an importing
+	// file produces the same mangled C instance as the qualified form.
+	PubGenericFns     map[string]*GenericFnDecl
+	PubGenericStructs map[string]*GenericStructDecl
+	PubGenericAliases map[string]*GenericAliasDecl
+
 	// Funcs holds every function (pub and private) for "symbol is
 	// private" diagnostics on qualified access.
 	Funcs map[string]*Symbol
+
+	// PrivateGenerics holds the bare names of non-pub generic
+	// declarations (fn/struct/alias), so importing them reports
+	// "symbol x is private to module y" instead of a misleading
+	// "no public symbol".
+	PrivateGenerics map[string]bool
+
+	// PrivateConsts holds the names of top-level const/var globals that
+	// are NOT pub, so importers get an explicit "is private to module"
+	// diagnostic instead of a generic "no public symbol" (the const
+	// counterpart of Funcs).
+	PrivateConsts map[string]bool
+
+	// SubModules exposes in-file `module name { ... }` blocks of a
+	// module file as nested namespaces, so importers can chain through
+	// them (`module math; ... module physics { pub const g; }` ->
+	// `math.physics.g`). Values are pub-only projections of the blocks:
+	// blocks expose every member in-file (same-file namespace), but
+	// across the module boundary only `pub` members are visible.
+	SubModules map[string]*TinocModule
 }
 
 func newTinocModule(name, path string) *TinocModule {
 	return &TinocModule{
-		Name:      name,
-		Path:      path,
-		PubFuncs:  make(map[string]*Symbol),
-		PubTypes:  make(map[string]*Type),
-		PubConsts: make(map[string]*constExport),
-		Funcs:     make(map[string]*Symbol),
+		Name:              name,
+		Path:              path,
+		PubFuncs:          make(map[string]*Symbol),
+		PubTypes:          make(map[string]*Type),
+		PubConsts:         make(map[string]*constExport),
+		PubGenericFns:     make(map[string]*GenericFnDecl),
+		PubGenericStructs: make(map[string]*GenericStructDecl),
+		PubGenericAliases: make(map[string]*GenericAliasDecl),
+		Funcs:             make(map[string]*Symbol),
+		PrivateConsts:     make(map[string]bool),
+		PrivateGenerics:   make(map[string]bool),
+		SubModules:        make(map[string]*TinocModule),
 	}
 }
 
@@ -84,12 +122,18 @@ func newTinocModule(name, path string) *TinocModule {
 // (`fn identity:T(x T) T`). Key is the canonical decl name (module +
 // name); Prefix is the module/block name segments for C mangling; Short
 // is the bare function name; Params the type parameter names.
+// GenericFnDecl is a registered generic function template
+// (`fn identity:T(x T) T`). Sema is the analyzer that owns the
+// template's source file — instantiated bodies are checked
+// against it so module-local names (consts, private functions,
+// #importc aliases) resolve exactly as in the defining module.
 type GenericFnDecl struct {
 	Key    string
 	Prefix []string
 	Short  string
 	Params []string
 	Fn     *FunctionStatement
+	Sema   *Sema
 }
 
 func (d *GenericFnDecl) hasParam(name string) bool {
@@ -102,13 +146,16 @@ func (d *GenericFnDecl) hasParam(name string) bool {
 }
 
 // GenericStructDecl is a registered generic struct template
-// (`struct Pair:T { ... }`).
+// (`struct Pair:T { ... }`). Sema is the analyzer that owns the
+// template's source file; monomorphized method bodies are
+// checked against it (see GenericFnDecl.Sema).
 type GenericStructDecl struct {
 	Key    string
 	Prefix []string
 	Short  string
 	Params []string
 	St     *StructStatement
+	Sema   *Sema
 }
 
 // GenericAliasDecl is a registered generic alias template
@@ -471,6 +518,15 @@ func (s *Sema) bindModuleImport(is *ImportStatement, mod *TinocModule, localName
 			}
 			s.bindImportedType(name, t, mod, is.Token.Line, is.Token.Column)
 		}
+		for name, d := range mod.PubGenericFns {
+			s.bindImportedGenericFn(name, d, is.Token.Line, is.Token.Column)
+		}
+		for name, d := range mod.PubGenericStructs {
+			s.bindImportedGenericStruct(name, d, is.Token.Line, is.Token.Column)
+		}
+		for name, d := range mod.PubGenericAliases {
+			s.bindImportedGenericAlias(name, d, is.Token.Line, is.Token.Column)
+		}
 		return
 	}
 
@@ -505,11 +561,104 @@ func (s *Sema) bindSymbolImport(is *ImportStatement, mod *TinocModule, name, ali
 		s.bindImportedType(localName, t, mod, line, col)
 		return
 	}
+	if d := mod.PubGenericFns[name]; d != nil {
+		s.bindImportedGenericFn(localName, d, line, col)
+		return
+	}
+	if d := mod.PubGenericStructs[name]; d != nil {
+		s.bindImportedGenericStruct(localName, d, line, col)
+		return
+	}
+	if d := mod.PubGenericAliases[name]; d != nil {
+		s.bindImportedGenericAlias(localName, d, line, col)
+		return
+	}
 	if _, priv := mod.Funcs[name]; priv {
 		s.errorAt(line, col, "symbol %s is private to module %s", name, mod.Name)
 		return
 	}
+	if mod.PrivateConsts[name] {
+		s.errorAt(line, col, "symbol %s is private to module %s", name, mod.Name)
+		return
+	}
+	if mod.PrivateGenerics[name] {
+		s.errorAt(line, col, "symbol %s is private to module %s", name, mod.Name)
+		return
+	}
 	s.errorAt(line, col, "module %s has no public symbol %s", mod.Name, name)
+}
+
+// bindImportedGenericFn binds a generic function template from another
+// module under a local name, so bare instantiations (`identity:i32(42)`,
+// `identity(42)` with inference) resolve through lookupGenericFn. The
+// shared decl keeps its defining module's prefix, so the instantiated C
+// name (`tnc_math_identity_str`) matches what a qualified call in the
+// same compilation produces — no duplicate instances.
+func (s *Sema) bindImportedGenericFn(localName string, d *GenericFnDecl, line, col int) {
+	if _, dup := s.importedGenericFns[localName]; dup {
+		s.errorAt(line, col, "%s redeclared in this block", localName)
+		return
+	}
+	if _, dup := s.funcs[localName]; dup {
+		s.errorAt(line, col, "%s redeclared in this block", localName)
+		return
+	}
+	if _, dup := s.importConsts[localName]; dup {
+		s.errorAt(line, col, "%s redeclared in this block", localName)
+		return
+	}
+	if _, dup := s.typeAliases[localName]; dup {
+		s.errorAt(line, col, "%s redeclared in this block", localName)
+		return
+	}
+	s.importedGenericFns[localName] = d
+}
+
+// bindImportedGenericStruct binds a generic struct template from
+// another module under a local name (`#import shapes.Circle;`), so
+// bare instantiations (`Circle:f64 { ... }`, `var c Circle:i32;`)
+// resolve through lookupGenericStruct.
+func (s *Sema) bindImportedGenericStruct(localName string, d *GenericStructDecl, line, col int) {
+	if _, dup := s.importedGenericStructs[localName]; dup {
+		s.errorAt(line, col, "%s redeclared in this block", localName)
+		return
+	}
+	if _, dup := s.typeAliases[localName]; dup {
+		s.errorAt(line, col, "%s redeclared in this block", localName)
+		return
+	}
+	if _, dup := s.funcs[localName]; dup {
+		s.errorAt(line, col, "%s redeclared in this block", localName)
+		return
+	}
+	if _, dup := s.importConsts[localName]; dup {
+		s.errorAt(line, col, "%s redeclared in this block", localName)
+		return
+	}
+	s.importedGenericStructs[localName] = d
+}
+
+// bindImportedGenericAlias binds a generic alias template from another
+// module under a local name (`#import box.Opt;`), so bare expansions
+// (`Opt:i32`) resolve.
+func (s *Sema) bindImportedGenericAlias(localName string, d *GenericAliasDecl, line, col int) {
+	if _, dup := s.importedGenericAliases[localName]; dup {
+		s.errorAt(line, col, "%s redeclared in this block", localName)
+		return
+	}
+	if _, dup := s.typeAliases[localName]; dup {
+		s.errorAt(line, col, "%s redeclared in this block", localName)
+		return
+	}
+	if _, dup := s.funcs[localName]; dup {
+		s.errorAt(line, col, "%s redeclared in this block", localName)
+		return
+	}
+	if _, dup := s.importConsts[localName]; dup {
+		s.errorAt(line, col, "%s redeclared in this block", localName)
+		return
+	}
+	s.importedGenericAliases[localName] = d
 }
 
 func (s *Sema) bindImportFunc(localName string, sym *Symbol, line, col int) {
@@ -787,6 +936,15 @@ func (s *Sema) resolveQualifiedType(t *NamedType) *Type {
 			return ty
 		}
 	}
+	// A block inside a module file extends its namespace
+	// (`math.physics.Point`): descend into the block's pub projection.
+	if len(segs) > 2 {
+		if sub, ok := mod.SubModules[segs[1]]; ok {
+			if ty, ok := sub.PubTypes[strings.Join(segs[2:], ".")]; ok {
+				return ty
+			}
+		}
+	}
 	s.errorAt(t.Token.Line, t.Token.Column, "module %s has no public type %s", segs[0], rest)
 	return nil
 }
@@ -805,6 +963,14 @@ func (s *Sema) tinocModule(e Expression) (*TinocModule, bool) {
 			if nmod, ok2 := s.modules[base.Name+"."+ex.Field.Value]; ok2 {
 				return nmod, true
 			}
+			// Blocks inside a module file extend its namespace:
+			// `math.physics` resolves through the file module's
+			// SubModules (pub-only projection of the block).
+			if base.SubModules != nil {
+				if nmod, ok2 := base.SubModules[ex.Field.Value]; ok2 {
+					return nmod, true
+				}
+			}
 		}
 		return nil, false
 	}
@@ -812,18 +978,21 @@ func (s *Sema) tinocModule(e Expression) (*TinocModule, bool) {
 }
 
 // lookupModuleGenericFn finds a generic function template exported by a
-// module (keyed `math.identity`), for qualified generic calls such as
-// `math.identity:i32(42)`.
+// module for qualified generic calls such as `math.identity:i32(42)`.
+// Only pub templates are reachable cross-module: the module's own
+// registry (selfView) and the pub-only block projections carry exactly
+// the exported surface, so a private generic (`fn hidden:T ...` without
+// `pub`) is rejected here rather than silently callable by importers.
+// Blocks inside a module file publish pub members into the file
+// module's SubModules projections, which populate their own
+// PubGenericFns — so `math.physics.blockid:i32(42)` resolves through
+// the projection's decl (whose Key carries the full canonical
+// `math.physics.blockid`).
 func (s *Sema) lookupModuleGenericFn(mod *TinocModule, name string) *GenericFnDecl {
-	if s.state == nil {
+	if s.state == nil || mod == nil {
 		return nil
 	}
-	if mod.Name != "" {
-		if d, ok := s.state.GenericFns[mod.Name+"."+name]; ok {
-			return d
-		}
-	}
-	return nil
+	return mod.PubGenericFns[name]
 }
 
 // === Generic Registration ===
@@ -833,12 +1002,25 @@ func (cs *CompileState) registerGenericFn(s *Sema, fn *FunctionStatement, canoni
 		s.errorAt(fn.Token.Line, fn.Token.Column, "%s redeclared in this block", canonical)
 		return
 	}
-	cs.GenericFns[canonical] = &GenericFnDecl{
+	decl := &GenericFnDecl{
 		Key:    canonical,
 		Prefix: append([]string{}, s.itemPrefix()...),
 		Short:  fn.Name.Value,
 		Params: fn.GenericParams,
 		Fn:     fn,
+		Sema:   s,
+	}
+	cs.GenericFns[canonical] = decl
+	// Publish the template into the module's export surface so
+	// importers can bind it by name (`#import math.identity;`) or via
+	// wildcard/selected imports, and track private generics so
+	// importing one reports "is private to module" precisely.
+	if s.selfView != nil {
+		if fn.IsPub {
+			s.selfView.PubGenericFns[fn.Name.Value] = decl
+		} else {
+			s.selfView.PrivateGenerics[fn.Name.Value] = true
+		}
 	}
 }
 
@@ -847,12 +1029,21 @@ func (cs *CompileState) registerGenericStruct(s *Sema, st *StructStatement, cano
 		s.errorAt(st.Token.Line, st.Token.Column, "%s redeclared in this block", canonical)
 		return
 	}
-	cs.GenericStructs[canonical] = &GenericStructDecl{
+	decl := &GenericStructDecl{
 		Key:    canonical,
 		Prefix: append([]string{}, s.itemPrefix()...),
 		Short:  st.Name.Value,
 		Params: st.GenericParams,
 		St:     st,
+		Sema:   s,
+	}
+	cs.GenericStructs[canonical] = decl
+	if s.selfView != nil {
+		if st.IsPub {
+			s.selfView.PubGenericStructs[st.Name.Value] = decl
+		} else {
+			s.selfView.PrivateGenerics[st.Name.Value] = true
+		}
 	}
 }
 
@@ -861,17 +1052,26 @@ func (cs *CompileState) registerGenericAlias(s *Sema, tas *TypeAliasStatement, c
 		s.errorAt(tas.Token.Line, tas.Token.Column, "%s redeclared in this block", canonical)
 		return
 	}
-	cs.GenericAliases[canonical] = &GenericAliasDecl{
+	decl := &GenericAliasDecl{
 		Key:    canonical,
 		Prefix: append([]string{}, s.itemPrefix()...),
 		Short:  tas.Name.Value,
 		Params: tas.GenericParams,
 		Type:   tas.Type,
 	}
+	cs.GenericAliases[canonical] = decl
+	if s.selfView != nil {
+		if tas.IsPub {
+			s.selfView.PubGenericAliases[tas.Name.Value] = decl
+		} else {
+			s.selfView.PrivateGenerics[tas.Name.Value] = true
+		}
+	}
 }
 
 // lookupGenericFn finds a generic function template by bare name in the
-// current module scope.
+// current module scope — a local template or one imported by name
+// (`#import math.identity;` / `#import math.*;`).
 func (s *Sema) lookupGenericFn(name string) *GenericFnDecl {
 	if s.state == nil {
 		return nil
@@ -879,11 +1079,15 @@ func (s *Sema) lookupGenericFn(name string) *GenericFnDecl {
 	if d, ok := s.state.GenericFns[s.itemCanonical(name)]; ok {
 		return d
 	}
+	if d, ok := s.importedGenericFns[name]; ok {
+		return d
+	}
 	return nil
 }
 
 // lookupGenericStruct finds a generic struct template by its dotted
-// spelling ("Pair", "math.Pair").
+// spelling ("Pair", "math.Pair") or an imported bare name
+// (`#import shapes.Circle;`).
 func (s *Sema) lookupGenericStruct(base string) *GenericStructDecl {
 	if s.state == nil {
 		return nil
@@ -894,6 +1098,9 @@ func (s *Sema) lookupGenericStruct(base string) *GenericStructDecl {
 	if d, ok := s.state.GenericStructs[s.itemCanonical(base)]; ok {
 		return d
 	}
+	if d, ok := s.importedGenericStructs[base]; ok {
+		return d
+	}
 	return nil
 }
 
@@ -901,7 +1108,11 @@ func (s *Sema) lookupGenericStruct(base string) *GenericStructDecl {
 // monomorphize the generic struct, or expand the generic alias.
 func (s *Sema) resolveGenericType(t *GenericType) *Type {
 	base := t.Base
-	// Qualified base: `math.Pair:i32` -> find the module's generic.
+	// Qualified base: `math.Pair:i32` -> find the module's generic. Only
+	// pub templates are reachable: the module's registry (selfView)
+	// carries exactly the exported generic surface, so a private generic
+	// struct/alias is rejected here instead of silently instantiable by
+	// importers (lookupModuleGenericFn applies the same rule to fns).
 	if idx := strings.LastIndex(base, "."); idx >= 0 {
 		modName, short := base[:idx], base[idx+1:]
 		mod, ok := s.modules[modName]
@@ -909,14 +1120,10 @@ func (s *Sema) resolveGenericType(t *GenericType) *Type {
 			s.errorAt(t.Token.Line, t.Token.Column, "undefined module %s", modName)
 			return nil
 		}
-		key := short
-		if mod.Name != "" {
-			key = mod.Name + "." + short
-		}
-		if d := s.state.GenericStructs[key]; d != nil {
+		if d := mod.PubGenericStructs[short]; d != nil {
 			return s.instantiateGenericStruct(d, t.Args, t.Token)
 		}
-		if a := s.state.GenericAliases[key]; a != nil {
+		if a := mod.PubGenericAliases[short]; a != nil {
 			return s.instantiateGenericAlias(a, t.Args, t.Token)
 		}
 		s.errorAt(t.Token.Line, t.Token.Column, "module %s has no generic type %s", modName, short)
@@ -926,6 +1133,9 @@ func (s *Sema) resolveGenericType(t *GenericType) *Type {
 		return s.instantiateGenericStruct(d, t.Args, t.Token)
 	}
 	if a := s.state.GenericAliases[s.itemCanonical(base)]; a != nil {
+		return s.instantiateGenericAlias(a, t.Args, t.Token)
+	}
+	if a := s.importedGenericAliases[base]; a != nil {
 		return s.instantiateGenericAlias(a, t.Args, t.Token)
 	}
 	s.errorAt(t.Token.Line, t.Token.Column, "undefined generic type %s", base)
@@ -996,17 +1206,26 @@ func (s *Sema) instantiateGenericStruct(decl *GenericStructDecl, args []TypeExpr
 	}
 	for _, m := range clone.Methods {
 		substituteFunctionTypes(m, env)
+		substituteBodyTypes(m.Body, env)
 	}
 
 	t := &Type{Kind: KindStruct, Name: canonical, CName: cname, FieldIndex: make(map[string]int)}
+	methods := make(map[string]*Symbol)
+	inst := &StructInstance{Type: t, Methods: methods, Decl: clone, Sema: decl.Sema}
+	// Cache the instance BEFORE its method signatures resolve. A method
+	// that references the struct's own generic type (`fn swap(self
+	// ^Pair:T)`) re-enters instantiateGenericStruct with the same key
+	// while `self ^Pair:(i32)` resolves; without the early entry it
+	// would find no cache hit and recurse forever (clone -> register
+	// method -> resolve signature -> re-instantiate).
+	s.state.StructInstances[key] = inst
 	// Register the instance's concrete type before its methods resolve,
 	// so a method's `self` parameter and every body referencing the
 	// concrete type resolves during signature registration.
 	s.structTypes[canonical] = t
-	s.structMethods[canonical] = make(map[string]*Symbol)
+	s.structMethods[canonical] = methods
 	s.resolveStructFields(t, clone, canonical)
 
-	methods := make(map[string]*Symbol)
 	wrapper := map[string]map[string]*Symbol{canonical: methods}
 	for _, m := range clone.Methods {
 		if m != nil && m.Name != nil {
@@ -1014,14 +1233,21 @@ func (s *Sema) instantiateGenericStruct(decl *GenericStructDecl, args []TypeExpr
 		}
 	}
 
-	inst := &StructInstance{Type: t, Methods: methods, Decl: clone, Sema: s}
-	s.state.StructInstances[key] = inst
 	s.state.InstantiatedStructs = append(s.state.InstantiatedStructs, inst)
 	s.registerInstanceLocally(inst)
+	// Mirror the instance into the defining module's analyzer too:
+	// its method bodies are checked against decl.Sema (so
+	// module-local names resolve) and codegen emits the definition
+	// through inst.Sema, so both must see the concrete type and
+	// method table.
+	if decl.Sema != nil && decl.Sema != s {
+		decl.Sema.registerInstanceLocally(inst)
+		s.mirrorCallerTypes(decl.Sema)
+	}
 
 	for _, m := range clone.Methods {
 		if m != nil && m.Name != nil {
-			s.pendingChecks = append(s.pendingChecks, pendingCheck{kind: checkStructMethod, canonical: canonical, fn: m})
+			s.pendingChecks = append(s.pendingChecks, pendingCheck{kind: checkStructMethod, canonical: canonical, fn: m, sema: decl.Sema})
 		}
 	}
 	return t
@@ -1034,6 +1260,48 @@ func (s *Sema) instantiateGenericStruct(decl *GenericStructDecl, args []TypeExpr
 func (s *Sema) registerInstanceLocally(inst *StructInstance) {
 	s.structTypes[inst.Type.Name] = inst.Type
 	s.structMethods[inst.Type.Name] = inst.Methods
+}
+
+// mirrorCallerTypes copies the instantiating analyzer's type
+// registries into the defining module's analyzer so a generic
+// body checked cross-module can still resolve concrete type
+// arguments that come from the caller's scope (e.g. a root-file
+// struct passed to a module's generic function). Only missing
+// keys are copied: the defining module's own names always win.
+func (s *Sema) mirrorCallerTypes(dst *Sema) {
+	if dst == nil || dst == s {
+		return
+	}
+	for k, v := range s.structTypes {
+		if _, exists := dst.structTypes[k]; !exists {
+			dst.structTypes[k] = v
+		}
+	}
+	for k, v := range s.structMethods {
+		if _, exists := dst.structMethods[k]; !exists {
+			dst.structMethods[k] = v
+		}
+	}
+	for k, v := range s.enumTypes {
+		if _, exists := dst.enumTypes[k]; !exists {
+			dst.enumTypes[k] = v
+		}
+	}
+	for k, v := range s.enumMethods {
+		if _, exists := dst.enumMethods[k]; !exists {
+			dst.enumMethods[k] = v
+		}
+	}
+	for k, v := range s.unionTypes {
+		if _, exists := dst.unionTypes[k]; !exists {
+			dst.unionTypes[k] = v
+		}
+	}
+	for k, v := range s.unionMethods {
+		if _, exists := dst.unionMethods[k]; !exists {
+			dst.unionMethods[k] = v
+		}
+	}
 }
 
 // instantiateGenericAlias expands a generic alias: substitute the type
@@ -1175,6 +1443,7 @@ func (s *Sema) instantiateGenericFn(decl *GenericFnDecl, argTypes []*Type) *Symb
 	clone.GenericParams = nil
 	clone.Name = &Identifier{Value: display}
 	substituteFunctionTypes(clone, env)
+	substituteBodyTypes(clone.Body, env)
 
 	sym := s.resolveFnSignature(clone, display, clone.Token.Line, clone.Token.Column)
 	if sym == nil {
@@ -1182,10 +1451,18 @@ func (s *Sema) instantiateGenericFn(decl *GenericFnDecl, argTypes []*Type) *Symb
 	}
 	sym.CName = genericFnCName(decl.Prefix, decl.Short, argTypes)
 	s.funcs[display] = sym
+	// The body is checked against the defining module's analyzer so
+	// module-local names resolve; mirror the caller's type
+	// registries (the type arguments may be caller-local types) and
+	// register the instance symbol there for codegen.
+	if decl.Sema != nil && decl.Sema != s {
+		s.mirrorCallerTypes(decl.Sema)
+		decl.Sema.funcs[display] = sym
+	}
 
 	s.state.FnInstances[key] = clone
-	s.state.InstantiatedFns = append(s.state.InstantiatedFns, &FnInstance{Fn: clone, Sema: s})
-	s.pendingChecks = append(s.pendingChecks, pendingCheck{kind: checkFn, fn: clone, label: display})
+	s.state.InstantiatedFns = append(s.state.InstantiatedFns, &FnInstance{Fn: clone, Sema: decl.Sema})
+	s.pendingChecks = append(s.pendingChecks, pendingCheck{kind: checkFn, fn: clone, label: display, sema: decl.Sema})
 	return sym
 }
 
@@ -1218,6 +1495,10 @@ type pendingCheck struct {
 	canonical string
 	fn        *FunctionStatement
 	label     string
+	// sema is the analyzer the body must be checked against: the
+	// defining module's analyzer for cross-module instances (nil
+	// means the draining analyzer itself).
+	sema *Sema
 }
 
 // drainPendingChecks checks every monomorphized function/method body
@@ -1231,19 +1512,34 @@ func (s *Sema) drainPendingChecks() {
 		if pc.fn == nil || pc.fn.Name == nil || pc.fn.Body == nil {
 			continue
 		}
+		// Cross-module generic instances are checked against the
+		// defining module's analyzer (pc.sema), where the body's
+		// module-local names resolve; instances of the analyzer's own
+		// generics use itself.
+		checker := pc.sema
+		if checker == nil {
+			checker = s
+		}
 		switch pc.kind {
 		case checkFn:
-			if sym := s.funcs[pc.fn.Name.Value]; sym != nil {
-				s.checkFunctionBody(pc.label, sym, pc.fn.Params, pc.fn.Body, pc.fn.Token, false)
+			if sym := checker.funcs[pc.fn.Name.Value]; sym != nil {
+				checker.checkFunctionBody(pc.label, sym, pc.fn.Params, pc.fn.Body, pc.fn.Token, false)
 			}
 		case checkStructMethod:
-			methods := s.structMethods[pc.canonical]
+			methods := checker.structMethods[pc.canonical]
 			if methods == nil {
 				continue
 			}
 			if sym := methods[pc.fn.Name.Value]; sym != nil {
-				s.checkFunctionBody(pc.canonical+"."+pc.fn.Name.Value, sym, pc.fn.Params, pc.fn.Body, pc.fn.Token, true)
+				checker.checkFunctionBody(pc.canonical+"."+pc.fn.Name.Value, sym, pc.fn.Params, pc.fn.Body, pc.fn.Token, true)
 			}
+		}
+		// A body checked against another analyzer can instantiate
+		// further generics, which queue on that analyzer; fold them
+		// back into this queue so they drain here too.
+		if checker != s && len(checker.pendingChecks) > 0 {
+			s.pendingChecks = append(s.pendingChecks, checker.pendingChecks...)
+			checker.pendingChecks = nil
 		}
 	}
 }
@@ -1278,11 +1574,35 @@ func (s *Sema) bindBlockView(mbs *ModuleBlockStatement, full []string) {
 					view.PubFuncs[inner.Name.Value] = sym
 					view.Funcs[inner.Name.Value] = sym
 				}
+				// Generic functions register as templates, not symbols;
+				// expose the template so qualified calls
+				// (`physics.identity:i32(42)`) resolve in-file.
+				if len(inner.GenericParams) > 0 && s.state != nil {
+					if d := s.state.GenericFns[blockItemCanonical(s, full, inner.Name.Value)]; d != nil {
+						view.PubGenericFns[inner.Name.Value] = d
+					}
+				}
 			}
 		case *StructStatement:
 			if inner.Name != nil {
 				if t := s.structTypes[s.canonNames[inner]]; t != nil {
 					view.PubTypes[inner.Name.Value] = t
+				}
+				if len(inner.GenericParams) > 0 && s.state != nil {
+					if d := s.state.GenericStructs[blockItemCanonical(s, full, inner.Name.Value)]; d != nil {
+						view.PubGenericStructs[inner.Name.Value] = d
+					}
+				}
+			}
+		case *TypeAliasStatement:
+			if inner.Name != nil {
+				if t := s.typeAliases[inner.Name.Value]; t != nil {
+					view.PubTypes[inner.Name.Value] = t
+				}
+				if len(inner.GenericParams) > 0 && s.state != nil {
+					if d := s.state.GenericAliases[blockItemCanonical(s, full, inner.Name.Value)]; d != nil {
+						view.PubGenericAliases[inner.Name.Value] = d
+					}
 				}
 			}
 		case *EnumStatement:
@@ -1333,12 +1653,6 @@ func (s *Sema) bindBlockView(mbs *ModuleBlockStatement, full []string) {
 					}
 				}
 			}
-		case *TypeAliasStatement:
-			if inner.Name != nil {
-				if t := s.typeAliases[inner.Name.Value]; t != nil {
-					view.PubTypes[inner.Name.Value] = t
-				}
-			}
 		}
 	}
 	s.modules[segName] = view
@@ -1355,6 +1669,135 @@ func (s *Sema) bindBlockView(mbs *ModuleBlockStatement, full []string) {
 			s.modules[key] = view
 		}
 	}
+
+	// Publish a pub-only projection of the block into the file module's
+	// namespace so importers can chain through it (`module math;` file
+	// containing `module physics { pub const g; }` -> `math.physics.g`).
+	// Blocks expose every member in-file (same-file namespace), but
+	// across the module boundary only `pub` members are visible, so the
+	// projection filters IsPub. Nested blocks wire parent -> child so
+	// chains (`math.a.b.VAL`) resolve through each projection's own
+	// SubModules.
+	if s.selfView != nil {
+		proj := s.blockPubProjection(view, mbs)
+		s.selfView.SubModules[strings.Join(full, ".")] = proj
+		if len(full) > 1 {
+			parent := s.selfView.SubModules[strings.Join(full[:len(full)-1], ".")]
+			if parent != nil {
+				parent.SubModules[full[len(full)-1]] = proj
+			}
+		}
+	}
+}
+
+// blockPubProjection builds the pub-only view of a block for
+// cross-module access: every member marked `pub` (functions, types,
+// consts/vars) is exported; private block members stay file-private.
+func (s *Sema) blockPubProjection(view *TinocModule, mbs *ModuleBlockStatement) *TinocModule {
+	proj := newTinocModule(view.Name, view.Path)
+	proj.IsBlock = true
+	// view.Name is the block's full dotted name ("physics" or "a.b"),
+	// which blockMemberCName needs as its segment list.
+	segments := strings.Split(view.Name, ".")
+	for _, stmt := range mbs.Statements {
+		switch inner := stmt.(type) {
+		case *FunctionStatement:
+			if inner.Name != nil && inner.IsPub {
+				if sym := s.funcs[inner.Name.Value]; sym != nil {
+					proj.PubFuncs[inner.Name.Value] = sym
+					proj.Funcs[inner.Name.Value] = sym
+				}
+			}
+			// Generic functions register as templates, not symbols;
+			// publish the template so importers can call them
+			// qualified through the block (`math.physics.identity:i32(42)`).
+			if inner.Name != nil && inner.IsPub && len(inner.GenericParams) > 0 && s.state != nil {
+				if d := s.state.GenericFns[blockItemCanonical(s, segments, inner.Name.Value)]; d != nil {
+					proj.PubGenericFns[inner.Name.Value] = d
+				}
+			}
+		case *StructStatement:
+			if inner.Name != nil && inner.IsPub {
+				if t := s.structTypes[s.canonNames[inner]]; t != nil {
+					proj.PubTypes[inner.Name.Value] = t
+				}
+			}
+			if inner.Name != nil && inner.IsPub && len(inner.GenericParams) > 0 && s.state != nil {
+				if d := s.state.GenericStructs[blockItemCanonical(s, segments, inner.Name.Value)]; d != nil {
+					proj.PubGenericStructs[inner.Name.Value] = d
+				}
+			}
+		case *EnumStatement:
+			if inner.Name != nil && inner.IsPub {
+				if t := s.enumTypes[s.canonNames[inner]]; t != nil {
+					proj.PubTypes[inner.Name.Value] = t
+				}
+			}
+		case *UnionStatement:
+			if inner.Name != nil && inner.IsPub {
+				if t := s.unionTypes[s.canonNames[inner]]; t != nil {
+					proj.PubTypes[inner.Name.Value] = t
+				}
+			}
+		case *ConstStatement:
+			if inner.Name != nil && inner.IsPub {
+				if t := s.declConstTypes[inner]; t != nil {
+					proj.PubConsts[inner.Name.Value] = &constExport{Name: inner.Name.Value, Type: t, CName: blockMemberCName(s, segments, inner.Name.Value), Mutable: false, IsStatic: inner.IsStatic}
+					proj.PubTypes[inner.Name.Value] = t
+				} else if inner.Type != nil {
+					if t := s.resolveTypeExpr(inner.Type); t != nil {
+						proj.PubConsts[inner.Name.Value] = &constExport{Name: inner.Name.Value, Type: t, CName: blockMemberCName(s, segments, inner.Name.Value), Mutable: false, IsStatic: inner.IsStatic}
+						proj.PubTypes[inner.Name.Value] = t
+					}
+				} else if inner.Value != nil {
+					if t := s.checkExpression(inner.Value); t != nil && t.Kind != KindInvalid {
+						proj.PubConsts[inner.Name.Value] = &constExport{Name: inner.Name.Value, Type: t, CName: blockMemberCName(s, segments, inner.Name.Value), Mutable: false, IsStatic: inner.IsStatic}
+						proj.PubTypes[inner.Name.Value] = t
+					}
+				}
+			}
+		case *VarStatement:
+			if inner.Name != nil && inner.IsPub {
+				if t := s.declVarTypes[inner]; t != nil {
+					proj.PubConsts[inner.Name.Value] = &constExport{Name: inner.Name.Value, Type: t, CName: blockMemberCName(s, segments, inner.Name.Value), Mutable: true, IsStatic: inner.IsStatic}
+					proj.PubTypes[inner.Name.Value] = t
+				} else if inner.Type != nil {
+					if t := s.resolveTypeExpr(inner.Type); t != nil {
+						proj.PubConsts[inner.Name.Value] = &constExport{Name: inner.Name.Value, Type: t, CName: blockMemberCName(s, segments, inner.Name.Value), Mutable: true, IsStatic: inner.IsStatic}
+						proj.PubTypes[inner.Name.Value] = t
+					}
+				} else if inner.Value != nil {
+					if t := s.checkExpression(inner.Value); t != nil && t.Kind != KindInvalid {
+						proj.PubConsts[inner.Name.Value] = &constExport{Name: inner.Name.Value, Type: t, CName: blockMemberCName(s, segments, inner.Name.Value), Mutable: true, IsStatic: inner.IsStatic}
+						proj.PubTypes[inner.Name.Value] = t
+					}
+				}
+			}
+		case *TypeAliasStatement:
+			if inner.Name != nil && inner.IsPub {
+				if t := s.typeAliases[inner.Name.Value]; t != nil {
+					proj.PubTypes[inner.Name.Value] = t
+				}
+			}
+			if inner.Name != nil && inner.IsPub && len(inner.GenericParams) > 0 && s.state != nil {
+				if d := s.state.GenericAliases[blockItemCanonical(s, segments, inner.Name.Value)]; d != nil {
+					proj.PubGenericAliases[inner.Name.Value] = d
+				}
+			}
+		}
+	}
+	return proj
+}
+
+// blockItemCanonical returns the canonical dotted name a generic
+// declaration inside an in-file module block registered under
+// (`module math; module physics { pub fn id:T ... }` ->
+// `math.physics.id`): the file module prefix (skipped for the
+// entry file) plus the block's full dotted name plus the
+// member name.
+func blockItemCanonical(s *Sema, full []string, name string) string {
+	segs := append(s.itemPrefix(), full...)
+	return strings.Join(append(segs, name), ".")
 }
 
 // blockMemberCName computes the mangled C name a module-block member

@@ -622,6 +622,14 @@ func (g *Codegen) genStructTypeDef(st *StructStatement) {
 	if st.Name == nil {
 		return
 	}
+	// A generic struct template (`struct Pair:T { ... }`) emits nothing
+	// itself: only its monomorphized instances (emitted by
+	// genStructInstanceDef) become C types. The template's fields name
+	// type parameters that have no C spelling, so emitting it would
+	// produce an empty or invalid struct.
+	if len(st.GenericParams) > 0 {
+		return
+	}
 	name := g.typeCName(st.Name.Value)
 
 	g.writeln("struct %s;", name)
@@ -649,6 +657,11 @@ func (g *Codegen) genStructTypeDef(st *StructStatement) {
 // declared parameters.
 func (g *Codegen) genStructMethods(st *StructStatement) {
 	if st.Name == nil {
+		return
+	}
+	// Generic struct templates have no C representation; their methods
+	// are emitted per monomorphized instance (genStructInstanceDef).
+	if len(st.GenericParams) > 0 {
 		return
 	}
 	for _, m := range st.Methods {

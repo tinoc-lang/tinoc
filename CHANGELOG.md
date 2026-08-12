@@ -35,6 +35,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Calls support explicit type arguments (`identity:str(x)`) and inference
   from argument types (`identity(x)`), and generics work across module
   boundaries (`shapes.Circle:f64`, `math.identity:i32(42)`).
+- **Generics importable by name**: pub generic fn/struct/alias templates
+  bind through every import form like plain symbols — `#import
+  math.identity;` (bare `identity:i32(42)` / inferred `identity(7)`),
+  `#import math.identity as id;`, `#import math.{Pair};` (bare
+  `Pair:f64 { ... }`), `#import box.Opt;`, and `#import math.*;` binds
+  every pub generic bare. A bare instantiation and the qualified call
+  share one mangled C instance (`identity:i32(42)` and
+  `math.identity:i32(42)` emit a single `tnc_math_identity_i32`); private
+  generics report `symbol x is private to module math` on both paths;
+  module-block generics are reachable through dotted chains
+  (`math.physics.blockid:i32(42)`).
+- **Generic bodies compose**: a generic fn/method body may reference the
+  defining module's own generics (`makePair:(K, V)` returning
+  `Pair:(K, V) { ... }`) — instantiated bodies have their type
+  expressions substituted too, and are checked against the defining
+  module's analyzer, so module-private helpers and consts resolve
+  exactly as in the defining file.
 - **Single merged C output**: every loaded module compiles into one C
   translation unit in load order (imports before importers), with type
   typedefs, prototypes, and file-scope data hoisted so call order across
@@ -133,6 +150,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`#importc` local headers next to modules in subdirectories**: a
+  module file importing its own local header (`#importc "vecmath.h"`
+  inside `lib/mathc.tnc` with `vecmath.h` beside it) emitted the right
+  quoted include into the merged C, but the C compile step only put the
+  *entry file's* directory on the include path — so the header was not
+  found and the build failed. `compileGeneratedC` now receives every
+  loaded module's directory as an `-I` path (in load order,
+  deduplicated), so local headers resolve wherever they live.
+- **Generic struct instantiation recursion**: a generic method whose
+  signature references the struct's own type (`fn sum(self ^Pair:T)`)
+  re-entered instantiation while the instance was still being built and
+  recursed forever (clone → register method → resolve signature →
+  re-instantiate). Instances are now cached before their method
+  signatures resolve, so the re-entrant call hits the cache.
+- **Generic bodies kept stale type parameters**: after monomorphization a
+  generic body's type expressions still carried the template's type
+  parameters (`return Pair:(K, V) { ... }` inside a `makePair:(K, V)`
+  instance), so re-checking the body failed on K/V. `substituteBodyTypes`
+  now rewrites every reachable type expression in the cloned body from
+  the same substitution environment as the signature.
+- **Cross-module generic instances checked against the caller**: method
+  and fn bodies of a generic instantiated from another module were
+  checked in the caller's scope, so module-private names referenced by
+  the body did not resolve. Instances now carry the defining module's
+  analyzer, and the caller's concrete type arguments are mirrored into
+  it, so bodies resolve module-local helpers/consts and caller-provided
+  types alike.
+- **Stale `#importc` parse cache**: the disk cache keyed only on the
+  wrapper text and dumper identity, so two `#importc "vecmath.h"` from
+  different directories (or an edited local header) could be served the
+  stale parse of a different file under the same name — silently missing
+  or wrong declarations. The key now folds in each local header's
+  resolved absolute path plus a hash of its current contents, so
+  same-named headers across directories and edits always re-parse.
+- **Module-file blocks unreachable from importers**: a
+  `module name { ... }` block inside a module file (`module math;` …
+  `module physics { pub const g; }`) could not be reached cross-module
+  — `math.physics.g` failed with "module math has no public member
+  physics". Blocks now publish a pub-only projection into the file
+  module's namespace, so dotted chains (`math.physics.g`,
+  `math.physics.weight`) resolve, nested blocks chain (`math.a.b.VAL`),
+  and private block members stay file-private with a clear diagnostic.
+- **Private `const`/`var` diagnostics**: importing a private top-level
+  `const`/`var` reported "module x has no public symbol y"; it now
+  reports "symbol y is private to module x", matching private
+  functions. Private globals are tracked per module and checked in both
+  the symbol-import and qualified-access paths.
 - **Module `str` globals**: top-level `const`/`var` of type `str` (or
   arrays/slices of `str`) in module files emitted invalid C
   (`static const str x = tinoc_str_lit(...)` — a function call in a

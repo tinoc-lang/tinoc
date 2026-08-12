@@ -8,18 +8,23 @@
 //   #import math.PI;              single symbol     -> PI
 //   #import math.E as EULER;      single symbol,    -> EULER
 //                                 renamed
+//   #import math.identity;        generic fn by name -> identity:i32(...)
 //   #import shapes.*;             wildcard          -> circumference(...)
+//                                 and every pub generic (Circle)
 //   #import shapes.vec;           submodule         -> vec.Vec2 / vec.dot
 //   #import shapes.vec.{Vec2,dot} selected symbols  -> Vec2 / dot
 //   #import "shapes/vec.tnc" as f file import       -> f.Vec2 / f.dot
 //
 // plus an in-file `module physics { ... }` block, a directory module
 // (samples/modules/shapes/), and generic structs/functions used across
-// modules (`shapes.Circle:f64`, `math.identity:i32(...)`).
+// modules — qualified (`shapes.Circle:f64`, `math.identity:i32(...)`) or
+// bare through imports (`identity:i32(7)`, `Circle:f64 { ... }`), which
+// share one mangled C instance with the qualified forms.
 
 #import math;
 #import math.PI;
 #import math.E as EULER;
+#import math.identity;
 #import shapes.*;
 #import shapes.vec;
 #import shapes.vec.{Vec2, dot};
@@ -65,4 +70,12 @@ fn main() void {
 	// Generic function from a module: math.identity:i32(42).
 	var id = math.identity:i32(42);
 	printf("identity=%d\n", id);
+
+	// Generics imported by name: `identity` came in bare via
+	// #import math.identity; and `Circle` via the shapes.* wildcard.
+	// A bare `identity:i32(7)` shares the mangled instance with the
+	// qualified `math.identity:i32(42)` call above.
+	var c2 Circle:f64 = Circle:f64 { .r = 3.0 };
+	printf("bare circle r=%f\n", c2.r);
+	printf("bare identity=%d\n", identity:i32(7));
 }

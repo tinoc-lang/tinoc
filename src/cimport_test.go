@@ -579,3 +579,180 @@ fn main() void {
 	}
 	t.Fatal("expected non-zero exit (exit(42)), got success")
 }
+
+func TestCImport_LocalHeaderInSubdirModule(t *testing.T) {
+	// A module in a subdirectory may #importc a header that lives next
+	// to itself (`#importc "vecmath.h"` inside lib/vecmath.tnc with
+	// vecmath.h beside it). The merged C is compiled from a scratch work
+	// directory, so the C compiler needs every loaded module's directory
+	// on its include path — not just the entry file's — for the quoted
+	// include to resolve. This runs the same pipeline the CLI uses
+	// (LoadRoot + GenerateAll + compileGeneratedC + moduleIncludeDirs),
+	// so it guards the regression directly.
+	cc := requireCC(t)
+	requireHeaderDumper(t)
+	dir := t.TempDir()
+
+	header := `// local header next to a module in a subdirectory
+int tinoc_quad(int x) { return x * 4; }
+`
+	mod := `module vecmath;
+#importc "vecmath.h" as vm;
+
+pub fn quad(x i32) i32 {
+	return vm.tinoc_quad(x);
+}
+`
+	entry := `#import lib.vecmath;
+
+extern "C" fn exit(status i32) void;
+
+fn main() void {
+	var v = vecmath.quad(10);
+	exit(v);
+}
+`
+
+	if err := os.MkdirAll(filepath.Join(dir, "lib"), 0o755); err != nil {
+		t.Fatalf("mkdir lib: %v", err)
+	}
+	// The header lives NEXT TO the module file (lib/vecmath.h), not next
+	// to the entry file — the exact regression: only the entry file's
+	// dir used to reach the C compiler's include path.
+	if err := os.WriteFile(filepath.Join(dir, "lib", "vecmath.h"), []byte(header), 0o644); err != nil {
+		t.Fatalf("write header: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "lib", "vecmath.tnc"), []byte(mod), 0o644); err != nil {
+		t.Fatalf("write module: %v", err)
+	}
+	entryPath := filepath.Join(dir, "main.tnc")
+	if err := os.WriteFile(entryPath, []byte(entry), 0o644); err != nil {
+		t.Fatalf("write entry: %v", err)
+	}
+
+	diags := NewDiagnostics(entryPath)
+	state := NewCompileState()
+	state.LoadRoot(entryPath, entry, diags)
+	if diags.HasErrors() {
+		for _, d := range diags.All() {
+			t.Errorf("diagnostic: %s", d.String())
+		}
+		t.FailNow()
+	}
+
+	gen := NewCodegen(state.Root.Sema, diags)
+	gen.sourceDir = filepath.Dir(entryPath)
+	code := gen.GenerateAll(state)
+	if diags.HasErrors() {
+		for _, d := range diags.All() {
+			t.Errorf("codegen diagnostic: %s", d.String())
+		}
+		t.FailNow()
+	}
+	if !strings.Contains(code, `#include "vecmath.h"`) {
+		t.Fatalf("merged C should quote-include the local header:\n%s", code)
+	}
+
+	binPath := filepath.Join(dir, "main.bin")
+	_, workDir, err := compileGeneratedC(cc, entryPath, code, binPath, false, false, false, moduleIncludeDirs(state))
+	if err != nil {
+		t.Fatalf("compileGeneratedC failed: %v", err)
+	}
+	defer func() { _ = os.RemoveAll(workDir) }()
+
+	runCmd := exec.Command(binPath)
+	if err := runCmd.Run(); err != nil {
+		if exitErr, ok := err.(interface{ ExitCode() int }); ok {
+			if exitErr.ExitCode() != 40 {
+				t.Fatalf("expected exit 40, got %d", exitErr.ExitCode())
+			}
+			return
+		}
+		t.Fatalf("cannot run compiled binary: %v", err)
+	}
+	t.Fatal("expected non-zero exit (exit(40)), got success")
+}
+
+func TestCImport_CacheDistinguishesSameNamedLocalHeaders(t *testing.T) {
+	// Two projects can each have their own `vecmath.h` with different
+	// contents. The parse cache is keyed on the wrapper text
+	// (`#include "vecmath.h"`), which is identical for both — so the key
+	// must also fold in the resolved local header path and content hash,
+	// or the second parse is silently served from the first project's
+	// (wrong) cached dump.
+	requireHeaderDumper(t)
+	t.Setenv("TINOC_CACHE_DIR", t.TempDir())
+	dirA := t.TempDir()
+	dirB := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dirA, "vecmath.h"), []byte("int tinoc_one(void);\n"), 0o644); err != nil {
+		t.Fatalf("write header A: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dirB, "vecmath.h"), []byte("int tinoc_two(void);\n"), 0o644); err != nil {
+		t.Fatalf("write header B: %v", err)
+	}
+
+	modA, err := ImportCHeaders("vm", []string{"vecmath.h"}, dirA)
+	if err != nil {
+		t.Fatalf("parse A: %v", err)
+	}
+	if _, ok := modA.Funcs["tinoc_one"]; !ok {
+		t.Fatalf("header A parse should expose tinoc_one, funcs=%v", funcKeys(modA))
+	}
+	if _, ok := modA.Funcs["tinoc_two"]; ok {
+		t.Fatalf("header A parse must not expose tinoc_two (stale cache of B?)")
+	}
+
+	modB, err := ImportCHeaders("vm", []string{"vecmath.h"}, dirB)
+	if err != nil {
+		t.Fatalf("parse B: %v", err)
+	}
+	if _, ok := modB.Funcs["tinoc_two"]; !ok {
+		t.Fatalf("header B parse should expose tinoc_two, funcs=%v", funcKeys(modB))
+	}
+	if _, ok := modB.Funcs["tinoc_one"]; ok {
+		t.Fatalf("header B parse must not expose tinoc_one (stale cache of A?)")
+	}
+}
+
+func TestCImport_CacheInvalidatesOnHeaderEdit(t *testing.T) {
+	// Editing a local header must invalidate its cached parse: the key
+	// folds in the header's current content hash, so a build after the
+	// edit sees the new declarations, not yesterday's dump.
+	requireHeaderDumper(t)
+	t.Setenv("TINOC_CACHE_DIR", t.TempDir())
+	dir := t.TempDir()
+	header := filepath.Join(dir, "mine.h")
+	if err := os.WriteFile(header, []byte("int tinoc_first(void);\n"), 0o644); err != nil {
+		t.Fatalf("write header: %v", err)
+	}
+
+	mod1, err := ImportCHeaders("m", []string{"mine.h"}, dir)
+	if err != nil {
+		t.Fatalf("parse v1: %v", err)
+	}
+	if _, ok := mod1.Funcs["tinoc_first"]; !ok {
+		t.Fatalf("v1 parse should expose tinoc_first, funcs=%v", funcKeys(mod1))
+	}
+
+	if err := os.WriteFile(header, []byte("int tinoc_second(void);\n"), 0o644); err != nil {
+		t.Fatalf("rewrite header: %v", err)
+	}
+	mod2, err := ImportCHeaders("m", []string{"mine.h"}, dir)
+	if err != nil {
+		t.Fatalf("parse v2: %v", err)
+	}
+	if _, ok := mod2.Funcs["tinoc_second"]; !ok {
+		t.Fatalf("v2 parse should expose tinoc_second, funcs=%v", funcKeys(mod2))
+	}
+	if _, ok := mod2.Funcs["tinoc_first"]; ok {
+		t.Fatalf("v2 parse must not expose tinoc_first (stale cache of v1?)")
+	}
+}
+
+func funcKeys(m *CImportModule) []string {
+	ks := make([]string, 0, len(m.Funcs))
+	for k := range m.Funcs {
+		ks = append(ks, k)
+	}
+	return ks
+}
