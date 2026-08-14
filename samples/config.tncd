@@ -1,0 +1,22 @@
+// Tinoc has this config.td file which is helpful and unified build system. tncd means tinoc-defination and which currency optional.
+
+// define <name_without_spaces_lower_case> is fhe syntax
+    define my_project {
+    tinoc "0.2.0" // this means minimum tinoc version
+    version "0.1.0" // project version
+    description "Something is better than nothing" // description about this
+    repository "https://github.com/tinoc-lang/project-sample" // repository and this is optional field
+    //... other information
+    dependencies {
+    // if no deps so please leave this as empty dependencies {} kind of block dont remove it.
+    my_dep {
+    source "https://github.com/pbarot2009/my_dep"
+    version "0.1.1"
+    // ... so on
+    }
+    inside_dep {
+    source "inside_dep" // inside dependencies
+    version "0.1.0" // must match version for insider dependencies
+    }
+    }
+    }
