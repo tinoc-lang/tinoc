@@ -1,9 +1,15 @@
 name: CI
 
-# Runs on every push and pull request. Mirrors what the release workflow
-# trusts: the full `build.sh ci` / `build.ps1 ci` pipeline (deps, fmt-check,
-# vet, lint, race tests, release build) on every supported OS, followed by a
-# smoke test of the native installer in --local mode.
+# Runs on every push and pull request. Two jobs:
+#
+# 1. `test` — the project's native pipeline: the full `build.sh ci` /
+#    `build.ps1 ci` run (deps, fmt-check, vet, lint, race tests, release
+#    build) on every supported OS, followed by a smoke test of the native
+#    installer in --local mode.
+# 2. `nix` — the hermetic Nix pipeline on Linux + macOS: Determinate Nix
+#    installer + Magic Nix Cache, then `nix flake check` (gofmt, vet, race
+#    tests, end-to-end samples), `nix build .#tinoc`, and an explicit
+#    golangci-lint / go vet / `go test -race` pass inside the dev shell.
 
 on:
   push:
@@ -63,3 +69,39 @@ jobs:
           "$dir/bin/tinoc" version
           echo "VERSION file: $(cat "$dir/VERSION")"
           echo "PowerShell installer smoke test passed"
+
+  nix:
+    name: nix (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    permissions:
+      contents: read
+      id-token: write # for Magic Nix Cache push access
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Nix (Determinate Nix)
+        uses: DeterminateSystems/determinate-nix-action@v3
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Cache the Nix store (Magic Nix Cache)
+        uses: DeterminateSystems/magic-nix-cache-action@main
+
+      - name: Flake check (gofmt, vet, race tests, end-to-end samples)
+        run: nix flake check
+
+      - name: Build the flake package
+        run: nix build .#tinoc
+
+      - name: Lint, vet, and race-test inside the dev shell
+        run: |
+          nix develop . --command bash -euo pipefail -c '
+            golangci-lint run ./...
+            go vet ./...
+            go test -race -timeout 600s ./...
+          '

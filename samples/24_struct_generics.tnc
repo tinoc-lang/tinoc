@@ -1,0 +1,127 @@
+// 24_struct_generics.tnc — generic structs end-to-end.
+//
+//   - `struct Pair:T`            single-parameter generic struct
+//   - `struct Triple:T:U:V`      chained multi-parameter form (new)
+//   - `struct Map:(K, V)`        parenthesized multi-parameter form
+//
+// Instances are monomorphized per concrete type-argument set
+// (`Pair:i32`, `math.Pair:f64`, ...), each with its own C struct and
+// mangled method names (tinoc_Pair_i32_swap, ...). Methods work on any
+// instance; `self` binds the concrete instance type.
+//
+// Method bodies are type-checked per instance (monomorphization
+// semantics): a method that uses `+` only compiles for instances whose
+// payload supports it, so `Num:T` below keeps `double` (which uses `+`)
+// and is only ever instantiated with `i32`, while the payload-agnostic
+// `Pair` methods work with str / pointer / nested-struct payloads too.
+
+extern "C" fn printf(fmt *const char, ...) i32;
+
+// Single-parameter generic struct with instance + static methods.
+struct Pair:T {
+	first T;
+	second T;
+
+	fn swap(self ^Pair:(T)) void {
+		var tmp T = self^.first;
+		self^.first = self^.second;
+		self^.second = tmp;
+	}
+
+	static fn make(a T, b T) Pair:T {
+		return Pair:T { .first = a, .second = b };
+	}
+}
+
+// A numeric-only generic struct: `double` uses `+`, so it is only
+// instantiated with numeric type arguments.
+struct Num:T {
+	v T;
+
+	fn double(self ^Num:(T)) T {
+		return self^.v + self^.v;
+	}
+
+	static fn of(x T) Num:T {
+		return Num:T { .v = x };
+	}
+}
+
+// Chained multi-parameter generic struct: `struct Triple:T:U:V` is
+// equivalent to `struct Triple:(T, U, V)`.
+struct Triple:T:U:V {
+	a T;
+	b U;
+	c V;
+
+	fn first(self ^Triple:(T, U, V)) T {
+		return self^.a;
+	}
+}
+
+// Parenthesized multi-parameter form (the classic spelling).
+struct Map:(K, V) {
+	key K;
+	value V;
+
+	fn pair(self ^Map:(K, V)) Map:(K, V) {
+		return Map:(K, V) { .key = self^.key, .value = self^.value };
+	}
+}
+
+// Generic structs compose: a generic struct used inside another generic
+// struct's fields (instantiated with the outer type parameter).
+struct Wrapper:T {
+	inner Pair:T;
+	tag str;
+
+	fn tagged(self ^Wrapper:T, label str) void {
+		self^.tag = label;
+	}
+}
+
+fn main() void {
+	// Static method with inferred type arguments: `Pair.make(10, 20)`
+	// infers Pair:i32 from the argument types, exactly like the
+	// explicit `Pair:i32.make(...)` spelling.
+	var p Pair:i32 = Pair.make(10, 20);
+	p.swap();
+	printf("pair sum = %d\n", p.first + p.second); // 30 after swap
+
+	// Explicit type arguments on the static method receiver.
+	var n Num:i32 = Num:i32.of(21);
+	printf("doubled = %d\n", n.double()); // 42
+
+	// str payloads.
+	var s Pair:str = Pair:str { .first = "tin", .second = "oc" };
+	s.swap();
+	printf("pair first = %s\n", s.first); // "oc"
+
+	// Pointer payloads (^i32).
+	var a i32 = 5;
+	var b i32 = 6;
+	var pp Pair:^i32 = Pair:^i32 { .first = &a, .second = &b };
+	pp.swap();
+	printf("ptr pair first = %d\n", pp.first^); // 6
+
+	// Nested struct payloads: Pair:(Pair:i32).
+	var inner Pair:i32 = Pair:i32 { .first = 1, .second = 2 };
+	var nested Pair:(Pair:i32) = Pair:(Pair:i32) { .first = inner, .second = inner };
+	nested.first.swap();
+	printf("nested first = %d\n", nested.first.first); // 2 after swap
+
+	// Chained multi-param instantiation via the :(T, U, V) spelling.
+	var t Triple:(i32, str, bool) = Triple:(i32, str, bool) { .a = 1, .b = "x", .c = true };
+	printf("triple first = %d\n", t.first());
+
+	// Parenthesized multi-param form.
+	var m Map:(str, i32) = Map:(str, i32) { .key = "age", .value = 7 };
+	var copy Map:(str, i32) = m.pair();
+	printf("map value = %d\n", copy.value);
+
+	// Generic struct as a field of another generic struct.
+	var w Wrapper:i32 = Wrapper:i32 { .inner = Pair:i32 { .first = 3, .second = 4 }, .tag = "w" };
+	w.tagged("wrapped");
+	w.inner.swap();
+	printf("wrapper inner = %d, %d, tag = %s\n", w.inner.first, w.inner.second, w.tag);
+}

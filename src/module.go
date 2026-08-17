@@ -216,7 +216,21 @@ type CompileState struct {
 	// body against the right registries.
 	InstantiatedFns     []*FnInstance
 	InstantiatedStructs []*StructInstance
+
+	// instDepth tracks the current monomorphization recursion depth so
+	// mutually-recursive generic declarations (`struct A:T { b B:(A:T) }`
+	// / `struct B:U { a A:(B:U) }`) fail with a clear diagnostic instead
+	// of instantiating forever (each new key is a distinct cache entry,
+	// so the cycle never hits the instance cache). See
+	// maxGenericInstDepth.
+	instDepth int
 }
+
+// maxGenericInstDepth caps how deeply generic structs/fns may nest during
+// monomorphization. Realistic programs nest a handful of levels (e.g.
+// `Pair:(Pair:(Pair:i32, i32), i32)`); 64 is far beyond any legitimate
+// nesting while still stopping pathological recursive types quickly.
+const maxGenericInstDepth = 64
 
 // NewCompileState creates an empty compilation state.
 func NewCompileState() *CompileState {
@@ -1170,6 +1184,17 @@ func (s *Sema) resolveGenericArgs(params []string, args []TypeExpr, what string,
 // type for a generic struct + type args, registering it in this Sema's
 // tables so fields, methods, and calls resolve normally.
 func (s *Sema) instantiateGenericStruct(decl *GenericStructDecl, args []TypeExpr, tok Token) *Type {
+	// Depth guard: mutually-recursive generic structs (A:T referencing
+	// B:(A:T) whose body references A again, ...) would otherwise keep
+	// minting distinct cache keys forever. Fail loudly instead of
+	// hanging the compiler.
+	if s.state.instDepth >= maxGenericInstDepth {
+		s.errorAt(tok.Line, tok.Column, "generic instantiation depth limit exceeded (%d) while resolving %s — recursive generic struct?", maxGenericInstDepth, decl.Short)
+		return nil
+	}
+	s.state.instDepth++
+	defer func() { s.state.instDepth-- }()
+
 	argTypes := s.resolveGenericArgs(decl.Params, args, decl.Short, tok)
 	if argTypes == nil {
 		return nil
@@ -1893,6 +1918,17 @@ func substituteTypeExpr(te TypeExpr, env map[string]TypeExpr) TypeExpr {
 	case *ArrayType:
 		return &ArrayType{Token: t.Token, Size: cloneExpr(t.Size), Inferred: t.Inferred, Sentinel: cloneExpr(t.Sentinel), Elem: substituteTypeExpr(t.Elem, env)}
 	case *GenericType:
+		// The base may be the generic's own short name (`self
+		// ^Pair:(K, V)`, `return Box:T { ... }` inside the template):
+		// substitute it like any other named type so a cross-module
+		// instance resolves to its concrete canonical type (registered
+		// under the module-qualified name, which the importer cannot
+		// look up by bare base). A base naming a different generic
+		// (`Pair:T` inside Wrapper:T) stays as-is with its args
+		// substituted, so it still resolves to that template.
+		if repl, ok := env[t.Base]; ok {
+			return cloneTypeExpr(repl)
+		}
 		args := make([]TypeExpr, 0, len(t.Args))
 		for _, a := range t.Args {
 			args = append(args, substituteTypeExpr(a, env))

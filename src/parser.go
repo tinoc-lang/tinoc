@@ -129,6 +129,15 @@ type Parser struct {
 	// the body block instead. Mirrors the same disambiguation Go and Zig
 	// apply to brace-headed conditions.
 	noStructLiterals bool
+
+	// noDottedTypeNames suppresses dotted-name absorption while parsing
+	// a single generic type argument in expression position
+	// (`Pair:i32.make(...)`): without it, parseNamedOrGenericType would
+	// read `i32.make` as one qualified type name and swallow the method
+	// call. Dotted type arguments still work via the parenthesized
+	// spelling `Pair:(math.Vec2).make(...)`, where the closing paren
+	// ends the argument list and disambiguates the method.
+	noDottedTypeNames bool
 }
 
 // NewParser constructs a Parser over the given source text.
@@ -791,15 +800,30 @@ func (p *Parser) parseStructStatement() Statement {
 	}
 	stmt.Name = &Identifier{Token: p.curToken, Value: p.curToken.Literal}
 
-	// Generic struct header: `struct Pair:T {` / `struct Map:(K, V) {`.
+	// Generic struct header: `struct Pair:T {` / `struct Map:(K, V) {` /
+	// `struct Pair:T:U {` (chained single-param form).
 	if p.peekTokenIs(TOKEN_COLON) {
 		p.nextToken() // consume ':'
 		if p.peekTokenIs(TOKEN_LPAREN) {
 			p.nextToken() // consume '('
 			stmt.GenericParams = p.parseIdentList(TOKEN_RPAREN)
 		} else if p.peekTokenIs(TOKEN_IDENT) {
-			p.nextToken()
-			stmt.GenericParams = []string{p.curToken.Literal}
+			// Chained colon form: `struct Pair:T:U {` is equivalent to
+			// `struct Pair:(T, U) {` — each `:ident` appends one type
+			// parameter.
+			for {
+				p.nextToken() // move onto the type-parameter name
+				stmt.GenericParams = append(stmt.GenericParams, p.curToken.Literal)
+				if !p.peekTokenIs(TOKEN_COLON) {
+					break
+				}
+				p.nextToken() // consume ':'
+				if !p.peekTokenIs(TOKEN_IDENT) {
+					// `struct Pair:T: {` — a stray ':' with no parameter
+					// name; let the '{' expectation report it below.
+					break
+				}
+			}
 		}
 	}
 
@@ -1414,8 +1438,65 @@ func (p *Parser) parseGroupedExpression() Expression {
 
 func (p *Parser) parseArrayLiteral() Expression {
 	arr := &ArrayLiteral{Token: p.curToken}
+
+	// Type-annotated array/slice literal: `[]T { ... }` and
+	// `[N]T { ... }` spell the element type explicitly (used in struct
+	// literals and return statements, e.g. `[]i32 {}` for an empty
+	// slice). The bracketed part is a type, not elements, so it is
+	// skipped and the brace list becomes the literal's elements; Sema
+	// retypes the literal from the result location anyway (the same
+	// way every other array literal is handled), so the annotation is
+	// syntax sugar and can be discarded.
+	if p.typedArrayLiteralAhead() {
+		p.nextToken() // consume '[' -> ']' (empty) or the size literal
+		if p.curTokenIs(TOKEN_INT) {
+			p.nextToken() // consume the size -> ']'
+		}
+		p.nextToken() // consume ']' -> start of the element type
+		p.parseType() // skip the element-type annotation (discarded)
+		if !p.expectPeek(TOKEN_LBRACE) {
+			return arr
+		}
+		arr.Elements = p.parseExpressionList(TOKEN_RBRACE)
+		return arr
+	}
+
 	arr.Elements = p.parseExpressionList(TOKEN_RBRACK)
 	return arr
+}
+
+// typedArrayLiteralAhead reports whether the expression starting at the
+// current `[` is a type-annotated array literal — `[]T { ... }` or
+// `[N]T { ... }` — as opposed to a plain element list (`[1, 2, 3]`,
+// `[[1,0],[0,1]]`). The parser has one-token lookahead, so the check
+// scans forward with a cloned lexer (the clone's state is discarded).
+func (p *Parser) typedArrayLiteralAhead() bool {
+	if !p.curTokenIs(TOKEN_LBRACK) {
+		return false
+	}
+	// p.l has already produced peekToken; the clone continues from the
+	// token after it.
+	scan := *p.l
+	t1 := scan.NextToken() // token after peekToken
+	switch p.peekToken.Type {
+	case TOKEN_RBRACK: // `[]T { ... }`
+		return isTypeStartToken(t1.Type) && scan.NextToken().Type == TOKEN_LBRACE
+	case TOKEN_INT: // `[N]T { ... }`
+		t2 := scan.NextToken()
+		return t1.Type == TOKEN_RBRACK && isTypeStartToken(t2.Type) && scan.NextToken().Type == TOKEN_LBRACE
+	}
+	return false
+}
+
+// isTypeStartToken reports whether tt can begin a type expression:
+// named types (`i32`, `math.Vec2`), nested arrays (`[3]f64`), pointers
+// (`^T`, `*T`), optionals (`?T`), and the const qualifier.
+func isTypeStartToken(tt TokenType) bool {
+	switch tt {
+	case TOKEN_IDENT, TOKEN_LBRACK, TOKEN_ASTERISK, TOKEN_CARET, TOKEN_QUESTION, TOKEN_CONST:
+		return true
+	}
+	return false
 }
 
 func (p *Parser) parseExpressionList(closing TokenType) []Expression {
@@ -1593,7 +1674,13 @@ func (p *Parser) parseGenericSuffix(left Expression) Expression {
 		ge.Args = p.parseTypeList(TOKEN_RPAREN)
 	} else {
 		p.nextToken()
+		// Single-arg form: stop dotted-name absorption so `Pair:i32.foo`
+		// parses as instance `Pair:i32` followed by field/method `foo`,
+		// not as a type argument named `i32.foo`. The paren form above
+		// is unaffected — its closing paren already ends the arguments.
+		p.noDottedTypeNames = true
 		ge.Args = []TypeExpr{p.parseType()}
+		p.noDottedTypeNames = false
 	}
 
 	return ge
@@ -1669,6 +1756,14 @@ func (p *Parser) parseType() TypeExpr {
 
 func (p *Parser) parseNamedOrGenericType() TypeExpr {
 	base := &NamedType{Token: p.curToken, Name: p.curToken.Literal}
+
+	// In expression position a single generic argument must not absorb
+	// dotted suffixes (`Pair:i32.make(...)` -> arg `i32`, method
+	// `make`); see noDottedTypeNames. Dotted type arguments are written
+	// `Pair:(math.Vec2).make(...)` instead.
+	if p.noDottedTypeNames {
+		return base
+	}
 
 	// Dotted (qualified) type names: `math.Circle`, `vec.vec2.F32`.
 	// Module members are spelled with their full dotted path so the

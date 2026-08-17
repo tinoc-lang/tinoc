@@ -344,6 +344,58 @@ fn main() void {
 	}
 }
 
+func TestModuleGenericStructWithMethods(t *testing.T) {
+	// Cross-module generic structs with methods: instance methods
+	// (`self ^Box:T`), static methods (qualified template call), and
+	// multi-param templates — all monomorphized in the defining module's
+	// scope and usable from the importer. Regression: the method
+	// signature/body substitution kept the template's bare base
+	// (`self ^Pair:(K, V)` -> `^Pair:(i32, str)`), which the importer
+	// could not resolve — instances with methods failed to check.
+	out, _ := compileAndRunModules(t, map[string]string{
+		"containers.tnc": `pub struct Box:T {
+	item T;
+	tag str;
+
+	fn get(self ^Box:T) T {
+		return self^.item;
+	}
+
+	static fn pack(item T, tag str) Box:T {
+		return Box:T { .item = item, .tag = tag };
+	}
+}
+
+pub struct Pair:(K, V) {
+	first K;
+	second V;
+
+	fn firstOf(self ^Pair:(K, V)) K {
+		return self^.first;
+	}
+
+	static fn of(first K, second V) Pair:(K, V) {
+		return Pair:(K, V) { .first = first, .second = second };
+	}
+}
+`,
+		"main.tnc": `#import containers;
+extern "C" fn printf(fmt *const char, ...) i32;
+fn main() void {
+	var b containers.Box:i32 = containers.Box:i32 { .item = 42, .tag = "answer" };
+	var s containers.Box:str = containers.Box:str.pack("tinoc", "lang");
+	var p containers.Pair:(i32, str) = containers.Pair:(i32, str) { .first = 1, .second = "one" };
+	var q containers.Pair:(str, i32) = containers.Pair:(str, i32).of("age", 7);
+	printf("%d %s %d %s %d %d\n", b.get(), s.get(), p.firstOf(), q.firstOf(), b.item, q.second);
+}
+`,
+	}, "main.tnc")
+	want := "42 tinoc 1 age 42 7"
+	if !strings.Contains(out, want) {
+		t.Fatalf("expected %q, got %q", want, out)
+	}
+}
+
 func TestModuleGenericAlias(t *testing.T) {
 	out, _ := compileAndRunModules(t, map[string]string{
 		"box.tnc": "pub alias Opt:T = ?T;\npub fn make(x i32) Opt:i32 { return x; }\n",

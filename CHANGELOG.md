@@ -9,6 +9,61 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Structs, end-to-end**: struct literals (`Point { .x = 1.0, .y = 2.0 }`
+  — fields in any order, trailing commas allowed; `Point {}` is an
+  explicit zero-initialization; every field must be named and
+  type-checked, with exact source spans and `did you mean ...?` hints
+  for unknown names). Instance methods take `self ^T` (pointer
+  receiver, `self^.x` → `self->x`) or `self T` (by-value receiver);
+  static methods are called on the type name itself, including
+  monomorphized generic instances (`Rect.square(3.0)`, `Num:i32.of(21)`),
+  and calling a static method on a value (or an instance method on the
+  type name) is rejected with a hint. Multi-parameter generic structs
+  support the chained form `struct Pair:T:U { ... }` alongside
+  `struct Map:(K, V) { ... }`; by-value copy/param/return semantics and
+  structural size/alignment come from the C11 `typedef struct` emission
+  with deterministic dependency ordering. Const bindings are immutable
+  all the way down: assigning to a field of a `const` struct — directly
+  (`r.w = 1`), through nested structs (`o.inner.v = 1`), or through
+  array members (`o.grid[0][1] = 1`) — is rejected with
+  `cannot assign to ... (declared const)` and an exact source span, just
+  like reassigning the const itself; write-throughs stay legal
+  (`self^.x` in mutating methods, `s[i]` on slice parameters). Layout
+  diagnostics: circular by-value containment
+  (`circular struct layout: A -> B -> A`, with a pointer suggestion) is
+  detected at the end of analysis, and a generic-instantiation depth
+  limit turns mutually-recursive generic structs into a clear
+  `generic instantiation depth limit exceeded` error instead of hanging
+  the compiler.
+- **Typed array/slice literals**: `[]i32 {}`, `[]f64 { 1.5, 2.5 }`, and
+  `[3]i32 { 1, 2, 3 }` spell the element type explicitly — useful in
+  struct literal fields and return statements. An empty literal binds
+  to a concrete `[0]T` type and codegen emits an empty slice
+  (`{ .ptr = NULL, .len = 0 }`), so `Bag { .items = []i32 {} }` works.
+- **Samples**: `samples/24_struct_generics.tnc` (generic structs with
+  instance + static methods, cross-module-ready `Num:i32.of(21)` style
+  calls), `samples/25_struct_literals.tnc` (named-field and zero-init
+  literals, typed array-literal fields, slices/optionals inside
+  structs, nested/multidimensional arrays in literals),
+  `samples/26_struct_value_semantics.tnc` (by-value receivers, static
+  constructors, struct copy semantics, slice-field write-through),
+  `samples/27_struct_linked_list_methods.tnc` (self-referencing
+  pointer structs with methods, node arenas, pointer field writes), and
+  `samples/28_struct_module_generics.tnc` plus
+  `samples/modules/containers.tnc` (generic structs with instance +
+  static methods instantiated across module boundaries).
+- **Nix support**: `flake.nix` adds `packages.default` (a hermetic
+  `buildGoModule` build with the same `-trimpath` and version ldflags
+  `build.sh` injects, installing the C11 runtime header into
+  `$out/include` and `$out/share/tinoc`), `devShells.default` (pinned
+  Go toolchain matching `go.mod`, golangci-lint, gopls, gcc + clang,
+  gdb/valgrind on Linux or lldb on macOS), and `checks.default` so
+  `nix flake check` runs gofmt, go vet, `go test -race`, and the full
+  end-to-end samples suite — across x86_64/aarch64 Linux and Darwin.
+  `.envrc` loads the shell via nix-direnv, and CI gained a `nix` job
+  on Linux + macOS using Determinate Nix and Magic Nix Cache
+  (`nix flake check`, `nix build .#tinoc`, golangci-lint / go vet /
+  race tests inside the dev shell).
 - **Smart module system**: `#import` now resolves user modules semantically.
   Every form is supported — namespace (`#import math;`), wildcard
   (`#import math.*;`), single symbol (`#import math.PI;`), selected symbols
@@ -150,6 +205,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Cross-module generic structs with methods**: instantiating a
+  module's generic struct that declared methods (`struct Box:T {
+  fn get(self ^Box:T) ... }` imported as `containers.Box:i32`) failed
+  semantic analysis — the method signature/body substitution rewrote
+  the type arguments but kept the template's bare base (`self
+  ^Pair:(K, V)` became `^Pair:(i32, str)`), which the importer could
+  not resolve because the template lives under its module-qualified
+  key. `substituteTypeExpr` now substitutes a generic's base too when
+  it names the template itself, so cross-module instances resolve to
+  the concrete canonical type (`containers.Pair:(i32, str)`) and their
+  methods check and codegen correctly.
 - **`#importc` local headers next to modules in subdirectories**: a
   module file importing its own local header (`#importc "vecmath.h"`
   inside `lib/mathc.tnc` with `vecmath.h` beside it) emitted the right

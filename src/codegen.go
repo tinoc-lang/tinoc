@@ -1798,6 +1798,11 @@ func (g *Codegen) genAsSlice(e Expression) string {
 		g.errorAt(0, 0, "codegen: invalid array-to-slice conversion (expected a one-dimensional array)")
 		return "((tinoc_slice(i32)){ .ptr = NULL, .len = 0 })"
 	}
+	// An empty literal (`[]i32 {}`) has no storage: it becomes an
+	// empty slice with a NULL pointer.
+	if arr.ArraySize == 0 {
+		return fmt.Sprintf("((%s){ .ptr = NULL, .len = 0 })", sliceTypeName(arr))
+	}
 	var inner string
 	if al, ok := e.(*ArrayLiteral); ok && al != nil {
 		inner = g.genArrayCompound(al)
@@ -2491,6 +2496,15 @@ func (g *Codegen) genCall(ce *CallExpression) string {
 			if _, isStruct := g.sema.structTypes[id.Value]; isStruct {
 				return g.genStructMethodCall(id.Value, fa.Field.Value, ce, nil)
 			}
+			// `Pair.make(10, 20)` — a generic struct template's static
+			// method with inferred type args: Sema resolved the receiver
+			// expression to the concrete instance, whose mangled method
+			// name carries the instance's type arguments.
+			if g.sema.lookupGenericStruct(id.Value) != nil {
+				if t := g.sema.TypeOf(fa.Left); t != nil && t.Kind == KindStruct {
+					return g.genStructMethodCall(t.Name, fa.Field.Value, ce, nil)
+				}
+			}
 			if et, isEnum := g.sema.enumTypes[id.Value]; isEnum {
 				if _, isVariant := et.EnumVariantIdx[fa.Field.Value]; isVariant {
 					return g.genEnumConstructor(id.Value, fa.Field.Value, ce)
@@ -2499,6 +2513,15 @@ func (g *Codegen) genCall(ce *CallExpression) string {
 			}
 			if _, isUnion := g.sema.unionTypes[id.Value]; isUnion {
 				return g.genUnionMethodCall(id.Value, fa.Field.Value, ce, nil)
+			}
+		}
+		// `Pair:i32.make(...)` — static method on a generic-struct
+		// instance: Sema resolved the receiver to the monomorphized
+		// struct type; emit the mangled instance method with no receiver
+		// argument, like any static method.
+		if _, isGE := fa.Left.(*GenericExpression); isGE && fa.Field != nil {
+			if t := g.sema.TypeOf(fa.Left); t != nil && t.Kind == KindStruct {
+				return g.genStructMethodCall(t.Name, fa.Field.Value, ce, nil)
 			}
 		}
 		// Instance method call: `p.translate(...)` / `pp.method(...)` ->
@@ -2602,9 +2625,27 @@ func (g *Codegen) genStructLiteral(sl *StructLiteral) string {
 		}
 		val := "0"
 		if f.Value != nil {
-			val = g.genExpr(f.Value)
+			if al, isArray := f.Value.(*ArrayLiteral); isArray {
+				// Array-typed fields cannot be initialized from a compound
+				// literal (C arrays are not assignable/copyable values), so
+				// an array literal field initializer emits as a plain brace
+				// initializer: `Vec { .data = {1.0, 2.0, 3.0} }`.
+				if idx, ok := t.FieldIndex[f.Name.Value]; ok && t.Fields[idx].Type != nil && t.Fields[idx].Type.Kind == KindArray {
+					val = g.genArrayBraceInit(al)
+				} else {
+					val = g.genExpr(f.Value)
+				}
+			} else {
+				val = g.genExpr(f.Value)
+			}
 		}
 		parts = append(parts, fmt.Sprintf(".%s = %s", sanitizeCIdent(f.Name.Value), val))
+	}
+	if len(parts) == 0 {
+		// An empty struct literal (e.g. `Point {}`) is an explicit
+		// zero-initialization: `{0}` zeroes every member (an empty
+		// initializer list is not valid C11).
+		return fmt.Sprintf("(%s){ 0 }", t.CType())
 	}
 	return fmt.Sprintf("(%s){ %s }", t.CType(), strings.Join(parts, ", "))
 }
