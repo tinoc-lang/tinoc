@@ -1,0 +1,34 @@
+// containers.tnc — a user module with generic structs that carry
+// instance and static methods. Importers instantiate them with the
+// qualified name, and each concrete type-argument set monomorphizes to
+// one shared C struct + mangled methods (e.g. `containers.Box:i32` ->
+// `tnc_containers_Box_i32`). Method bodies are checked per instance, so
+// a method that cross-assigns K and V only compiles for matching
+// type-argument sets — the methods here are type-agnostic on purpose.
+// See samples/28_struct_module_generics.tnc.
+
+pub struct Box:T {
+	item T;
+	tag  str;
+
+	fn get(self ^Box:T) T {
+		return self^.item;
+	}
+
+	static fn pack(item T, tag str) Box:T {
+		return Box:T { .item = item, .tag = tag };
+	}
+}
+
+pub struct Pair:(K, V) {
+	first K;
+	second V;
+
+	fn firstOf(self ^Pair:(K, V)) K {
+		return self^.first;
+	}
+
+	static fn of(first K, second V) Pair:(K, V) {
+		return Pair:(K, V) { .first = first, .second = second };
+	}
+}

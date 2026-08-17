@@ -1,0 +1,69 @@
+// 27_struct_linked_list_methods.tnc — self-referencing structs through
+// pointers, with methods, an arena of nodes, and pointer field writes.
+//
+//   - `struct Node { next ^Node }` — a struct containing a pointer to
+//     its own type (pointers break the by-value layout cycle)
+//   - instance methods on `self ^Node` walk and mutate the list
+//   - nodes live in a fixed array (an arena); `&pool[i]` links them
+//   - pointer-to-struct parameters mutate the caller's node in place
+
+extern "C" fn printf(fmt *const char, ...) i32;
+
+struct Node {
+	value i32;
+	next  ^Node;
+
+	fn sum(self ^Node) i32 {
+		var total i32 = 0;
+		var cur ^Node = self;
+		while cur != null {
+			total += cur^.value;
+			cur = cur^.next;
+		}
+		return total;
+	}
+
+	fn scale(self ^Node, factor i32) void {
+		var cur ^Node = self;
+		while cur != null {
+			cur^.value *= factor;
+			cur = cur^.next;
+		}
+	}
+
+	static fn of(v i32) Node {
+		return Node { .value = v, .next = null };
+	}
+}
+
+// Pointer-to-struct parameter: mutates the caller's node in place.
+fn relink(head ^Node) void {
+	var cur ^Node = head;
+	while cur != null {
+		if cur^.value == 2 {
+			cur^.value = 22;
+		}
+		cur = cur^.next;
+	}
+}
+
+fn main() void {
+	// Linked nodes declared on the stack, linked with address-of.
+	var n0 Node = Node { .value = 10, .next = null };
+	var n1 Node = Node { .value = 20, .next = &n0 };
+	var n2 Node = Node { .value = 30, .next = &n1 };
+	var n3 Node = Node { .value = 40, .next = &n2 };
+	printf("stack list sum = %d\n", n3.sum());
+	n3.scale(2);
+	printf("after scale  = %d\n", n3.sum());
+
+	// Arena: nodes in a fixed array, linked by taking element addresses.
+	var pool [3]Node = [Node.of(1), Node.of(2), Node.of(3)];
+	pool[0].next = &pool[1];
+	pool[1].next = &pool[2];
+	printf("arena sum = %d\n", pool[0].sum());
+
+	// Pointer field writes through a function parameter.
+	relink(&pool[0]);
+	printf("after relink = %d\n", pool[0].sum());
+}

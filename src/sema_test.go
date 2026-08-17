@@ -534,6 +534,125 @@ fn main() void {
 `, "cannot use")
 }
 
+func TestStructConstFieldMutationRejected(t *testing.T) {
+	// Mutating a field through a const-declared struct is rejected just
+	// like reassigning the const itself: the base binding is immutable.
+	checkHasError(t, `
+struct Point {
+	x f32;
+	y f32;
+}
+
+fn main() void {
+	const p Point = Point { .x = 1.0, .y = 2.0 };
+	p.x = 5.0;
+	return;
+}
+`, "cannot assign to p.x (declared const)")
+}
+
+func TestStructConstNestedFieldMutationRejected(t *testing.T) {
+	// The chain walk catches nested field and array-element writes too:
+	// `o.inner.v` and `o.grid[0][1]` both bottom out at the const `o`.
+	checkHasError(t, `
+struct Inner {
+	v i32;
+}
+
+struct Outer {
+	inner Inner;
+	grid [2][2]i32;
+}
+
+fn main() void {
+	const o Outer = Outer { .inner = Inner { .v = 1 }, .grid = [[1, 2], [3, 4]] };
+	o.inner.v = 5;
+	return;
+}
+`, "cannot assign to o.inner.v (declared const)")
+	checkHasError(t, `
+struct Inner {
+	v i32;
+}
+
+struct Outer {
+	inner Inner;
+	grid [2][2]i32;
+}
+
+fn main() void {
+	const o Outer = Outer { .inner = Inner { .v = 1 }, .grid = [[1, 2], [3, 4]] };
+	o.grid[0][1] = 9;
+	return;
+}
+`, "cannot assign to o.grid[0][1] (declared const)")
+}
+
+func TestStructVarFieldMutationAllowed(t *testing.T) {
+	// `var` structs stay mutable, and mutating methods write through the
+	// pointer receiver (`self^.x`) even though `self` is an immutable
+	// by-value parameter — the dereference breaks the const chain.
+	checkNoErrors(t, `
+struct Point {
+	x f32;
+	y f32;
+
+	fn translate(self ^Point, dx f32) void {
+		self^.x += dx;
+	}
+}
+
+fn main() void {
+	var p Point = Point { .x = 1.0, .y = 2.0 };
+	p.x = 5.0;
+	p.translate(1.0);
+	return;
+}
+`)
+}
+
+func TestStructSliceParamWriteThroughAllowed(t *testing.T) {
+	// `s[i] = v` on a slice parameter writes through the slice's pointee
+	// (the backing array), so it must NOT be treated as mutating the
+	// immutable parameter itself.
+	checkNoErrors(t, `
+fn double_all(s []i32) void {
+	var i i32 = 0;
+	while i < s.len {
+		s[i] = s[i] * 2;
+		i += 1;
+	}
+}
+
+fn main() void {
+	var nums [3]i32 = [1, 2, 3];
+	double_all(nums);
+	return;
+}
+`)
+}
+
+func TestStructByValueSelfMutationRejected(t *testing.T) {
+	// A by-value `self` is a copy: writing to it is a no-op, so it is
+	// rejected like any other immutable parameter.
+	checkHasError(t, `
+struct Point {
+	x f32;
+	y f32;
+
+	fn nudge(self Point) void {
+		self.x = 9.0;
+	}
+}
+
+fn main() void {
+	var p Point = Point { .x = 1.0, .y = 2.0 };
+	p.nudge();
+	return;
+}
+`, "cannot assign to self.x (declared const)")
+}
+
 func TestStructCannotCompare(t *testing.T) {
 	checkHasError(t, `
 struct Point {

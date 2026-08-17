@@ -28,6 +28,7 @@
 - [Changelog](#changelog)
 - [Release Checklist](#release-checklist)
 - [Important Links](#important-links)
+- [Nix (reproducible dev & CI)](#nix-reproducible-dev--ci)
 - [Contributing](#contributing)
 - [License](#license)
 
@@ -142,6 +143,35 @@ int main() {
 
 - **Website:** https://tinoc-lang.vercel.app
 - **Creator GitHub:** https://github.com/pbarot2009
+
+---
+
+## Nix (reproducible dev & CI)
+
+The repository ships a [Nix flake](flake.nix) for hermetic, zero-drift
+development on Linux and macOS (`x86_64-linux`, `aarch64-linux`,
+`x86_64-darwin`, `aarch64-darwin`):
+
+```bash
+# Enter the dev shell: the pinned Go toolchain (matching go.mod),
+# golangci-lint, gopls, a C11 compiler (gcc + clang on Linux, clang on
+# macOS), gdb + valgrind (lldb on macOS), and a flake-built `tinoc`.
+nix develop
+
+# Or with nix-direnv (see .envrc):
+#   direnv allow
+
+# Build the compiler (installs the C11 runtime header into $out/include
+# and $out/share/tinoc):
+nix build .#tinoc
+
+# Full gate — gofmt, go vet, go test -race, and the end-to-end samples
+# suite (generated C compiled and executed):
+nix flake check
+```
+
+CI runs the same flake checks on Linux and macOS with Determinate Nix and
+Magic Nix Cache (see [`.github/workflows/ci.yml`](.github/workflows/ci.yml)).
 
 ---
 

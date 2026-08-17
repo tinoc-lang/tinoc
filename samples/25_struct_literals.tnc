@@ -1,0 +1,101 @@
+// 25_struct_literals.tnc — struct literals and rich field types.
+//
+//   - named-field literals with trailing commas and nested literals
+//   - `Type {}` — the explicit zero-initialization form
+//   - structs containing arrays, slices, and optionals (with the same
+//     implicit array->slice / payload->optional conversions as var init)
+//   - decl-only `var x Type;` zero-initialization
+//   - static constructors returning literals
+
+extern "C" fn printf(fmt *const char, ...) i32;
+
+struct Vec2 {
+	x f32;
+	y f32;
+
+	fn len(self ^Vec2) f32 {
+		var v = self^.x * self^.x + self^.y * self^.y;
+		if v < 0.0 {
+			v = -v;
+		}
+		return v;
+	}
+}
+
+struct Line {
+	from Vec2;
+	to   Vec2;
+}
+
+struct Bag {
+	name  str;
+	items []i32;    // slice field
+	grid  [2][2]f32; // array field
+	score ?i32;     // optional field
+	tag   ?str;
+
+	fn total(self ^Bag) i32 {
+		var sum i32 = 0;
+		for self^.items |x| {
+			sum += x;
+		}
+		return sum;
+	}
+
+	static fn empty(name str) Bag {
+		return Bag {
+			.name = name,
+			.items = []i32 {},
+			.grid = [[0.0, 0.0], [0.0, 0.0]],
+			.score = null,
+			.tag = null,
+		};
+	}
+}
+
+fn main() void {
+	// Named-field literal with a trailing comma and nested structs.
+	var l Line = Line {
+		.from = Vec2 { .x = 1.0, .y = 2.0 },
+		.to   = Vec2 { .x = 4.0, .y = 6.0 },
+	};
+	printf("line len = %f\n", l.from.len());
+
+	// Explicit zero-initialization: every field is zeroed.
+	var zero Vec2 = Vec2 {};
+	printf("zero = (%f, %f)\n", zero.x, zero.y);
+
+	// Decl-only var: also zero-initialized.
+	var zero2 Vec2;
+	printf("zero2 = (%f, %f)\n", zero2.x, zero2.y);
+
+	// Slice + optional fields take implicit conversions: the array
+	// literal becomes a slice view, the payload wraps into the optional.
+	var b Bag = Bag {
+		.name = "tools",
+		.items = [1, 2, 3, 4],
+		.grid = [[1.0, 0.0], [0.0, 1.0]],
+		.score = 7,
+		.tag = "checked",
+	};
+	printf("total = %d\n", b.total()); // 10
+	printf("score = %d\n", b.score orelse -1);
+	var gridLen f32 = b.grid[0][0];
+	printf("grid[0][0] = %f\n", gridLen);
+
+	// Static constructor returning a fully-typed literal (incl. []i32 {}
+	// and null optionals).
+	var e Bag = Bag.empty("empty");
+	printf("empty total = %d, has tag = %d\n", e.total(), e.tag != null);
+
+	// A plain array value also converts to a slice field.
+	var nums [3]i32 = [10, 20, 30];
+	var b2 Bag = Bag {
+		.name = "view",
+		.items = nums,
+		.grid = [[0.0, 0.0], [0.0, 0.0]],
+		.score = null,
+		.tag = null,
+	};
+	printf("view total = %d\n", b2.total()); // 60
+}

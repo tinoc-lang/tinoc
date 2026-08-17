@@ -1,0 +1,38 @@
+// 28_struct_module_generics.tnc — generic structs across module
+// boundaries, including their methods.
+//
+//   - `#import modules.containers;` resolves samples/modules/containers.tnc
+//     and binds the namespace alias `containers`
+//   - qualified instantiation `containers.Box:i32 { ... }` monomorphizes
+//     the template in the defining module's scope, sharing one C struct
+//     and mangled method set per type-argument set
+//   - static methods work on the qualified template
+//     (`containers.Box:str.pack(...)`), instance methods on the values
+//   - multi-parameter templates instantiate per argument set:
+//     `containers.Pair:(i32, str)` and `containers.Pair:(str, i32)` are
+//     two distinct C types
+
+#import modules.containers;
+
+extern "C" fn printf(fmt *const char, ...) i32;
+
+fn main() void {
+	// Qualified literal instantiation: Box:i32 with its instance method.
+	var b containers.Box:i32 = containers.Box:i32 { .item = 42, .tag = "answer" };
+	printf("box = %d (%s)\n", b.get(), b.tag);
+
+	// Static method on the qualified template, monomorphized to Box:str.
+	var s containers.Box:str = containers.Box:str.pack("tinoc", "lang");
+	printf("str box = %s\n", s.get());
+
+	// Multi-parameter template: (i32, str) with its instance method.
+	var p containers.Pair:(i32, str) = containers.Pair:(i32, str) {
+		.first = 1,
+		.second = "one",
+	};
+	printf("pair = %d %s\n", p.firstOf(), p.second);
+
+	// Same template, different argument set — a separate C type.
+	var q containers.Pair:(str, i32) = containers.Pair:(str, i32).of("age", 7);
+	printf("q = %s %d\n", q.firstOf(), q.second);
+}

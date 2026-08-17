@@ -3,6 +3,7 @@ package src
 import (
 	"fmt"
 	"path/filepath"
+	"sort"
 	"strings"
 )
 
@@ -379,6 +380,13 @@ func (s *Sema) Check(prog *Program) {
 	// Pass 5: check every monomorphized generic body queued during the
 	// passes above (and by other instances' bodies).
 	s.drainPendingChecks()
+
+	// Pass 6: detect circular by-value struct/union layouts (direct and
+	// indirect, including through generic instances, optionals, and
+	// arrays) so infinite-size aggregates fail with a clear diagnostic
+	// instead of a confusing C incomplete-type error. Runs last so every
+	// monomorphized instance exists to be checked.
+	s.checkAggregateLayoutCycles(prog)
 }
 
 // walkStatements visits every statement in stmts, descending into
@@ -1947,6 +1955,11 @@ func (s *Sema) retypeArrayLiteral(declared *Type, valueExpr Expression, line, co
 	if declared.Kind == KindSlice {
 		// `var s []i32 = [1, 2, 3];` — the literal is stored as a
 		// temporary [N]T array that codegen slices into {ptr, len}.
+		// Bind the literal to a concrete [N]T type (an empty literal
+		// becomes [0]T) so codegen knows its element type and size.
+		arrType := &Type{Kind: KindArray, Elem: declared.Elem, ArraySize: len(al.Elements)}
+		arrType.Name = arrType.arrayTypeName()
+		s.resolvedTypes[al] = arrType
 		s.sliceConvs[al] = true
 		if declared.Elem != nil {
 			s.retypeArrayLiteralElements(al, declared.Elem, line, col)
@@ -2020,6 +2033,119 @@ func (s *Sema) checkIdentifier(id *Identifier) *Type {
 	}
 	s.errorAt(id.Token.Line, id.Token.Column, "undefined: %s", id.Value)
 	return &Type{Kind: KindInvalid}
+}
+
+// checkAggregateLayoutCycles detects circular by-value struct/union
+// layouts after every type is resolved (including monomorphized generic
+// instances): a struct or union that contains itself — directly, or
+// through a chain of other by-value aggregates, optionals, or arrays —
+// would have infinite size. Pointers and slices break the cycle, which
+// is what the diagnostic suggests. Example:
+//
+//	struct A { b B; }   struct B { a A; }
+//
+// reports `circular struct layout: A -> B -> A`. The pass runs at the
+// very end of Check so instances created while bodies were checked
+// participate too.
+func (s *Sema) checkAggregateLayoutCycles(prog *Program) {
+	pos := make(map[string]Token)
+	s.walkStatements(prog.Statements, nil, func(stmt Statement) {
+		switch st := stmt.(type) {
+		case *StructStatement:
+			if c, ok := s.canonNames[st]; ok {
+				pos[c] = st.Token
+			}
+		case *UnionStatement:
+			if c, ok := s.canonNames[st]; ok {
+				pos[c] = st.Token
+			}
+		}
+	})
+
+	reported := make(map[string]bool)
+
+	// visit walks by-value containment edges from t. A cycle is a node
+	// that reappears on the current path; the path grows monotonically
+	// and the aggregate set is finite, so the recursion always
+	// terminates (each visit either reports a cycle or reaches a leaf).
+	var visit func(t *Type, path []string)
+	visit = func(t *Type, path []string) {
+		if t == nil || t.Name == "" {
+			return
+		}
+		for i, p := range path {
+			if p == t.Name {
+				key := cycleKey(path[i:])
+				if !reported[key] {
+					reported[key] = true
+					line, col := 0, 0
+					if tok, ok := pos[t.Name]; ok {
+						line, col = tok.Line, tok.Column
+					}
+					chain := append(append([]string{}, path[i:]...), t.Name)
+					s.errorAt(line, col, "circular struct layout: %s (make one of the fields a pointer, e.g. ^%s)", strings.Join(chain, " -> "), t.Name)
+				}
+				return
+			}
+		}
+
+		var fields []*StructFieldInfo
+		switch t.Kind {
+		case KindStruct, KindUnion:
+			fields = t.Fields
+		}
+		path = append(path, t.Name)
+		for _, f := range fields {
+			if f == nil {
+				continue
+			}
+			if inner := byValueContained(f.Type); inner != nil {
+				visit(inner, path)
+			}
+		}
+	}
+
+	roots := make(map[string]bool)
+	for _, t := range s.structTypes {
+		if t != nil && t.Name != "" && !roots[t.Name] {
+			roots[t.Name] = true
+			visit(t, nil)
+		}
+	}
+	for _, t := range s.unionTypes {
+		if t != nil && t.Name != "" && !roots[t.Name] {
+			roots[t.Name] = true
+			visit(t, nil)
+		}
+	}
+}
+
+// byValueContained returns the aggregate contained by value inside t: t
+// itself when it is a struct/union, its payload for optionals, and its
+// element for arrays. Pointers, slices, and primitives return nil — they
+// do not contribute to size recursion, so they break layout cycles.
+func byValueContained(t *Type) *Type {
+	if t == nil {
+		return nil
+	}
+	switch t.Kind {
+	case KindStruct, KindUnion:
+		return t
+	case KindOptional:
+		return byValueContained(t.Elem)
+	case KindArray:
+		return byValueContained(t.Elem)
+	default:
+		return nil
+	}
+}
+
+// cycleKey dedupes cycle reports: the same cycle found from different
+// roots produces the same sorted key.
+func cycleKey(chain []string) string {
+	parts := append([]string{}, chain...)
+	sort.Strings(parts)
+	return strings.Join(parts, ",")
 }
 
 // checkFieldAccess resolves `alias.member` for #importc modules, struct
@@ -2133,7 +2259,11 @@ func (s *Sema) checkFieldAccess(fa *FieldAccessExpression) *Type {
 			if m, ok := s.structMethods[recvType.Name][fa.Field.Value]; ok {
 				return m.ReturnType // bare method reference; call sites check the full signature
 			}
-			s.errorAt(fa.Token.Line, fa.Token.Column, "type %s has no field or method %s", recvType.Name, fa.Field.Value)
+			msg := fmt.Sprintf("type %s has no field or method %s", recvType.Name, fa.Field.Value)
+			if sug := closestFieldName(fa.Field.Value, recvType.Fields); sug != "" {
+				msg += fmt.Sprintf(" (did you mean %s?)", sug)
+			}
+			s.errorAt(fa.Token.Line, fa.Token.Column, "%s", msg)
 			return &Type{Kind: KindInvalid}
 		}
 		// Union-typed values expose their shared-memory fields and
@@ -2195,6 +2325,14 @@ func (s *Sema) checkStructLiteral(sl *StructLiteral) *Type {
 		return &Type{Kind: KindUnknown, Name: "struct"}
 	}
 
+	// `Point {}` — an empty struct literal is an explicit
+	// zero-initialization: every field takes its zero value, so no
+	// per-field checks and no missing-field diagnostic. Any non-empty
+	// literal must still name every field.
+	if len(sl.Fields) == 0 {
+		return st
+	}
+
 	seen := make(map[string]bool)
 	for _, f := range sl.Fields {
 		if f == nil || f.Name == nil {
@@ -2203,7 +2341,11 @@ func (s *Sema) checkStructLiteral(sl *StructLiteral) *Type {
 		fname := f.Name.Value
 		idx, ok := st.FieldIndex[fname]
 		if !ok {
-			s.errorAt(f.Name.Token.Line, f.Name.Token.Column, "unknown field %s in struct %s", fname, st.Name)
+			msg := fmt.Sprintf("unknown field %s in struct %s", fname, st.Name)
+			if sug := closestFieldName(fname, st.Fields); sug != "" {
+				msg += fmt.Sprintf(" (did you mean %s?)", sug)
+			}
+			s.errorAt(f.Name.Token.Line, f.Name.Token.Column, "%s", msg)
 			continue
 		}
 		if seen[fname] {
@@ -2217,6 +2359,41 @@ func (s *Sema) checkStructLiteral(sl *StructLiteral) *Type {
 			continue
 		}
 		vt := s.checkExpression(f.Value)
+		// Array/slice field targets accept array literals and plain
+		// array values: an array literal binds to an array field (with
+		// length/sentinel validation and element retyping) or to a
+		// slice field (codegen slices it via sliceConvs); a plain
+		// array value converts to a slice field (`items = nums`).
+		if ft.Kind == KindArray || ft.Kind == KindSlice {
+			if s.retypeArrayLiteral(ft, f.Value, f.Name.Token.Line, f.Name.Token.Column) {
+				if ft.Kind == KindArray {
+					s.resolvedTypes[f.Value] = ft
+				}
+				continue
+			}
+			if ft.Kind == KindSlice && vt.Kind == KindArray &&
+				vt.Elem != nil && vt.Elem.Kind != KindArray &&
+				typesEqual(ft.Elem, vt.Elem) {
+				s.sliceConvs[f.Value] = true
+				continue
+			}
+		}
+		// A payload value (or null) fills an optional field: `count = 7`
+		// for a `count ?i32` field. Untyped literals adapt to the payload
+		// type first (`height ?f64 = 5`); null wraps into an empty
+		// optional.
+		if ft.Kind == KindOptional && vt.Kind != KindOptional {
+			if isUntypedLiteral(f.Value) && vt.isNumeric() && ft.Elem != nil && ft.Elem.isNumeric() {
+				s.resolvedTypes[f.Value] = ft.Elem
+				vt = ft.Elem
+			}
+			if assignable(ft, vt) {
+				s.optWraps[f.Value] = ft
+			} else {
+				s.errorAt(f.Name.Token.Line, f.Name.Token.Column, "%s", describeMismatch(fmt.Sprintf("field %s", fname), vt, ft))
+			}
+			continue
+		}
 		if isUntypedLiteral(f.Value) && vt.isNumeric() && ft.isNumeric() {
 			s.resolvedTypes[f.Value] = ft
 			continue
@@ -2240,6 +2417,81 @@ func (s *Sema) checkStructLiteral(sl *StructLiteral) *Type {
 	}
 
 	return st
+}
+
+// closestFieldName returns the name of the field closest to name by edit
+// distance (at most 2 edits, or a shared prefix of at least half the
+// name), for "did you mean" hints in diagnostics. Empty when nothing is
+// close enough.
+func closestFieldName(name string, fields []*StructFieldInfo) string {
+	best := ""
+	bestDist := 3
+	for _, f := range fields {
+		if f == nil {
+			continue
+		}
+		d := editDistance(name, f.Name)
+		if d < bestDist {
+			bestDist = d
+			best = f.Name
+		}
+	}
+	if best != "" && bestDist <= 2 {
+		return best
+	}
+	// A long shared prefix is a strong hint even when the edit distance is
+	// large (e.g. `xcoordinate` vs `x_coordinate`).
+	for _, f := range fields {
+		if f == nil || f.Name == "" || name == "" {
+			continue
+		}
+		minLen := len(name)
+		if len(f.Name) < minLen {
+			minLen = len(f.Name)
+		}
+		if minLen >= 2 && name[:minLen] == f.Name[:minLen] {
+			return f.Name
+		}
+	}
+	return ""
+}
+
+// editDistance is the Levenshtein edit distance between two strings.
+func editDistance(a, b string) int {
+	ar, br := []rune(a), []rune(b)
+	if len(ar) == 0 {
+		return len(br)
+	}
+	if len(br) == 0 {
+		return len(ar)
+	}
+	prev := make([]int, len(br)+1)
+	cur := make([]int, len(br)+1)
+	for j := range prev {
+		prev[j] = j
+	}
+	for i := 1; i <= len(ar); i++ {
+		cur[0] = i
+		for j := 1; j <= len(br); j++ {
+			cost := 1
+			if ar[i-1] == br[j-1] {
+				cost = 0
+			}
+			del := prev[j] + 1
+			ins := cur[j-1] + 1
+			sub := prev[j-1] + cost
+			m := del
+			if ins < m {
+				m = ins
+			}
+			if sub < m {
+				m = sub
+			}
+			cur[j] = m
+		}
+		prev, cur = cur, prev
+	}
+	return prev[len(br)]
 }
 
 // checkEnumConstructor type-checks an enum variant construction call,
@@ -2367,6 +2619,178 @@ func (s *Sema) checkStructMethodCall(ce *CallExpression, st *Type, method string
 	s.checkCallArgs(ce, m, st.Name+"."+method, offset)
 
 	return m.ReturnType
+}
+
+// genericExprStructType resolves a GenericExpression receiver in
+// method-call position — `Pair:i32` in `Pair:i32.make(...)`, or the
+// module-qualified `math.Pair:(i32, str)` — to the concrete
+// monomorphized struct type, mirroring resolveGenericType's lookup
+// order (module-qualified first, then bare/imported templates).
+// Returns nil with a diagnostic already emitted when the base is not a
+// generic struct.
+func (s *Sema) genericExprStructType(ge *GenericExpression) *Type {
+	if ge == nil || ge.Base == nil {
+		return nil
+	}
+	base := ge.Base.String()
+	if idx := strings.LastIndex(base, "."); idx >= 0 {
+		modName, short := base[:idx], base[idx+1:]
+		mod, ok := s.modules[modName]
+		if !ok {
+			s.errorAt(ge.Token.Line, ge.Token.Column, "undefined module %s", modName)
+			return nil
+		}
+		if d := mod.PubGenericStructs[short]; d != nil {
+			return s.instantiateGenericStruct(d, ge.Args, ge.Token)
+		}
+		s.errorAt(ge.Token.Line, ge.Token.Column, "module %s has no generic struct %s", modName, short)
+		return nil
+	}
+	if d := s.lookupGenericStruct(base); d != nil {
+		return s.instantiateGenericStruct(d, ge.Args, ge.Token)
+	}
+	if a := s.state.GenericAliases[s.itemCanonical(base)]; a != nil {
+		s.errorAt(ge.Token.Line, ge.Token.Column, "generic alias %s has no methods", base)
+		return nil
+	}
+	if a := s.importedGenericAliases[base]; a != nil {
+		s.errorAt(ge.Token.Line, ge.Token.Column, "generic alias %s has no methods", base)
+		return nil
+	}
+	s.errorAt(ge.Token.Line, ge.Token.Column, "undefined generic type %s", base)
+	return nil
+}
+
+// checkGenericStructStaticCall handles `Pair.make(10, 20)`: a static
+// method call on a generic struct template with the type arguments
+// omitted. The type arguments are inferred from the method's parameter
+// types, then the struct is monomorphized and the call is checked
+// against the concrete instance's method signature — the same path an
+// explicit `Pair:i32.make(...)` takes. The receiver expression is
+// recorded as the instance type so codegen can emit the mangled
+// instance method name.
+func (s *Sema) checkGenericStructStaticCall(ce *CallExpression, decl *GenericStructDecl, recv Expression, method string) *Type {
+	var m *FunctionStatement
+	for _, mm := range decl.St.Methods {
+		if mm != nil && mm.Name != nil && mm.Name.Value == method {
+			m = mm
+			break
+		}
+	}
+	if m == nil {
+		s.errorAt(ce.Token.Line, ce.Token.Column, "type %s has no static method %s", decl.Short, method)
+		s.checkArgsOnly(ce)
+		return &Type{Kind: KindInvalid}
+	}
+	if !m.IsStatic {
+		s.errorAt(ce.Token.Line, ce.Token.Column, "method %s.%s is not static; call it on a value of type %s", decl.Short, method, decl.Short)
+		s.checkArgsOnly(ce)
+		return &Type{Kind: KindInvalid}
+	}
+	argTypes := s.inferStructTypeArgs(decl, m, ce)
+	if argTypes == nil {
+		s.checkArgsOnly(ce)
+		return &Type{Kind: KindInvalid}
+	}
+	args := make([]TypeExpr, len(argTypes))
+	for i, at := range argTypes {
+		args[i] = typeExprFromType(at)
+	}
+	inst := s.instantiateGenericStruct(decl, args, ce.Token)
+	if inst == nil {
+		s.checkArgsOnly(ce)
+		return &Type{Kind: KindInvalid}
+	}
+	if recv != nil {
+		s.resolvedTypes[recv] = inst
+	}
+	return s.checkStructMethodCall(ce, inst, method, true)
+}
+
+// inferStructTypeArgs derives a generic struct's type arguments from a
+// static-method call's argument types: each parameter whose declared
+// type names a type parameter binds it to the argument's concrete type
+// (parameters whose types do not mention a type parameter, and generic
+// instantiations such as `x Pair:(T, U)` which cannot be destructured
+// structurally, are skipped). Returns nil — with a diagnostic — when a
+// type parameter cannot be bound, in which case the call needs the
+// explicit `Pair:i32.method(...)` spelling.
+func (s *Sema) inferStructTypeArgs(decl *GenericStructDecl, m *FunctionStatement, ce *CallExpression) []*Type {
+	if len(m.Params) != len(ce.Arguments) {
+		s.errorAt(ce.Token.Line, ce.Token.Column, "cannot infer type argument(s) of %s from this call — provide explicit type arguments (e.g. %s)", decl.Short, genericStructArgsHint(decl, m.Name.Value))
+		return nil
+	}
+	env := make(map[string]*Type, len(decl.Params))
+	for i, p := range m.Params {
+		if p == nil || p.Type == nil {
+			continue
+		}
+		at := s.checkExpression(ce.Arguments[i])
+		if at == nil || at.Kind == KindInvalid || at.Kind == KindUnknown {
+			continue
+		}
+		collectStructTypeParams(p.Type, decl.Params, at, env, s, ce)
+	}
+	var missing []string
+	for _, p := range decl.Params {
+		if env[p] == nil {
+			missing = append(missing, p)
+		}
+	}
+	if len(missing) > 0 {
+		s.errorAt(ce.Token.Line, ce.Token.Column, "cannot infer type argument(s) %s of %s from this call — provide explicit type arguments (e.g. %s)", strings.Join(missing, ", "), decl.Short, genericStructArgsHint(decl, m.Name.Value))
+		return nil
+	}
+	argTypes := make([]*Type, 0, len(decl.Params))
+	for _, p := range decl.Params {
+		argTypes = append(argTypes, env[p])
+	}
+	return argTypes
+}
+
+// genericStructArgsHint renders the explicit instantiation spelling for
+// a generic struct's static method, e.g. `Pair:i32.make(...)` for a
+// single type parameter or `Pair:(i32, str).make(...)` for several.
+func genericStructArgsHint(decl *GenericStructDecl, method string) string {
+	if len(decl.Params) == 1 {
+		return decl.Short + ":T." + method + "(...)"
+	}
+	return decl.Short + ":(T, ...)." + method + "(...)"
+}
+
+// collectStructTypeParams walks a method parameter's declared type,
+// binding every type parameter it names to the call argument's concrete
+// type. Generic instantiations (`x Pair:(T, U)`) are skipped — their
+// type parameters cannot be destructured structurally, so such calls
+// require explicit type arguments.
+func collectStructTypeParams(te TypeExpr, params []string, at *Type, env map[string]*Type, s *Sema, ce *CallExpression) {
+	if te == nil {
+		return
+	}
+	switch t := te.(type) {
+	case *NamedType:
+		for _, p := range params {
+			if t.Name == p {
+				if prev, ok := env[p]; ok {
+					if !typesEqual(prev, at) {
+						s.errorAt(ce.Token.Line, ce.Token.Column, "inconsistent type arguments for %s: got %s and %s", p, prev.String(), at.String())
+					}
+				} else {
+					env[p] = at
+				}
+			}
+		}
+	case *PointerType:
+		collectStructTypeParams(t.Elem, params, at, env, s, ce)
+	case *OptionalType:
+		collectStructTypeParams(t.Elem, params, at, env, s, ce)
+	case *CQualType:
+		collectStructTypeParams(t.Elem, params, at, env, s, ce)
+	case *ErrorUnionType:
+		collectStructTypeParams(t.Elem, params, at, env, s, ce)
+	case *ArrayType:
+		collectStructTypeParams(t.Elem, params, at, env, s, ce)
+	}
 }
 
 // checkUnionMethodCall type-checks `d.method(args)` (isStatic=false,
@@ -2687,15 +3111,72 @@ func (s *Sema) checkOperandsCompatible(ie *InfixExpression, lt, rt *Type) {
 	}
 }
 
+// assignTargetString renders an assignment target without the AST's
+// redundant parentheses, so const-write diagnostics read naturally:
+// `r.w`, `r.arr[0]`, `o.grid[0][1]`.
+func assignTargetString(e Expression) string {
+	switch t := e.(type) {
+	case *Identifier:
+		return t.Value
+	case *FieldAccessExpression:
+		return assignTargetString(t.Left) + "." + t.Field.Value
+	case *IndexExpression:
+		return assignTargetString(t.Left) + "[" + assignTargetString(t.Index) + "]"
+	case *PostfixExpression:
+		if t.Operator == "^" {
+			return assignTargetString(t.Left) + "^"
+		}
+	}
+	return e.String()
+}
+
+// immutableRoot reports whether the base of an assignment target chain is
+// a const binding or by-value parameter (an immutable symbol). It walks
+// through field-access and array-index chains (`r.w`, `r.w.x`,
+// `r.arr[0]`, `o.grid[0][1]`) so writes through a const-declared struct
+// are caught. Two shapes break the chain — the write goes through a
+// handle, not the binding's own storage, and stays allowed:
+//
+//   - pointer dereference (`self^.x` — how mutating methods write)
+//   - indexing a slice or pointer (`s[i]` — the slice's pointee is not
+//     owned by the binding, so `fn double_all(s []i32) { s[i] *= 2 }`
+//     writes through to the backing array)
+//
+// Indexing a plain array does NOT break the chain: the array's storage
+// belongs to the root, so `const r Rect; r.arr[0] = 1` is rejected.
+func (s *Sema) immutableRoot(e Expression) bool {
+	for {
+		switch t := e.(type) {
+		case *FieldAccessExpression:
+			e = t.Left
+		case *IndexExpression:
+			if lt := s.TypeOf(t.Left); lt != nil && (lt.Kind == KindSlice || lt.Kind == KindPointer) {
+				return false
+			}
+			e = t.Left
+		case *Identifier:
+			if sym, found := s.current.Lookup(t.Value); found && !sym.Mutable {
+				return true
+			}
+			return false
+		default:
+			return false
+		}
+	}
+}
+
 func (s *Sema) checkAssignExpression(ae *AssignExpression) *Type {
 	var targetType *Type
 	if ae.Target != nil {
 		targetType = s.checkExpression(ae.Target)
 	}
-	if id, ok := ae.Target.(*Identifier); ok {
-		if sym, found := s.current.Lookup(id.Value); found && !sym.Mutable {
-			s.errorAt(ae.Token.Line, ae.Token.Column, "cannot assign to %s (declared const)", id.Value)
-		}
+	// Writes to a const binding are rejected both directly (`c = 1`) and
+	// through a field/index chain (`const p Point; p.x = 1`, `p.arr[0] =
+	// 1`). A pointer dereference breaks the chain: `self^.x = 1` writes
+	// through the pointee, which is exactly how mutating methods work, so
+	// it stays allowed even though `self` is an immutable by-value param.
+	if s.immutableRoot(ae.Target) {
+		s.errorAt(ae.Token.Line, ae.Token.Column, "cannot assign to %s (declared const)", assignTargetString(ae.Target))
 	}
 
 	var valueType *Type
@@ -2833,6 +3314,13 @@ func (s *Sema) checkCallExpression(ce *CallExpression) *Type {
 				if st, ok := s.structTypes[id.Value]; ok {
 					return s.checkStructMethodCall(ce, st, fa.Field.Value, true)
 				}
+				// `Pair.make(10, 20)` — a static method call on a generic
+				// struct template with the type arguments omitted: infer
+				// them from the method's parameter types, then monomorphize
+				// and check like the explicit `Pair:i32.make(...)` form.
+				if decl := s.lookupGenericStruct(id.Value); decl != nil {
+					return s.checkGenericStructStaticCall(ce, decl, fa.Left, fa.Field.Value)
+				}
 				if et, ok := s.enumTypes[id.Value]; ok {
 					if _, isVariant := et.EnumVariantIdx[fa.Field.Value]; isVariant {
 						return s.checkEnumConstructor(ce, et, fa.Field.Value)
@@ -2842,6 +3330,19 @@ func (s *Sema) checkCallExpression(ce *CallExpression) *Type {
 				if ut, ok := s.unionTypes[id.Value]; ok {
 					return s.checkUnionMethodCall(ce, ut, fa.Field.Value, true)
 				}
+			}
+			// `Pair:i32.make(...)` / `math.Pair:(i32, str).make(...)` — a
+			// static method call on a concrete generic-struct instance:
+			// resolve the receiver to its monomorphized type, record it so
+			// codegen can emit the mangled instance method, and check like
+			// any other static method.
+			if ge, isGE := fa.Left.(*GenericExpression); isGE && fa.Field != nil {
+				if t := s.genericExprStructType(ge); t != nil {
+					s.resolvedTypes[fa.Left] = t
+					return s.checkStructMethodCall(ce, t, fa.Field.Value, true)
+				}
+				s.checkArgsOnly(ce)
+				return &Type{Kind: KindInvalid}
 			}
 			// Instance method call: `p.translate(...)` on a struct-typed
 			// (or pointer-to-struct/enum) receiver.

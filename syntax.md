@@ -469,6 +469,75 @@ fn main() void {
 }
 ```
 
+***Struct literals:***
+
+Struct values are constructed with **named-field literals**. Fields may
+appear in any order and a trailing comma is allowed; every field must be
+initialized exactly once:
+
+```
+var p Point = Point { .x = 1.0, .y = 2.0 };
+var q Point = Point { .y = 0.5, .x = -1.0, };   // any order, trailing comma
+var pair Pair:i32 = Pair:i32 { .first = 10, .second = 20 };  // generic instance
+```
+
+- An **empty literal** — `Point {}` — is an explicit zero-initialization:
+  every field takes its zero value, so no field list is required.
+- Literal fields are type-checked against the declared field types.
+  **Unknown fields**, **missing fields**, and **wrong-typed fields** are
+  reported with exact source spans; an unknown name gets a
+  `did you mean ...?` hint when a close match exists.
+- Array-typed fields initialize with plain C brace syntax
+  (`Vec { .data = [3]f64 { 1.0, 2.0, 3.0 } }`), and slice fields accept
+  a typed literal (`Bag { .items = []i32 {} }`).
+
+***Methods:***
+
+- **Instance methods** take a receiver as their first parameter:
+  `self ^Point` (pointer receiver — `self^.x` lowers to `self->x`) or
+  `self Point` (by-value receiver, `self.x` works directly). Instance
+  methods are called on a value or pointer: `p.translate(0.5, 1.5)`.
+- **Static methods** (`static fn name(...)`) have no receiver and are
+  called on the type itself, including monomorphized generic instances:
+  `Rect.square(3.0)` or `Num:i32.of(21)`. Calling an instance method on
+  the type name (or a static method on a value) is rejected with a hint.
+
+***Mutability:***
+
+A `const` binding is immutable all the way down: assigning to one of
+its fields — directly, through nested structs, or through array
+members — is rejected (`cannot assign to r.w (declared const)`) just
+like reassigning the const itself. Writes that go *through a handle*
+stay legal: mutating methods write `self^.x` (dereference) and slice
+parameters write `s[i]` (through the slice's pointee, i.e. the backing
+array). Mutating a by-value `self` copy (`self.x = ...`) is rejected as
+a no-op.
+
+***Generic structs:***
+
+- `struct Pair:T { ... }` declares a template; `Pair:i32` instantiates
+  it, monomorphized per concrete type-argument set with a mangled C
+  name (`Pair:i32` → `tnc_Pair_i32`), cached and shared across module
+  boundaries (`math.Pair:f64`). Multi-parameter forms:
+  `struct Map:(K, V) { ... }` or the chained `struct Pair:T:U { ... }`.
+- Static methods on an instance use the bare form `Num:i32.of(21)`;
+  when a type argument is a dotted module path, parenthesize it
+  (`Pair:(math.Vec2).make(...)`) so the parser doesn't absorb the
+  method name into the type argument.
+- Mutually-recursive generic structs (`struct A:T { b B:(A:T) }` …
+  `struct B:U { a A:(B:U) }`) hit a monomorphization depth limit and
+  fail with a clear `generic instantiation depth limit exceeded`
+  diagnostic instead of hanging the compiler.
+
+***Layout diagnostics:***
+
+Circular **by-value** layouts — `struct A { b B; }` with
+`struct B { a A; }`, directly or through optionals/arrays — would have
+infinite size; Sema detects them at the end of analysis and reports
+`circular struct layout: A -> B -> A (make one of the fields a pointer,
+e.g. ^A)`. A struct containing itself directly as a field is rejected
+at declaration with a pointer hint too.
+
 ---
 
 # Enum
@@ -957,6 +1026,9 @@ Its length is part of the type and known at compile time.
 [<length>:<sentinel>]<T>  // sentinel-terminated array, e.g. [_:0]u8
 
 [<elem>, <elem>, ...]     // array literal; element type is inferred
+
+[<T>] { <elem>, ... }     // typed slice literal, e.g. []i32 { 1, 2 } or []i32 {}
+[<N><T>] { <elem>, ... }  // typed fixed-size literal, e.g. [3]i32 { 1, 2, 3 }
 ```
 
 ***Example:***
@@ -994,6 +1066,11 @@ for message |ch| {
   conventions.
 - Elements are read/write accessible via `arr[i]`; indexing a
   multidimensional array chains: `mat[i][j]`.
+- A type-annotated literal — `[]i32 {}`, `[]f64 { 1.5, 2.5 }`, or
+  `[3]i32 { 1, 2, 3 }` — spells the element type explicitly and is
+  useful wherever the result location isn't a plain declaration (struct
+  literal fields, return statements). The annotation is syntax sugar:
+  Sema retypes the literal from the result location as usual.
 
 ## Slices
 

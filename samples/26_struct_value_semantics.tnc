@@ -1,0 +1,80 @@
+// 26_struct_value_semantics.tnc — struct value semantics end-to-end.
+//
+//   - by-value receivers (`self Stats`) read a copy; static constructors
+//     build values through named-field literals
+//   - structs copy by value: a copy diverges from the original
+//   - a slice field views the caller's array, so methods write through
+//     to the backing storage
+//   - `const` structs are read-only: field assignment is a compile error
+
+extern "C" fn printf(fmt *const char, ...) i32;
+
+struct Stats {
+	total f64;
+	count f64;
+	label str;
+
+	// By-value receiver: reads a copy, returns a scalar.
+	fn average(self Stats) f64 {
+		if self.count == 0.0 {
+			return 0.0;
+		}
+		return self.total / self.count;
+	}
+
+	// Static constructor: no receiver, called on the type name.
+	static fn named(label str) Stats {
+		return Stats { .label = label, .total = 0.0, .count = 0.0 };
+	}
+}
+
+struct Ledger {
+	entries []f64; // slice field viewing the caller's array
+	name     str;
+
+	// Methods write through the slice's pointee: `self^.entries[i]`
+	// mutates the backing array the field was initialized from.
+	fn add(self ^Ledger, v f64) void {
+		var i i32 = 0;
+		while i < self^.entries.len {
+			self^.entries[i] += v;
+			i += 1;
+		}
+	}
+
+	fn total(self ^Ledger) f64 {
+		var sum f64 = 0.0;
+		var i i32 = 0;
+		while i < self^.entries.len {
+			sum += self^.entries[i];
+			i += 1;
+		}
+		return sum;
+	}
+}
+
+fn main() void {
+	// Static constructor + by-value receiver.
+	var s Stats = Stats.named("visits");
+	printf("%s avg = %f\n", s.label, s.average());
+
+	// Structs copy by value: the copy diverges, the original stays.
+	var a Stats = Stats { .total = 10.0, .count = 2.0, .label = "a" };
+	var b = a;
+	b.total = 20.0;
+	printf("a.total=%f b.total=%f a.avg=%f\n", a.total, b.total, a.average());
+
+	// Slice field write-through: Ledger mutates the backing array.
+	var nums [3]f64 = [1.0, 2.0, 3.0];
+	var led Ledger = Ledger {
+		.name = "nums",
+		.entries = nums,
+	};
+	led.add(10.0);
+	printf("%s total = %f, nums[0] = %f\n", led.name, led.total(), nums[0]);
+
+	// Const struct: fields are read-only (assignment would be a compile
+	// error); reading through a by-value receiver is fine.
+	const fixed Stats = Stats { .total = 7.0, .count = 1.0, .label = "fixed" };
+	printf("fixed avg = %f\n", fixed.average());
+}
