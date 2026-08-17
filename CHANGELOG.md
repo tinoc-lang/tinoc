@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+_No unreleased changes yet — next release's entries land here._
+
+---
+
+## [0.1.1] - 2026-08-17
+
+Patch release. Structs are now complete end-to-end (generics, methods,
+literals, const-mutability, layout diagnostics), generic structs with
+methods work across module boundaries, and the project gained a hermetic
+Nix flake with matching CI.
+
 ### Added
 
 - **Structs, end-to-end**: struct literals (`Point { .x = 1.0, .y = 2.0 }`
@@ -413,5 +424,6 @@ First public release. Tinoc transpiles to **C11** and ships a CLI with
 
 - No known security issues.
 
-[Unreleased]: https://github.com/tinoc-lang/tinoc/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/tinoc-lang/tinoc/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/tinoc-lang/tinoc/releases/tag/v0.1.1
 [0.1.0]: https://github.com/tinoc-lang/tinoc/releases/tag/v0.1.0

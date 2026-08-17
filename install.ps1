@@ -388,7 +388,7 @@ function Show-Help {
     Write-Host "  -Local         Build from source (build.ps1/build.sh) and install the local binary"
     Write-Host "  -Check         Compare installed version with the latest release, make no changes"
     Write-Host "  -Uninstall     Remove the entire TINOC_HOME install"
-    Write-Host "  -Version       Install a specific release version (e.g. -Version 0.1.0)"
+    Write-Host "  -Version       Install a specific release version (e.g. -Version 0.1.1)"
     Write-Host "  -Force, -Yes   Skip all confirmation prompts"
     Write-Host "  -Dir           Override install directory (default: $HOME\.tinoc)"
     Write-Host "  -Repo          Override the GitHub repository (default: $($script:TinocRepo))"
@@ -405,7 +405,7 @@ function Show-Help {
     Write-Host "  ./install.ps1"
     Write-Host "  ./install.ps1 -Check"
     Write-Host "  ./install.ps1 -Local"
-    Write-Host "  ./install.ps1 -Version 0.1.0 -Yes"
+    Write-Host "  ./install.ps1 -Version 0.1.1 -Yes"
     Write-Host "  ./install.ps1 -Uninstall"
 }
 

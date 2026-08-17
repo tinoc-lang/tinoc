@@ -3,7 +3,7 @@
 This checklist documents everything that must happen — and everything that
 should be verified — before, during, and after shipping a Tinoc release.
 
-## v0.1.0 — release checklist
+## v0.1.1 — release checklist
 
 ### 1. Code health
 
@@ -17,7 +17,7 @@ should be verified — before, during, and after shipping a Tinoc release.
 
 ### 2. Release prep
 
-- [ ] `src/cmd.go` `Version` default matches the release version (`0.1.0`);
+- [ ] `src/cmd.go` `Version` default matches the release version (`0.1.1`);
       release binaries get it overridden from the tag by `build.sh`'s
       ldflags, so `./build/tinoc version` reports the actual release.
 - [ ] `CHANGELOG.md` has an entry for the version (move `[Unreleased]`
@@ -28,7 +28,7 @@ should be verified — before, during, and after shipping a Tinoc release.
 
 ### 3. Tagging & CI release
 
-- [ ] Tag the release: `git tag v0.1.0` and `git push origin v0.1.0`.
+- [ ] Tag the release: `git tag v0.1.1` and `git push origin v0.1.1`.
 - [ ] **The release workflow** (`.github/workflows/release.yml`) must trigger
       on the tag push **only** — never on branch pushes.
 - [ ] Workflow cross-compiles all targets (linux/darwin/windows ×
@@ -44,13 +44,13 @@ should be verified — before, during, and after shipping a Tinoc release.
       released version.
 - [ ] Sanity-run one sample from the release binary (not the local build):
       `tinoc run samples/10_struct_basics.tnc`.
-- [ ] If a hotfix is needed, bump to `0.1.1` and repeat from step 1.
+- [ ] If a hotfix is needed, bump to `0.1.2` and repeat from step 1.
 
 ---
 
 ### How the release pipeline works
 
-Pushing a tag like `v0.1.0` triggers `.github/workflows/release.yml`, which:
+Pushing a tag like `v0.1.1` triggers `.github/workflows/release.yml`, which:
 
 1. Checks out the tag and sets up Go.
 2. Cross-compiles `tinoc` for every target platform using `./build.sh build-all`

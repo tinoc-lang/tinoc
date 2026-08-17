@@ -24,7 +24,7 @@ const (
 // time via -ldflags "-X github.com/tinoc-lang/tinoc/src.Version=<tag>" so
 // release binaries report the actual tag; the in-tree default keeps plain
 // `go build` / `go run` behaving sensibly.
-var Version = "0.1.0"
+var Version = "0.1.1"
 
 // Color constants and supportsColor are defined in lexer.go and shared
 // across this package.

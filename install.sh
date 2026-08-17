@@ -172,7 +172,7 @@ usage() {
         "--local"    "Build with ./build.sh build and install the local binary" \
         "--check"    "Compare installed version with the latest release, make no changes" \
         "--uninstall" "Remove the entire \$TINOC_HOME install" \
-        "--version"  "Install a specific release version (e.g. --version 0.1.0)" \
+        "--version"  "Install a specific release version (e.g. --version 0.1.1)" \
         "--force, --yes" "Skip all confirmation prompts" \
         "--dir"      "Override install directory (default: \$HOME/.tinoc)" \
         "--repo"     "Override the GitHub repository (default: ${TINOC_REPO})" \
@@ -190,7 +190,7 @@ usage() {
     printf '  ./install.sh\n'
     printf '  ./install.sh --check\n'
     printf '  ./install.sh --local\n'
-    printf '  ./install.sh --version 0.1.0 --yes\n'
+    printf '  ./install.sh --version 0.1.1 --yes\n'
     printf '  ./install.sh --uninstall\n'
 }
 
@@ -286,7 +286,7 @@ maybe_setup_path() {
     fi
 }
 
-fetch_latest_tag() { # -> tag like v0.1.0
+fetch_latest_tag() { # -> tag like v0.1.1
     local url="${TINOC_API_BASE%/}/repos/${TINOC_REPO}/releases/latest"
     local json tag
     if ! json="$(fetch_stdout "$url" 2>/dev/null)"; then
