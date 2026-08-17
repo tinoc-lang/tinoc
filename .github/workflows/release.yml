@@ -2,7 +2,7 @@ name: Release
 
 # Builds and publishes a Tinoc release.
 #
-# Triggers ONLY on tag pushes (e.g. `git tag v0.1.0 && git push origin v0.1.0`),
+# Triggers ONLY on tag pushes (e.g. `git tag v0.1.1 && git push origin v0.1.1`),
 # never on branch pushes. Cross-compiles the compiler for every supported
 # platform via build.sh build-all, packages each binary as .tar.gz (unix) or
 # .zip (windows), attaches a SHA256SUMS manifest, and creates a GitHub

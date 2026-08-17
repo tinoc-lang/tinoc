@@ -10,6 +10,7 @@
 </p>
 
 <p align="center">
+  <img src="https://img.shields.io/github/v/release/tinoc-lang/tinoc?style=flat-square" alt="Release">
   <img src="https://img.shields.io/github/license/tinoc-lang/tinoc?style=flat-square" alt="License">
   <img src="https://img.shields.io/github/stars/tinoc-lang/tinoc?style=flat-square" alt="Stars">
   <img src="https://img.shields.io/github/forks/tinoc-lang/tinoc?style=flat-square" alt="Forks">
@@ -77,7 +78,7 @@ The installers (`install.sh` / `install.ps1`) are companions to
 - Offer to add `~/.tinoc/bin` to your `PATH` after installing.
 
 Common flags: `--check` (compare installed vs latest), `--uninstall`,
-`--version 0.1.0` (specific release), `--force`/`--yes` (skip prompts),
+`--version 0.1.1` (specific release), `--force`/`--yes` (skip prompts),
 `--dir <path>` (override install dir). Run `install.sh --help` for the full list.
 
 ---
@@ -136,6 +137,40 @@ int main() {
 	printf("%s is creator of %s Programming Language!\n", name.data, lang.data);
 }
 ```
+
+---
+
+## Changelog
+
+All notable changes are documented in [`CHANGELOG.md`](CHANGELOG.md), which
+follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
+[Semantic Versioning](https://semver.org/spec/v2.0.0.html). Releases are
+tagged `vX.Y.Z` on `main`; pushing a tag triggers the [release
+workflow](.github/workflows/release.yml), which cross-compiles, packages, and
+attaches binaries for linux/darwin/windows × amd64/arm64 plus a `SHA256SUMS`
+manifest.
+
+**What's new in v0.1.1** (2026-08-17):
+
+- **Structs, end-to-end** — generic structs (`Box:T`, `Pair:(K, V)`) with
+  monomorphized C11 `typedef` emission, instance (`self ^T` / `self T`) and
+  static methods, named-field and zero-init literals, and const-mutability
+  enforced all the way down (`o.inner.v = 1` on a `const` struct is rejected).
+- **Typed array/slice literals** — `[]i32 { ... }`, `[3]i32 { ... }` in
+  struct fields and return statements.
+- **Nix flake + CI** — hermetic dev shell (`nix develop`), `nix flake check`,
+  and a Linux/macOS CI job running the same flake checks.
+- **Cross-module generic structs with methods** now instantiate correctly
+  (`containers.Box:i32` with a working `fn get(self ^Box:T)`).
+- **Samples 24–28** exercise every new feature end-to-end.
+
+## Release Checklist
+
+The exact release process lives in [`CHECKLIST.md`](CHECKLIST.md): code
+health → release prep (version bump, changelog) → tag & CI release →
+post-release verification. In short, `git tag v0.1.1 && git push origin
+v0.1.1` triggers the release workflow, which builds the archives, generates
+release notes, and creates the GitHub Release.
 
 ---
 
