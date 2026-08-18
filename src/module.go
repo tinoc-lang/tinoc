@@ -1400,9 +1400,7 @@ func (s *Sema) inferGenericArgs(decl *GenericFnDecl, ce *CallExpression) []*Type
 	params := decl.Fn.Params
 	if len(params) != len(ce.Arguments) {
 		missing := make([]string, 0, len(decl.Params))
-		for _, p := range decl.Params {
-			missing = append(missing, p)
-		}
+		missing = append(missing, decl.Params...)
 		s.errorAt(ce.Token.Line, ce.Token.Column, "cannot infer type parameter(s) %s — provide explicit type arguments (e.g. %s:...)", strings.Join(missing, ", "), decl.Short)
 		return nil
 	}
