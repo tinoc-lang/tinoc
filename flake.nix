@@ -184,7 +184,9 @@
               go build -trimpath -ldflags "-X github.com/tinoc-lang/tinoc/src.Version=${version}" -o tinoc .
 
               echo "==> end-to-end samples (generated C compiled and run)"
-              ./samples/build.sh run
+              # The build sandbox has no /usr/bin/env, so run the script via
+              # bash instead of relying on its #!/usr/bin/env bash shebang.
+              bash ./samples/build.sh run
 
               runHook postBuild
             '';

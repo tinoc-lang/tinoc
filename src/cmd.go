@@ -447,7 +447,7 @@ func runCompilerPipeline(mode string, config PipelineConfig) {
 		exitCode := runBinary(binPath)
 		// The scratch dir holds the generated C and (in run mode) the
 		// binary itself; drop it now that the program has finished.
-		os.RemoveAll(workDir)
+		_ = os.RemoveAll(workDir)
 		if exitCode != 0 {
 			fmt.Println()
 			fail(useColor, "program exited with status %d", exitCode)
@@ -458,7 +458,7 @@ func runCompilerPipeline(mode string, config PipelineConfig) {
 
 	// build mode keeps the binary at binPath; only the scratch C work
 	// directory is temporary.
-	os.RemoveAll(workDir)
+	_ = os.RemoveAll(workDir)
 }
 
 // compileGeneratedC writes the generated C source and the embedded
@@ -485,7 +485,7 @@ func compileGeneratedC(cc *CCompiler, sourcePath, cCode, outName string, ephemer
 	}
 	defer func() {
 		if err != nil {
-			os.RemoveAll(workDir)
+			_ = os.RemoveAll(workDir)
 		}
 	}()
 

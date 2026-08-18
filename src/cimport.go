@@ -1,6 +1,7 @@
 package src
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -241,7 +242,12 @@ func ImportCHeaders(alias string, headers []string, sourceDir string) (*CImportM
 	switch dumper.Kind {
 	case "clang":
 		jsonText, err := cachedToolOutput(keyHash+".dump", func() ([]byte, error) {
-			return runCapture(dumper.Path, clangASTArgs(wrapper, sourceDir))
+			// -ast-dump=json writes the JSON AST to stdout; warnings and
+			// other diagnostics go to stderr. Read stdout alone — merging
+			// the streams (CombinedOutput) interleaves a stderr warning
+			// before the JSON (nixpkgs clang on macOS warns while parsing
+			// SDK headers), which then fails to parse as JSON.
+			return runCaptureStdout(dumper.Path, clangASTArgs(wrapper, sourceDir))
 		})
 		if err != nil {
 			return nil, fmt.Errorf("#importc %s: clang AST dump failed: %w", headers[0], err)
@@ -329,6 +335,24 @@ func runCapture(path string, args []string) ([]byte, error) {
 		return nil, fmt.Errorf("%s %s: %w: %s", path, strings.Join(args, " "), err, strings.TrimSpace(string(out)))
 	}
 	return out, nil
+}
+
+// runCaptureStdout runs the command and returns only its stdout, with
+// stderr folded into the error message when the command fails. Used for
+// clang's -ast-dump=json, which writes the JSON AST to stdout: merging
+// the streams (CombinedOutput) interleaves stderr diagnostics before the
+// JSON — e.g. nixpkgs clang on macOS warns while parsing SDK headers —
+// and the JSON then fails to parse ("invalid character 'c' looking for
+// beginning of value").
+func runCaptureStdout(path string, args []string) ([]byte, error) {
+	cmd := exec.Command(path, args...)
+	var outBuf, errBuf bytes.Buffer
+	cmd.Stdout = &outBuf
+	cmd.Stderr = &errBuf
+	if err := cmd.Run(); err != nil {
+		return nil, fmt.Errorf("%s %s: %w: %s", path, strings.Join(args, " "), err, strings.TrimSpace(errBuf.String()))
+	}
+	return outBuf.Bytes(), nil
 }
 
 func runTool(path string, args []string) error {
