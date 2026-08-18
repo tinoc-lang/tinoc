@@ -4,6 +4,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -755,4 +756,67 @@ func funcKeys(m *CImportModule) []string {
 		ks = append(ks, k)
 	}
 	return ks
+}
+
+// TestCImport_ClangWarningOnStderrDoesNotCorruptJSON is a regression test
+// for the macOS Nix CI failure: nixpkgs clang on macOS (the stdenv.cc of
+// the flake's check derivation) emits a warning to stderr while parsing
+// SDK headers and dumps the -ast-dump=json JSON AST to stdout. Merging
+// both streams (CombinedOutput) interleaves that warning before the JSON
+// — the buffer then starts with 'c' and every #importc parse fails with
+// "cannot parse clang AST JSON: invalid character 'c' looking for
+// beginning of value". This test replays that exact shape through a fake
+// clang (warning on stderr, JSON on stdout, exit 0) and asserts the
+// parse still succeeds.
+func TestCImport_ClangWarningOnStderrDoesNotCorruptJSON(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake clang shim is POSIX-only")
+	}
+	dir := t.TempDir()
+
+	shim := filepath.Join(dir, "fakeclang")
+	shimSrc := `#!/bin/sh
+# Mimic nixpkgs clang on macOS: a warning on stderr (unused injected
+# sysroot/flag) plus the JSON AST on stdout, exiting 0.
+echo "clang: warning: argument unused during compilation: '-isysroot /nix/store/xxxx' [-Wunused-command-line-argument]" >&2
+cat <<'JSON'
+{
+  "kind": "TranslationUnitDecl",
+  "inner": [
+    {
+      "kind": "FunctionDecl",
+      "name": "tinoc_fake_fn",
+      "type": { "qualType": "int (int)" },
+      "inner": [
+        { "kind": "ParmVarDecl", "name": "n", "type": { "qualType": "int" } }
+      ]
+    }
+  ]
+}
+JSON
+exit 0
+`
+	if err := os.WriteFile(shim, []byte(shimSrc), 0o755); err != nil {
+		t.Fatalf("write clang shim: %v", err)
+	}
+
+	// The header dumper is cached package-globally; swap in the shim for
+	// this test and restore it afterwards (t.Setenv restores TINOC_HD).
+	prev := cachedHeaderDumper
+	cachedHeaderDumper = nil
+	t.Cleanup(func() { cachedHeaderDumper = prev })
+	t.Setenv("TINOC_HD", shim)
+	t.Setenv("TINOC_CACHE_DIR", t.TempDir())
+
+	if err := os.WriteFile(filepath.Join(dir, "mine.h"), []byte("int tinoc_fake_fn(int);\n"), 0o644); err != nil {
+		t.Fatalf("write header: %v", err)
+	}
+
+	mod, err := ImportCHeaders("c", []string{"mine.h"}, dir)
+	if err != nil {
+		t.Fatalf("parse with warning-emitting clang: %v", err)
+	}
+	if _, ok := mod.Funcs["tinoc_fake_fn"]; !ok {
+		t.Fatalf("parse should expose tinoc_fake_fn despite the stderr warning, funcs=%v", funcKeys(mod))
+	}
 }
