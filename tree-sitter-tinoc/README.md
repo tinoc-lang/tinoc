@@ -19,6 +19,8 @@ specification.
   - `queries/locals.scm` — locals/references (goto-definition groundwork)
   - `queries/tags.scm` — symbol tags (outline / document symbols)
   - `queries/injections.scm` — language injections
+  - `queries/indents.scm` — Helix auto-indent
+  - `queries/textobjects.scm` — Helix textobjects (`vif`/`vaf`, etc.)
 
 ## Development
 
@@ -27,6 +29,14 @@ npm install            # installs tree-sitter-cli
 npm run generate       # regenerate parser from grammar.js
 npm test               # run corpus tests in test/corpus/
 npx tree-sitter parse examples/comprehensive.tnc   # parse a sample file
+```
+
+To preview highlighting in the terminal (after `npm install`), configure a
+parser directory once with `npx tree-sitter init-config` pointing at this
+repo's parent folder, then:
+
+```sh
+npx tree-sitter highlight examples/loops.tnc
 ```
 
 ## Building the parser library

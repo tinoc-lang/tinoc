@@ -178,7 +178,7 @@
   name: (identifier) @namespace)
 
 (module_block_declaration
-  name: (identifier) @namespace)
+  name: (dotted_identifier) @namespace)
 
 (import_declaration
   path: (import_path) @namespace)
