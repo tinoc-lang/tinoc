@@ -33,7 +33,7 @@
   name: (identifier) @name) @definition.module
 
 (module_block_declaration
-  name: (identifier) @name) @definition.module
+  name: (dotted_identifier) @name) @definition.module
 
 (test_declaration
   name: (string) @name) @definition.test

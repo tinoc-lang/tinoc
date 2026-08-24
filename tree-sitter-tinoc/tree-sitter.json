@@ -8,7 +8,10 @@
       "file-types": [
         "tnc"
       ],
-      "injection-regex": "^tinoc$"
+      "injection-regex": "^tinoc$",
+      "highlights": "queries/highlights.scm",
+      "locals": "queries/locals.scm",
+      "tags": "queries/tags.scm"
     }
   ],
   "metadata": {

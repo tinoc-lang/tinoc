@@ -11,6 +11,15 @@
     "syntax"
   ],
   "license": "Apache-2.0",
+  "tree-sitter": [
+    {
+      "scope": "source.tinoc",
+      "file-types": ["tnc"],
+      "highlights": "queries/highlights.scm",
+      "locals": "queries/locals.scm",
+      "tags": "queries/tags.scm"
+    }
+  ],
   "dependencies": {
     "node-addon-api": "^7.0.0",
     "node-gyp-build": "^4.8.0"

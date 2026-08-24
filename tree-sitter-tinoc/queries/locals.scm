@@ -53,7 +53,7 @@
   name: (identifier) @definition.namespace)
 
 (module_block_declaration
-  name: (identifier) @definition.namespace)
+  name: (dotted_identifier) @definition.namespace)
 
 ; References
 (identifier) @reference
