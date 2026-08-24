@@ -1,0 +1,6 @@
+module main;
+fn main() void {
+    for 0..10 |j| {
+        var temp i32 = j;
+    }
+}

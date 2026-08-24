@@ -1,0 +1,30 @@
+{
+  "grammars": [
+    {
+      "name": "tinoc",
+      "camelcase": "Tinoc",
+      "scope": "source.tinoc",
+      "path": ".",
+      "file-types": [
+        "tnc"
+      ],
+      "injection-regex": "^tinoc$"
+    }
+  ],
+  "metadata": {
+    "version": "0.1.0",
+    "license": "Apache-2.0",
+    "description": "Tree-sitter grammar for TinocLang",
+    "links": {
+      "repository": "https://github.com/tree-sitter/tree-sitter-tinoc"
+    }
+  },
+  "bindings": {
+    "c": true,
+    "go": true,
+    "node": true,
+    "python": true,
+    "rust": true,
+    "swift": true
+  }
+}

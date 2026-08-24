@@ -1,0 +1,36 @@
+{
+  "name": "tree-sitter-tinoc",
+  "version": "0.1.0",
+  "description": "Tree-sitter grammar for TinocLang",
+  "main": "bindings/node",
+  "keywords": [
+    "tree-sitter",
+    "tinoc",
+    "tinoclang",
+    "parser",
+    "syntax"
+  ],
+  "license": "Apache-2.0",
+  "dependencies": {
+    "node-addon-api": "^7.0.0",
+    "node-gyp-build": "^4.8.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "tree-sitter-cli": "^0.24.7"
+  },
+  "peerDependencies": {
+    "tree-sitter": ">=0.21.0"
+  },
+  "peerDependenciesMeta": {
+    "tree-sitter": {
+      "optional": true
+    }
+  },
+  "scripts": {
+    "build": "tree-sitter generate && node-gyp rebuild",
+    "test": "tree-sitter test",
+    "parse": "tree-sitter parse",
+    "generate": "tree-sitter generate"
+  }
+}

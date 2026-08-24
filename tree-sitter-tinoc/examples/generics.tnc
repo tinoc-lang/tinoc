@@ -1,0 +1,4 @@
+module main;
+fn make_pair:(K, V)(key K, val V) Pair:(K, V) {
+    return Pair:(K, V) { .key = key, .val = val };
+}

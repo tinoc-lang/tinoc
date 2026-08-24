@@ -1,0 +1,3 @@
+fn main() void {
+    io.println("{any}", Identity:str("Tinoc"));
+}
