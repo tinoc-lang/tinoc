@@ -1,0 +1,4 @@
+fn main() void {
+    p.translate(0.5, 1.5);
+    var len f32 = p.length();
+}

@@ -1,0 +1,4 @@
+module main;
+extern "C" fn printf(fmt *const char, ...) i32;
+extern "C" fn strlen(s *const char) usize;
+extern "C" fn mylib.puts(s *const char) i32;

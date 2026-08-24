@@ -1,0 +1,367 @@
+// Comprehensive TinocLang test file covering all syntax
+
+module main;
+
+#import math;
+#import std.io;
+#import std.collection.*;
+#import shapes.{Vec2, dot};
+#import shapes.vec;
+#import shapes.vec as v;
+#import "shapes/vec.tnc" as vf;
+
+#importc "stdio.h";
+#importc "stdio.h" "math.h" as c;
+#importc "mylib.h" as mylib;
+
+#partial;
+
+pub const PI f64 = 3.14159;
+const TAU f64 = 6.28318;
+
+pub const MAX_SIZE usize = 1024;
+
+var global_count i32 = 0;
+
+// Integer literals
+const decimal_int = 98222;
+const hex_int = 0xff;
+const another_hex_int = 0xFF;
+const octal_int = 0o755;
+const binary_int = 0b11110000;
+const one_billion = 1_000_000_000;
+const binary_mask = 0b1_1111_1111;
+const permissions = 0o7_5_5;
+
+// Float literals
+const floating_point = 123.0E+77;
+const another_float = 123.0;
+const yet_another = 123.0e+77;
+const hex_float = 0x103.70p-5;
+const lightspeed = 299_792_458.000_000;
+
+// String and char
+const name str = "Tinoc";
+const lang str = "Tinoc Is Not C";
+const ch char = 'A';
+const escaped str = "line1\nline2\ttab";
+const hex_str str = "\x41";
+const unicode_str str = "\u{1F600}";
+
+// Pointer deref
+fn sqrt(x f32) f32 {
+    return x;
+}
+
+// Simple function
+fn add(a i8, b i8) i8 {
+    return a + b;
+}
+
+// Function with no params
+fn greet() void {
+    io.println("Hi");
+}
+
+// Generic function
+fn Identity:T(val T) T {
+    return val;
+}
+
+// Multi-param generic
+fn make_pair:(K, V)(key K, val V) Pair:(K, V) {
+    return Pair:(K, V) { .key = key, .val = val };
+}
+
+// Function declaration only (no body)
+fn forward_decl() void;
+
+// Extern C function (using Tinoc pointer syntax ^char)
+extern "C" fn printf(fmt ^char, ...) i32;
+extern "C" fn strlen(s ^char) usize;
+extern "C" fn mylib.puts(s ^char) i32;
+
+// Simple struct
+struct Point {
+    x f32;
+    y f32;
+
+    fn translate(self ^Point, dx f32, dy f32) void {
+        self^.x += dx;
+        self^.y += dy;
+    }
+
+    fn length(self ^Point) f32 {
+        return sqrt(self^.x * self^.x + self^.y * self^.y);
+    }
+}
+
+// Generic struct
+struct Pair:T {
+    first T;
+    second T;
+
+    fn swap(self ^Pair:T) void {
+        var tmp T = self^.first;
+        self^.first = self^.second;
+        self^.second = tmp;
+    }
+}
+
+// Multi-param generic struct
+struct Map:(K, V) {
+    key K;
+    value V;
+}
+
+// Enum
+enum Direction {
+    North, East, South, West,
+}
+
+// Enum with data
+enum Shape {
+    Circle(f32),
+    Rect(f32, f32),
+    Point,
+
+    fn area(self ^Shape) f32 {
+        return 0.0;
+    }
+}
+
+// Generic enum
+enum Something:T {
+    First,
+    Second(T),
+}
+
+// Simple union
+union Data {
+    as_int i32;
+    as_float f32;
+    as_bytes [4]u8;
+
+    fn zero(self ^Data) void {
+        self^.as_int = 0;
+    }
+}
+
+// Generic union
+union Either:T {
+    value T;
+    raw u64;
+
+    fn clear(self ^Either:T) void {
+        self^.raw = 0;
+    }
+}
+
+// Multi-param generic union
+union OneOf:(A, B) {
+    a A;
+    b B;
+}
+
+// Alias
+alias Byte = u8;
+alias StringList = []str;
+alias PairStr = Pair:str;
+
+// Module block
+module math_block {
+    pub const g f64 = 9.81;
+
+    pub fn energy(m f64, v f64) f64 {
+        return 0.5 * m * v * v;
+    }
+}
+
+// Test
+test "basic addition" {
+    const result = add(10, 25);
+}
+
+// Main function with all statement types
+fn main() void {
+    // Variable declarations
+    var name str = "Lucifer";
+    var number i32 = 101;
+    var inferred = 42;
+    var flag bool = false;
+    var ch char = 'x';
+
+    // Assignment
+    name = "Julius";
+    number += 10;
+    flag = true;
+
+    // Constants
+    const lang str = "Tinoc";
+    const codename = "C^";
+
+    // Optional types
+    var maybe ?i32 = 42;
+    var none ?i32 = null;
+
+    if none == null {
+        var v i32 = maybe orelse 0;
+    }
+
+    // Array
+    var nums [4]i32 = [10, 20, 30, 40];
+    var s []i32 = nums;
+    var first i32 = nums[0];
+    nums[0] = 99;
+
+    // Struct literal
+    var p Point = Point { .x = 1.0, .y = 2.0 };
+    var p2 Point = Point { .y = 0.5, .x = -1.0, };
+    var empty_point Point = Point {};
+
+    // Generic struct literal
+    var pair Pair:i32 = Pair:i32 { .first = 10, .second = 20 };
+
+    // Method calls
+    p.translate(0.5, 1.5);
+    var len f32 = p.length();
+    pair.swap();
+
+    // Function calls
+    const result i32 = add(10, 25);
+    greet();
+    io.println("result = {d}", result);
+    io.println("{any}", Identity:str("Tinoc"));
+
+    // Enum usage
+    var tok Direction = Direction.North;
+    var shape Shape = Shape.Circle(5.0);
+
+    // Union usage
+    var d Data;
+    d.as_int = 42;
+    d.zero();
+
+    // If/else
+    var x i32 = 10;
+    if x > 0 {
+        x = 1;
+    } else if x == 0 {
+        x = 0;
+    } else {
+        x = -1;
+    }
+
+    // While loop
+    var i i32 = 0;
+    while i < 10 {
+        i += 1;
+    }
+
+    // Infinite loop
+    while true {
+        if i == 20 {
+            break;
+        }
+        i += 1;
+        if i == 15 {
+            continue;
+        }
+    }
+
+    // For range loop
+    for 0..10 |j| {
+        var temp i32 = j;
+    }
+
+    // For collection loop
+    for nums |n| {
+        var elem i32 = n;
+    }
+
+    // Switch
+    switch tok {
+        Direction.North => { x = 0; }
+        Direction.South => { x = 1; }
+        _ => { x = 2; }
+    }
+
+    // Binary operators
+    var a i32 = 5 + 3;
+    var b i32 = 10 - 2;
+    var c i32 = 4 * 6;
+    var d2 i32 = 20 / 4;
+    var e i32 = 17 % 5;
+    var f i32 = 2 ** 8;
+    var g i32 = 5 *% 3;
+    var h i32 = 5 *| 3;
+
+    // Bitwise
+    var b1 i32 = 0xff & 0x0f;
+    var b2 i32 = 0xf0 | 0x0f;
+    var b3 i32 = 0xff ^ 0x0f;
+    var b4 i32 = 0x01 << 4;
+    var b5 i32 = 0x10 >> 2;
+    var b6 i32 = 0x01 <<| 32;
+
+    // Logical
+    var l1 bool = true and false;
+    var l2 bool = true or false;
+    var l3 bool = !true;
+
+    // Comparison
+    var cmp1 bool = a == b;
+    var cmp2 bool = a != b;
+    var cmp3 bool = a < b;
+    var cmp4 bool = a > b;
+    var cmp5 bool = a <= b;
+    var cmp6 bool = a >= b;
+
+    // Error set merge
+    var merged i32 = a || b;
+
+    // Wrapping arithmetic
+    var w1 i32 = a +% b;
+    var w2 i32 = a -% b;
+    var w3 i32 = a +| b;
+    var w4 i32 = a -| b;
+
+    // Address of and deref
+    var ptr ^Point = &p;
+    var val Point = ptr^;
+
+    // Optional unwrap
+    var unwrapped i32 = maybe?;
+
+    // Type cast
+    var as_f32 f32 = number as f32;
+
+    // Range
+    var rng = 0..10;
+
+    // Array literal
+    var arr = [1, 2, 3, 4, 5];
+
+    // Array concatenation
+    var arr2 = arr ++ arr;
+
+    // Multi-dimensional array
+    const mat4x5 [4][5]f32 = [
+        [1.0, 0.0, 0.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0, 1.0, 0.0],
+        [0.0, 0.0, 1.0, 0.0, 0.0],
+        [0.0, 0.0, 0.0, 0.0, 9.9],
+    ];
+
+    // Ternary via orelse
+    var fallback = maybe orelse 0;
+
+    // Catch
+    var result2 = maybe catch 0;
+
+    // Negation
+    var neg i32 = -number;
+    var wneg i32 = -%number;
+    var sneg i32 = -|number;
+    var bnot i32 = ~a;
+}

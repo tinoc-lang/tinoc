@@ -1,0 +1,3 @@
+module main;
+#import math;
+#import std.io;

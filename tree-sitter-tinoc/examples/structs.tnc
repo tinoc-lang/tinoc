@@ -1,0 +1,8 @@
+module main;
+struct Point {
+    x f32;
+    y f32;
+}
+fn main() void {
+    var p2 Point = Point { .y = 0.5, .x = -1.0, };
+}

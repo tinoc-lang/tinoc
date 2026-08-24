@@ -1,0 +1,274 @@
+================================================================================
+Imports and modules
+================================================================================
+
+#import std.io;
+#import std.collections.*;
+#import "rel/path.tnc" as util;
+module math;
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (import_declaration
+    path: (import_path
+      (identifier)
+      (identifier)))
+  (import_declaration
+    path: (import_wildcard
+      (identifier)
+      (identifier)))
+  (import_declaration
+    path: (import_string
+      (string)
+      (identifier)))
+  (module_declaration
+    name: (identifier)))
+
+================================================================================
+Variables and constants
+================================================================================
+
+fn main() void {
+    var x i32 = 10;
+    var y = 3.14;
+    var z string;
+    const MAX i32 = 100;
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (function_declaration
+    name: (identifier)
+    parameters: (parameter_list)
+    return_type: (identifier)
+    body: (block
+      (variable_declaration
+        name: (identifier)
+        type: (identifier)
+        value: (integer))
+      (variable_declaration
+        name: (identifier)
+        value: (float))
+      (variable_declaration
+        name: (identifier)
+        type: (identifier))
+      (const_declaration
+        name: (identifier)
+        type: (identifier)
+        value: (integer)))))
+
+================================================================================
+Control flow with for-capture and switch
+================================================================================
+
+fn run() void {
+    var sum i32 = 0;
+    for 0..10 |n| {
+        sum += n;
+    }
+    while sum > 0 {
+        sum -= 1;
+    }
+    if sum == 0 {
+        return;
+    } else {
+        switch sum {
+            0 => { break; }
+            _ => { continue; }
+        }
+    }
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (function_declaration
+    name: (identifier)
+    parameters: (parameter_list)
+    return_type: (identifier)
+    body: (block
+      (variable_declaration
+        name: (identifier)
+        type: (identifier)
+        value: (integer))
+      (for_statement
+        iterable: (range_expression
+          start: (integer)
+          end: (integer))
+        variable: (identifier)
+        body: (block
+          (expression_statement
+            (binary_expression
+              left: (identifier)
+              right: (identifier)))))
+      (while_statement
+        condition: (binary_expression
+          left: (identifier)
+          right: (integer))
+        body: (block
+          (expression_statement
+            (binary_expression
+              left: (identifier)
+              right: (integer)))))
+      (if_statement
+        condition: (binary_expression
+          left: (identifier)
+          right: (integer))
+        consequence: (block
+          (return_statement))
+        alternative: (block
+          (switch_statement
+            value: (identifier)
+            (switch_arm
+              pattern: (integer)
+              body: (block
+                (break_statement)))
+            (switch_arm
+              body: (block
+                (continue_statement)))))))))
+
+================================================================================
+Structs, methods, generics, and error unions
+================================================================================
+
+struct Point {
+    x f32;
+    y f32;
+
+    fn length(self ^Point) f32 {
+        return self^.x + self^.y;
+    }
+}
+
+struct Pair:T {
+    first T;
+    second T;
+}
+
+fn make_pair:(T)(first T, second T) Pair:T {
+    return Pair:T { .first = first, .second = second };
+}
+
+enum Status {
+    Ok,
+    Err(string),
+}
+
+fn divide(a f32, b f32) f32!string {
+    if b == 0 {
+        return Err("division by zero");
+    }
+    return a / b;
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (struct_declaration
+    name: (identifier)
+    body: (struct_body
+      (struct_field_declaration
+        name: (identifier)
+        type: (identifier))
+      (struct_field_declaration
+        name: (identifier)
+        type: (identifier))
+      (function_declaration
+        name: (identifier)
+        parameters: (parameter_list
+          (parameter
+            name: (identifier)
+            type: (pointer_type
+              (identifier))))
+        return_type: (identifier)
+        body: (block
+          (return_statement
+            (binary_expression
+              left: (member_expression
+                object: (deref_expression
+                  (identifier))
+                property: (identifier))
+              right: (member_expression
+                object: (deref_expression
+                  (identifier))
+                property: (identifier))))))))
+  (struct_declaration
+    name: (identifier)
+    (generic_type_args
+      (type_list
+        (identifier)))
+    body: (struct_body
+      (struct_field_declaration
+        name: (identifier)
+        type: (identifier))
+      (struct_field_declaration
+        name: (identifier)
+        type: (identifier))))
+  (function_declaration
+    name: (identifier)
+    (generic_type_args
+      (type_list
+        (parenthesized_type
+          (identifier))))
+    parameters: (parameter_list
+      (parameter
+        name: (identifier)
+        type: (identifier))
+      (parameter
+        name: (identifier)
+        type: (identifier)))
+    return_type: (generic_type
+      name: (identifier)
+      type_args: (type_list
+        (identifier)))
+    body: (block
+      (return_statement
+        (struct_literal
+          type: (generic_type
+            name: (identifier)
+            type_args: (type_list
+              (identifier)))
+          (struct_literal_field
+            name: (identifier)
+            value: (identifier))
+          (struct_literal_field
+            name: (identifier)
+            value: (identifier))))))
+  (enum_declaration
+    name: (identifier)
+    body: (enum_body
+      (enum_variant
+        name: (identifier))
+      (enum_variant
+        name: (identifier)
+        payload: (enum_payload
+          (identifier)))))
+  (function_declaration
+    name: (identifier)
+    parameters: (parameter_list
+      (parameter
+        name: (identifier)
+        type: (identifier))
+      (parameter
+        name: (identifier)
+        type: (identifier)))
+    return_type: (error_union_type
+      (identifier)
+      (identifier))
+    body: (block
+      (if_statement
+        condition: (binary_expression
+          left: (identifier)
+          right: (integer))
+        consequence: (block
+          (return_statement
+            (call_expression
+              function: (identifier)
+              arguments: (argument_list
+                (string))))))
+      (return_statement
+        (binary_expression
+          left: (identifier)
+          right: (identifier))))))
